@@ -1,11 +1,47 @@
-*.pyc
+## OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.claude/
+.vscode/
+.idea/
+
+## Python
+*.py[cod]
 __pycache__/
 .venv/
-.env
-.env.*
+venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+## Node / frontend / electron
 node_modules/
+frontend/node_modules/
+electron/node_modules/
 dist/
+frontend/dist/
 build/
 coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+## Project-generated artifacts
+backend/tmp/
+backend/opentrace_backend.egg-info/
+/package-lock.json
+/tests/FileModifier
+/tests/testFile.txt
+
+## Local databases / caches
 *.sqlite3
 *.db
+*.db-journal
+*.db-shm
+*.db-wal

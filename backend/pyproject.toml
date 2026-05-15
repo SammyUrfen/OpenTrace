@@ -1,0 +1,20 @@
+[project]
+name = "opentrace-backend"
+version = "0.0.1"
+description = "OpenTrace backend — FastAPI server and tracing engine"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+]
+
+[project.scripts]
+opentrace = "app.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
