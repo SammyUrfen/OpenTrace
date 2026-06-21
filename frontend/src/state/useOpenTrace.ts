@@ -1,0 +1,167 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+
+/** Mirrors `app.sessions.Session` (a project/workspace). */
+export interface Project {
+  id: string
+  display_name: string
+  slug: string
+  created_at: number
+  updated_at: number
+  last_opened_at: number | null
+  notes: string | null
+}
+
+/** Mirrors `app.runs.Run` (one traced command execution). */
+export interface Run {
+  id: string
+  session_id: string
+  terminal_id: string | null
+  display_name: string
+  command: string
+  command_basename: string
+  cwd: string
+  started_at: number
+  ended_at: number | null
+  duration_ms: number | null
+  exit_code: number | null
+  exit_signal: string | null
+  status: string
+  label: string | null
+  max_severity: string | null
+  created_at: number
+}
+
+/** Mirrors `app.trace.events.MetricSample` (one psutil sample). */
+export interface MetricSample {
+  timestamp_ms: number
+  cpu_pct: number | null
+  rss_mb: number | null
+  vms_mb: number | null
+  open_fds: number | null
+  threads: number | null
+  syscall_rate: number | null
+  io_read_bps: number | null
+  io_write_bps: number | null
+}
+
+export interface LiveState {
+  latest: MetricSample | null
+  cpu: number[]
+  rss: number[]
+  fds: number[]
+}
+
+const RING = 120 // samples kept per series for the sparklines
+
+function push(arr: number[], v: number | null): number[] {
+  const next = arr.concat(v ?? 0)
+  return next.length > RING ? next.slice(next.length - RING) : next
+}
+
+interface Hook {
+  projects: Project[]
+  runs: Run[]
+  live: Record<string, LiveState>
+  liveRunId: string | null
+  connected: boolean
+  refresh: () => Promise<void>
+}
+
+/**
+ * Single source of truth for the renderer: projects + runs fetched over REST,
+ * kept live via the backend's `/stream` SSE channel (run lifecycle + metrics).
+ */
+export function useOpenTrace(backendUrl: string): Hook {
+  const [projects, setProjects] = useState<Project[]>([])
+  const [runs, setRuns] = useState<Run[]>([])
+  const [live, setLive] = useState<Record<string, LiveState>>({})
+  const [liveRunId, setLiveRunId] = useState<string | null>(null)
+  const [connected, setConnected] = useState(false)
+  const esRef = useRef<EventSource | null>(null)
+
+  const refresh = useCallback(async () => {
+    try {
+      const [p, r] = await Promise.all([
+        fetch(`${backendUrl}/sessions`).then((x) => x.json()),
+        fetch(`${backendUrl}/runs?limit=200`).then((x) => x.json()),
+      ])
+      setProjects(p)
+      setRuns(r)
+    } catch {
+      /* backend not up yet; SSE + retry will catch up */
+    }
+  }, [backendUrl])
+
+  const upsertRun = useCallback((run: Run) => {
+    setRuns((prev) => {
+      const without = prev.filter((r) => r.id !== run.id)
+      return [run, ...without].sort((a, b) => b.started_at - a.started_at)
+    })
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+    const es = new EventSource(`${backendUrl}/stream`)
+    esRef.current = es
+    es.onopen = () => setConnected(true)
+    es.onerror = () => setConnected(false)
+    es.onmessage = (ev) => {
+      let msg: { type: string; run_id: string; data: any }
+      try {
+        msg = JSON.parse(ev.data)
+      } catch {
+        return
+      }
+      const { type, run_id, data } = msg
+      if (type === 'run_started') {
+        upsertRun(data as Run)
+        setLiveRunId(run_id)
+        void refreshProjects()
+      } else if (type === 'run_analyzing') {
+        setRuns((prev) =>
+          prev.map((r) => (r.id === run_id ? { ...r, status: 'analyzing' } : r)),
+        )
+      } else if (type === 'run_ended') {
+        if (data && data.id) upsertRun(data as Run)
+        setLiveRunId((cur) => (cur === run_id ? null : cur))
+        // Drop the finished run's live ring buffers so `live` can't grow without
+        // bound over a long session (the run's metrics are persisted server-side).
+        setLive((prev) => {
+          if (!(run_id in prev)) return prev
+          const { [run_id]: _dropped, ...rest } = prev
+          return rest
+        })
+      } else if (type === 'metric') {
+        const s = data as MetricSample
+        setLive((prev) => {
+          const cur = prev[run_id] ?? { latest: null, cpu: [], rss: [], fds: [] }
+          return {
+            ...prev,
+            [run_id]: {
+              latest: s,
+              cpu: push(cur.cpu, s.cpu_pct),
+              rss: push(cur.rss, s.rss_mb),
+              fds: push(cur.fds, s.open_fds),
+            },
+          }
+        })
+      }
+    }
+
+    async function refreshProjects() {
+      try {
+        const p = await fetch(`${backendUrl}/sessions`).then((x) => x.json())
+        setProjects(p)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    return () => {
+      es.close()
+      esRef.current = null
+    }
+  }, [backendUrl, refresh, upsertRun])
+
+  return { projects, runs, live, liveRunId, connected, refresh }
+}

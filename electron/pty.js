@@ -5,20 +5,20 @@
  * IPC surface to main.js; nothing in here knows about Electron windows beyond
  * the WebContents handle passed in at start().
  *
- * Tracing ON/OFF lives here because the wrapper hook point (if any) will
- * eventually wrap the pty process. For Phase 0 the toggle only writes a
- * banner into the terminal stream — the shell itself is untouched in both
- * states, so OFF is always a plain shell path.
+ * Tracing ON/OFF is a single env var, `OPENTRACE_ENABLE_STRACE`, that the
+ * shell hook reads on every command. ON rewrites a simple foreground command to
+ * `otrace -- <cmd>` (zsh) or enables the `ot` helper (bash); OFF is a plain
+ * shell with zero overhead. The shell itself is never restarted.
  */
 const pty = require('node-pty')
 const path = require('path')
-const fs = require('fs')
-const os = require('os')
 
+const HOOKS_DIR = path.join(__dirname, 'shell-hooks')
+const OTRACE_PATH = path.join(HOOKS_DIR, 'otrace')
+const DEFAULT_BACKEND_URL = 'http://localhost:8000'
 
 let session = null
 let tracingEnabled = false
-let lastStartOpts = null
 
 function shellType(shellPath) {
   const base = path.basename(shellPath)
@@ -37,53 +37,46 @@ function banner(text) {
   return `\r\n\x1b[36m[opentrace] ${text}\x1b[0m\r\n`
 }
 
-function tracesDir() {
-  const home = process.env.OPENTRACE_HOME || path.join(os.homedir(), '.opentrace')
-  const dir = path.join(home, 'traces')
-  try{
-    fs.mkdirSync(dir, { recursive: true , mode: 0o700 })
-    // on systems that preserve modes, re-assert
-    try { fs.chmodSync(dir, 0o700) } catch {}
-  } catch(e) {
-    // ignore: best-effort creation
-  }
-  return dir
-}
-
-
 /**
  * Start a pty in the given cwd and stream its output to the given WebContents.
  * Idempotent for a given WebContents — calling again disposes the previous
  * session first. Returns a small info object the caller can hand to a session
  * record.
  */
-function start({ webContents, cwd, cols = 80, rows = 24 }) {
+function start({ webContents, cwd, cols = 80, rows = 24, backendUrl }) {
   if (session) dispose()
 
   const shell = defaultShell()
   const resolvedCwd = cwd || process.cwd()
+  const type = shellType(shell)
+
+  // The hook reads these on source / on each command. Setting them in the spawn
+  // env means the very first command already sees the right tracing state.
+  const env = {
+    ...process.env,
+    OPENTRACE_API: backendUrl || process.env.OPENTRACE_API || DEFAULT_BACKEND_URL,
+    OPENTRACE_OTRACE: OTRACE_PATH,
+    OPENTRACE_ENABLE_STRACE: tracingEnabled ? '1' : '0',
+  }
 
   const proc = pty.spawn(shell, ['-l'], {
     name: 'xterm-256color',
     cols,
     rows,
     cwd: resolvedCwd,
-    env: process.env,
+    env,
   })
 
-  const type = shellType(shell)
+  const hookPath = path.join(
+    HOOKS_DIR,
+    type === 'zsh' ? 'opentrace-hook.zsh' : 'opentrace-hook.sh',
+  )
 
-  const hookPath =
-    type === 'zsh'
-      ? path.join(__dirname, 'shell-hooks', 'opentrace-hook.zsh')
-      : path.join(__dirname, 'shell-hooks', 'opentrace-hook.sh')
-
+  // Source the hook once the shell has drawn its first prompt. Leading space so
+  // it stays out of history when HIST_IGNORE_SPACE is set.
   setTimeout(() => {
-    proc.write(`source "${hookPath}"\r`)
-    proc.write(`export OPENTRACE_ENABLE_STRACE=0\r`)
-    proc.write(`export OPENTRACE_ENABLE_PERF=0\r`)
-  }, 300)
-
+    proc.write(` source "${hookPath}"\r`)
+  }, 350)
 
   proc.onData((data) => {
     if (webContents.isDestroyed()) return
@@ -98,7 +91,6 @@ function start({ webContents, cwd, cols = 80, rows = 24 }) {
   })
 
   session = { proc, webContents, shell, cwd: resolvedCwd, cols, rows }
-
   return getInfo()
 }
 
@@ -108,7 +100,7 @@ function getInfo() {
     shell: session.shell,
     shellName: path.basename(session.shell),
     cwd: session.cwd,
-    pid: session.proc.pid
+    pid: session.proc.pid,
   }
 }
 
@@ -135,21 +127,16 @@ function dispose() {
 
 function setTracing(enabled) {
   tracingEnabled = Boolean(enabled)
-
   if (!session) return
 
-  if (tracingEnabled) {
-    session.proc.write(`export OPENTRACE_ENABLE_STRACE=1\r`)
-    session.proc.write(`export OPENTRACE_ENABLE_PERF=0\r`)
-  } else {
-    session.proc.write(`export OPENTRACE_ENABLE_STRACE=0\r`)
-    session.proc.write(`export OPENTRACE_ENABLE_PERF=0\r`)
-  }
+  // Update the live env var the hook reads on each command. Leading space keeps
+  // it out of history.
+  session.proc.write(` export OPENTRACE_ENABLE_STRACE=${tracingEnabled ? '1' : '0'}\r`)
 
   if (!session.webContents.isDestroyed()) {
     session.webContents.send(
       'pty:data',
-      banner(`tracing ${tracingEnabled ? 'enabled' : 'disabled'}`)
+      banner(`tracing ${tracingEnabled ? 'enabled' : 'disabled'}`),
     )
   }
 }

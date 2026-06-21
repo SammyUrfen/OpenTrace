@@ -15,28 +15,46 @@ pip install -e .
 uvicorn app.main:app --reload --port 8000
 ```
 
+Install dev/test extras (pytest) with `pip install -e ".[dev]"` and run the
+suite from `backend/` with `pytest -q`.
+
 On first run the backend creates:
 
 - `~/.opentrace/` — base directory (override with `OPENTRACE_HOME`)
 - `~/.opentrace/config.json` — defaults from `app.config.Config`
-- `~/.opentrace/sessions.db` — SQLite schema from `OpenTrace_Roadmap.md` §8
-- `~/.opentrace/sessions/` — per-session data lives here in later phases
+- `~/.opentrace/sessions.db` — SQLite (sessions → terminals → runs + per-run
+  events / metrics / anomalies / artifacts / run_views)
+- `~/.opentrace/sessions/<slug>/` — per-project folders with `terminals/` and `runs/`
 
 ## Endpoints
 
-| Endpoint  | Returns                                                       |
-|-----------|---------------------------------------------------------------|
-| `GET /health` | `{"status":"ok"}` — process is up.                         |
-| `GET /info`   | Resolved version + paths. Useful for verifying bootstrap.  |
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /health`, `GET /info` | liveness + resolved paths / cpu cores |
+| `POST/GET/PATCH/DELETE /sessions` | projects (with `/sessions/default`, `/{id}/touch`) |
+| `POST /terminals`, `POST /terminals/attach` | register a shell; `attach` is used by the hook |
+| `POST /runs/start`, `/runs/{id}/pid`, `/runs/{id}/end` | run lifecycle (driven by `otrace`) |
+| `GET /runs`, `/runs/{id}` | run list + detail |
+| `GET /runs/{id}/{events,metrics,anomalies,artifacts,summary}` | analytical detail |
+| `PUT/GET /runs/{id}/views/{name}` | persisted per-view UI state |
+| `GET /stream`, `GET /runs/{id}/stream` | SSE live channel (run lifecycle + metric samples) |
 
 ## Layout
 
 ```
 app/
-├── main.py     FastAPI app, lifespan, endpoints
-├── paths.py    one place for every filesystem path
-├── config.py   Config / LLMConfig pydantic models + load / save
-└── db.py       SQLite connect + first-run schema init
+├── main.py          FastAPI app, lifespan, SSE endpoints
+├── paths.py         filesystem paths + slug/run-folder naming
+├── config.py        Config / LLMConfig pydantic models
+├── db.py            SQLite connect + schema + migrations
+├── sessions.py      projects CRUD + router
+├── terminals.py     terminals CRUD + /attach + router
+├── runs.py          runs CRUD + lifecycle endpoints + router
+├── run_views.py     per-run view state + router
+├── storage.py       events/metrics/anomalies/artifacts + ndjson.zst + meta.json
+├── streaming.py     SSE pub/sub broker
+├── trace/           strace_parser · metrics (psutil) · fdresolve · orchestrator · events
+└── rules/           anomaly detection engine
 ```
 
 ## Environment variables

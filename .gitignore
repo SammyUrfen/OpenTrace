@@ -45,3 +45,4 @@ backend/opentrace_backend.egg-info/
 *.db-journal
 *.db-shm
 *.db-wal
+tmp-opentrace/

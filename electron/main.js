@@ -90,6 +90,35 @@ function createWindow() {
   if (process.env.OPENTRACE_DEV || process.env.DEBUG) {
     win.webContents.openDevTools()
   }
+
+  // Smoke mode: render, screenshot ourselves, then quit. Used for automated
+  // boot/render verification; a no-op for normal launches.
+  if (process.env.OPENTRACE_SMOKE) {
+    const outPath = process.env.OPENTRACE_SMOKE
+    const delay = Number(process.env.OPENTRACE_SMOKE_DELAY || 4000)
+    // comma-separated CSS selectors clicked in sequence (e.g. open run, switch tab)
+    const clickSels = (process.env.OPENTRACE_SMOKE_CLICK || '')
+      .split(',').map((s) => s.trim()).filter(Boolean)
+    win.webContents.once('did-finish-load', () => {
+      setTimeout(async () => {
+        try {
+          for (const sel of clickSels) {
+            await win.webContents.executeJavaScript(
+              `document.querySelector(${JSON.stringify(sel)})?.click()`,
+            )
+            await new Promise((r) => setTimeout(r, 1200)) // let fetch + render settle
+          }
+          const img = await win.webContents.capturePage()
+          require('fs').writeFileSync(outPath, img.toPNG())
+          console.log(`[smoke] captured ${outPath}`)
+        } catch (e) {
+          console.error(`[smoke] capture failed: ${e.message}`)
+        } finally {
+          app.quit()
+        }
+      }, delay)
+    })
+  }
   return win
 }
 
@@ -100,6 +129,7 @@ function registerIpc() {
       cwd: LAUNCH_CWD,
       cols: opts.cols,
       rows: opts.rows,
+      backendUrl: BACKEND_URL,
     })
     return { ...info, tracing: pty.isTracing() }
   })

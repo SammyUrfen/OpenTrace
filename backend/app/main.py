@@ -3,11 +3,15 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import config, db, paths, sessions
+from . import config, db, paths, run_views, runs, sessions, terminals
+from .streaming import sse_response
+from .trace import metrics as metrics_mod
+from .trace import orchestrator
 
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 
@@ -16,12 +20,16 @@ async def lifespan(app: FastAPI):
     paths.ensure_dirs()
     cfg = config.load()
     db.init()
+    orphaned = orchestrator.reconcile_orphans()
     app.state.config = cfg
-    log.info("opentrace ready: home=%s", paths.home())
+    log.info(
+        "opentrace ready: home=%s (reconciled %d orphan run(s))",
+        paths.home(), orphaned,
+    )
     yield
 
 
-app = FastAPI(title="OpenTrace", version="0.0.1", lifespan=lifespan)
+app = FastAPI(title="OpenTrace", version="0.1.0", lifespan=lifespan)
 
 # Renderer is loaded from a `file://` URL in packaged Electron, which Chromium
 # reports as the `null` origin. Allowing all origins is fine for a local-first
@@ -33,6 +41,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(sessions.router)
+app.include_router(terminals.router)
+app.include_router(runs.router)
+app.include_router(run_views.router)
 
 
 @app.get("/health")
@@ -49,30 +62,19 @@ def info() -> dict[str, object]:
         "db_path": str(paths.sessions_db()),
         "sessions_dir": str(paths.sessions_dir()),
         "schema_version": db.CURRENT_VERSION,
+        "cpu_cores": metrics_mod.cpu_count(),
     }
 
 
-@app.post("/sessions", response_model=sessions.Session)
-def create_session(data: sessions.SessionCreate) -> sessions.Session:
-    return sessions.create(data)
+# --- live SSE channels ------------------------------------------------------
+
+@app.get("/stream")
+def stream_all():
+    """Global live channel — every run's lifecycle + metric events."""
+    return sse_response("*")
 
 
-@app.get("/sessions", response_model=list[sessions.Session])
-def list_sessions(limit: int = 50, offset: int = 0) -> list[sessions.Session]:
-    return sessions.list_recent(limit=limit, offset=offset)
-
-
-@app.get("/sessions/{sid}", response_model=sessions.Session)
-def get_session(sid: str) -> sessions.Session:
-    sess = sessions.get(sid)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    return sess
-
-
-@app.patch("/sessions/{sid}", response_model=sessions.Session)
-def update_session(sid: str, data: sessions.SessionUpdate) -> sessions.Session:
-    sess = sessions.update(sid, data)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    return sess
+@app.get("/runs/{rid}/stream")
+def stream_run(rid: str):
+    """Live channel scoped to a single run."""
+    return sse_response(rid)

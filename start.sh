@@ -11,6 +11,7 @@ fi
 
 export OPENTRACE_LAUNCH_CWD="${OPENTRACE_LAUNCH_CWD:-$PWD}"
 export OPENTRACE_PYTHON="${OPENTRACE_PYTHON:-$(command -v python)}"
+export OPENTRACE_HOME="$ROOT/tmp-opentrace"
 
 # Build the frontend only if the dist entrypoint is missing.
 if [[ ! -f "$ROOT/frontend/dist/index.html" ]]; then

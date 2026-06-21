@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# otrace — wrap ONE foreground command under strace and report its lifecycle to
+# the OpenTrace backend. Invoked transparently by the shell hook as:
+#
+#     otrace -- <command> [args...]
+#
+# Design (from the interception-design synthesis):
+#   * The shell forks THIS as a normal foreground job, so quoting, job control,
+#     $?, and Ctrl-C are 100% native — there is no inner `bash -c` re-parse.
+#   * strace runs as our child (we stay alive to wait + finalize); we report
+#     strace's pid both on disk (<run_dir>/strace.pid) and via HTTP so the
+#     psutil poller can watch the real process subtree.
+#   * Everything is FAIL-OPEN: if the backend is down or curl/strace is missing,
+#     the command still runs, untraced. The backend never blocks the user.
+#   * Exit status is decoupled from HTTP: we always `exit` with the command's
+#     real status, regardless of whether /runs/end succeeded.
+set -u
+
+API="${OPENTRACE_API:-http://localhost:8000}"
+
+# Drop the leading `--` the hook passes.
+[ "${1:-}" = "--" ] && shift
+[ "$#" -eq 0 ] && exit 0
+
+# Re-entrancy guard: a traced program that itself spawns a hooked shell must not
+# double-wrap (the outer `strace -f` already follows children).
+if [ -n "${OPENTRACE_IN_RUN:-}" ]; then exec "$@"; fi
+
+# Without curl we can't talk to the backend — just run the command.
+command -v curl >/dev/null 2>&1 || exec "$@"
+
+_json_escape() {  # escape $1 as a JSON string body (no surrounding quotes)
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+_field() {  # _field <json> <key> -> value (string fields only)
+  printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
+}
+
+cmd_j="$(_json_escape "$*")"
+cwd_j="$(_json_escape "$PWD")"
+payload="{\"command\":\"$cmd_j\",\"cwd\":\"$cwd_j\""
+[ -n "${OPENTRACE_SESSION:-}" ] && payload="$payload,\"session_id\":\"$OPENTRACE_SESSION\""
+[ -n "${OPENTRACE_TERMINAL:-}" ] && payload="$payload,\"terminal_id\":\"$OPENTRACE_TERMINAL\""
+payload="$payload,\"collector_config\":{\"strace\":true,\"psutil\":true}}"
+
+resp="$(curl -sf --max-time 2 -X POST "$API/runs/start" \
+    -H 'content-type: application/json' -d "$payload" 2>/dev/null)"
+[ -z "$resp" ] && exec "$@"          # backend down -> fail open
+
+run_id="$(printf '%s' "$resp" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)"
+run_dir="$(_field "$resp" run_dir)"
+log="$(_field "$resp" strace_log_path)"
+{ [ -z "$run_id" ] || [ -z "$log" ]; } && exec "$@"
+
+export OPENTRACE_IN_RUN="$run_id"
+
+# Launch the workload under strace (or bare, if strace is unavailable).
+if command -v strace >/dev/null 2>&1; then
+  strace -f -T -ttt -o "$log" -- "$@" &
+else
+  "$@" &
+fi
+child=$!
+
+[ -n "$run_dir" ] && printf '%s\n' "$child" > "$run_dir/strace.pid" 2>/dev/null
+curl -sf --max-time 1 -X POST "$API/runs/$run_id/pid" \
+    -H 'content-type: application/json' -d "{\"pid\":$child}" >/dev/null 2>&1 &
+
+# Catch INT/TERM ourselves so we survive to finalize; the tty already delivered
+# the signal to the workload's process group, so it dies on its own.
+trap 'kill -INT "$child" 2>/dev/null' INT
+trap 'kill -TERM "$child" 2>/dev/null' TERM
+
+rc=0
+wait "$child"; rc=$?
+# A trap can make `wait` return early while the child is still dying; loop until
+# it is really gone so $rc reflects the workload's true exit status.
+while kill -0 "$child" 2>/dev/null; do wait "$child"; rc=$?; done
+
+sig_field="null"
+if [ "$rc" -gt 128 ]; then
+  name="$(kill -l "$((rc - 128))" 2>/dev/null || printf '%s' "$((rc - 128))")"
+  sig_field="\"$name\""
+fi
+ended="$(date +%s%3N 2>/dev/null || true)"
+end_payload="{\"exit_code\":$rc,\"exit_signal\":$sig_field"
+[ -n "$ended" ] && end_payload="$end_payload,\"ended_at\":$ended"
+end_payload="$end_payload}"
+curl -sf --max-time 3 -X POST "$API/runs/$run_id/end" \
+    -H 'content-type: application/json' -d "$end_payload" >/dev/null 2>&1
+
+exit $rc

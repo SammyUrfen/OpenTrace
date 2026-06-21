@@ -1,103 +1,98 @@
-"""Session records: create / read / update / list.
+"""Sessions = projects / workspaces.
 
-A session is a single execution span the UI cares about — for Phase 0 that
-means one record per terminal shell, but the schema is general enough for
-later phases (one record per traced command, per replay, etc.).
+A session groups terminals and runs under one filesystem-safe slug. It is the
+top of the data model; terminals and runs reference it by `session_id`.
 
 Public surface (stable):
 - `Session`, `SessionCreate`, `SessionUpdate` — pydantic models
-- `create(data) -> Session`
-- `get(sid) -> Session | None`
-- `update(sid, data) -> Session | None`
-- `list_recent(limit, offset) -> list[Session]`
+- `create`, `get`, `get_by_slug`, `update`, `touch`, `delete`, `list_all`
+- `get_or_create_default()` — convenience for the single-window app shell
+- `router` — FastAPI APIRouter mounted at `/sessions`
 """
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
-import time
-import uuid
 
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
-from . import db
+from . import db, paths
+from .util import new_id, now_ms
+
+DEFAULT_DISPLAY_NAME = "Default"
 
 
 class SessionCreate(BaseModel):
-    command: str
-    cwd: str
-    process_name: str | None = None
-    label: str | None = None
-    tags: list[str] | None = None
+    display_name: str
+    notes: str | None = None
 
 
 class SessionUpdate(BaseModel):
-    ended_at: int | None = None
-    exit_code: int | None = None
-    exit_signal: str | None = None
-    label: str | None = None
-    tags: list[str] | None = None
+    display_name: str | None = None
+    notes: str | None = None
 
 
 class Session(BaseModel):
     id: str
-    process_name: str
-    command: str
-    cwd: str
-    started_at: int
-    ended_at: int | None = None
-    duration_ms: int | None = None
-    exit_code: int | None = None
-    exit_signal: str | None = None
-    label: str | None = None
-    tags: list[str] = Field(default_factory=list)
+    display_name: str
+    slug: str
     created_at: int
+    updated_at: int
+    last_opened_at: int | None = None
+    notes: str | None = None
 
 
 def _row_to_session(row: sqlite3.Row) -> Session:
-    tags_raw = row["tags"]
     return Session(
         id=row["id"],
-        process_name=row["process_name"],
-        command=row["command"],
-        cwd=row["cwd"],
-        started_at=row["started_at"],
-        ended_at=row["ended_at"],
-        duration_ms=row["duration_ms"],
-        exit_code=row["exit_code"],
-        exit_signal=row["exit_signal"],
-        label=row["label"],
-        tags=json.loads(tags_raw) if tags_raw else [],
+        display_name=row["display_name"],
+        slug=row["slug"],
         created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        last_opened_at=row["last_opened_at"],
+        notes=row["notes"],
     )
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
+def _unique_slug(conn: sqlite3.Connection, display_name: str) -> str:
+    """A slug not already used by another session (suffix -2, -3, … on clash)."""
+    base = paths.slugify(display_name)
+    slug = base
+    n = 2
+    while conn.execute("SELECT 1 FROM sessions WHERE slug = ?", (slug,)).fetchone():
+        slug = f"{base}-{n}"
+        n += 1
+    return slug
+
+
+def _write_session_json(sess: Session) -> None:
+    """Mirror the session record to `<session>/session.json` on disk."""
+    paths.create_project_dir(sess.slug)
+    paths.session_json(sess.slug).write_text(
+        json.dumps(sess.model_dump(), indent=2), encoding="utf-8"
+    )
 
 
 def create(data: SessionCreate) -> Session:
-    sid = uuid.uuid4().hex
-    now = _now_ms()
-    process_name = (
-        data.process_name
-        or (data.command.split()[0] if data.command.strip() else "unknown")
-    )
-    tags_json = json.dumps(data.tags) if data.tags else None
+    sid = new_id()
+    now = now_ms()
     with db.connect() as conn:
+        slug = _unique_slug(conn, data.display_name)
         conn.execute(
             """
             INSERT INTO sessions
-                (id, process_name, command, cwd, started_at,
-                 label, tags, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, display_name, slug, created_at, updated_at,
+                 last_opened_at, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (sid, process_name, data.command, data.cwd, now,
-             data.label, tags_json, now),
+            (sid, data.display_name, slug, now, now, now, data.notes),
         )
-    found = get(sid)
-    assert found is not None  # we just inserted it
-    return found
+    sess = get(sid)
+    assert sess is not None
+    _write_session_json(sess)
+    return sess
 
 
 def get(sid: str) -> Session | None:
@@ -106,35 +101,119 @@ def get(sid: str) -> Session | None:
         return _row_to_session(row) if row else None
 
 
-def update(sid: str, data: SessionUpdate) -> Session | None:
-    existing = get(sid)
-    if existing is None:
-        return None
+def get_by_slug(slug: str) -> Session | None:
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE slug = ?", (slug,)
+        ).fetchone()
+        return _row_to_session(row) if row else None
 
+
+def list_all() -> list[Session]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM sessions
+            ORDER BY COALESCE(last_opened_at, updated_at) DESC
+            """
+        ).fetchall()
+        return [_row_to_session(r) for r in rows]
+
+
+def update(sid: str, data: SessionUpdate) -> Session | None:
     fields = data.model_dump(exclude_none=True)
     if not fields:
-        return existing
-
-    # Compute duration_ms when ended_at is provided and caller didn't pass one.
-    if "ended_at" in fields and "duration_ms" not in fields:
-        fields["duration_ms"] = max(0, fields["ended_at"] - existing.started_at)
-
-    if "tags" in fields:
-        fields["tags"] = json.dumps(fields["tags"]) if fields["tags"] else None
-
+        return get(sid)
+    fields["updated_at"] = now_ms()
     assignments = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [sid]
     with db.connect() as conn:
-        conn.execute(f"UPDATE sessions SET {assignments} WHERE id = ?", values)
+        cur = conn.execute(
+            f"UPDATE sessions SET {assignments} WHERE id = ?", values
+        )
+        if cur.rowcount == 0:
+            return None
+    sess = get(sid)
+    if sess is not None:
+        _write_session_json(sess)
+    return sess
+
+
+def touch(sid: str) -> Session | None:
+    """Mark a session as just-opened (updates `last_opened_at`)."""
+    now = now_ms()
+    with db.connect() as conn:
+        cur = conn.execute(
+            "UPDATE sessions SET last_opened_at = ? WHERE id = ?", (now, sid)
+        )
+        if cur.rowcount == 0:
+            return None
     return get(sid)
 
 
-def list_recent(limit: int = 50, offset: int = 0) -> list[Session]:
-    limit = max(1, min(limit, 500))
-    offset = max(0, offset)
+def delete(sid: str) -> bool:
+    """Remove a session, its DB rows (cascade), and its on-disk directory."""
+    sess = get(sid)
+    if sess is None:
+        return False
     with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        ).fetchall()
-        return [_row_to_session(r) for r in rows]
+        conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+    shutil.rmtree(paths.session_dir(sess.slug), ignore_errors=True)
+    return True
+
+
+def get_or_create_default() -> Session:
+    """Return the most-recent session, creating a `Default` one if none exist."""
+    existing = list_all()
+    if existing:
+        return existing[0]
+    return create(SessionCreate(display_name=DEFAULT_DISPLAY_NAME))
+
+
+# --- HTTP -------------------------------------------------------------------
+
+router = APIRouter(prefix="/sessions", tags=["sessions"])
+
+
+@router.post("", response_model=Session)
+def http_create(data: SessionCreate) -> Session:
+    return create(data)
+
+
+@router.get("", response_model=list[Session])
+def http_list() -> list[Session]:
+    return list_all()
+
+
+@router.get("/default", response_model=Session)
+def http_default() -> Session:
+    return get_or_create_default()
+
+
+@router.get("/{sid}", response_model=Session)
+def http_get(sid: str) -> Session:
+    sess = get(sid)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return sess
+
+
+@router.patch("/{sid}", response_model=Session)
+def http_update(sid: str, data: SessionUpdate) -> Session:
+    sess = update(sid, data)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return sess
+
+
+@router.post("/{sid}/touch", response_model=Session)
+def http_touch(sid: str) -> Session:
+    sess = touch(sid)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return sess
+
+
+@router.delete("/{sid}")
+def http_delete(sid: str) -> dict[str, bool]:
+    return {"deleted": delete(sid)}

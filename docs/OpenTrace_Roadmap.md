@@ -653,37 +653,45 @@ API key stored in OS keyring (libsecret / Secret Service API). Never in config f
 ## 10. Phase Roadmap
 
 ### Phase 0 — Foundation (Week 1)
-- [ ] Monorepo: `/backend`, `/frontend`, `/electron`, `/docs`
-- [ ] `opentrace` CLI binary: opens Electron window, passes CWD
-- [ ] Electron boots, starts FastAPI backend as child process
-- [ ] xterm.js + node-pty terminal in bottom panel
-- [ ] Command interception: wraps execution with strace + psutil when ON
-- [ ] SQLite initialized on first run
-- [ ] `config.json` created with defaults
-- [ ] OpenTrace ON/OFF toggle functional
+- [x] Monorepo: `/backend`, `/frontend`, `/electron`, `/docs`
+- [x] `opentrace` CLI binary: opens Electron window, passes CWD *(dev launcher `app.cli`; PyInstaller packaging deferred)*
+- [x] Electron boots, starts FastAPI backend as child process
+- [x] xterm.js + node-pty terminal in bottom panel
+- [x] Command interception: wraps execution with strace + psutil when ON
+- [x] SQLite initialized on first run
+- [x] `config.json` created with defaults
+- [x] OpenTrace ON/OFF toggle functional
 
 ### Phase 1 — Data Pipeline (Weeks 2–3)
-- [ ] strace parser → TraceEvent schema
-- [ ] psutil poller → metrics table
-- [ ] FD path resolver via procfs
-- [ ] Event normalization and storage
-- [ ] Session lifecycle (create, close, save)
+- [x] strace parser → TraceEvent schema
+- [x] psutil poller → metrics table
+- [x] FD path resolver via procfs
+- [x] Event normalization and storage (SQLite + `events.ndjson.zst` / `metrics.ndjson.zst` / `meta.json`)
+- [x] Run lifecycle (start, poll, finalize, save) over `/runs/*` + `otrace` wrapper
+- [x] *(bonus)* foundational anomaly rule engine + SSE live channel
+
+> **Data model note:** the flat Phase-0 `sessions` table was replaced by the
+> three-level **sessions (projects) → terminals → runs** model; events/metrics/
+> anomalies/artifacts now key off `run_id`. Interception is a zsh line-rewrite
+> (`accept-line` widget → `otrace -- <cmd>`), not the original preexec re-run.
+> Live updates use **SSE** rather than WebSocket (no extra native dep).
 
 ### Phase 2 — Setup UX + Sidebar (Weeks 4–5)
 - [ ] First-run wizard (LLM config + collector defaults)
-- [ ] API key in libsecret
-- [ ] Right sidebar: sessions list with severity dots
+- [ ] API key in libsecret *(file-based secret store exists; keyring swap deferred)*
+- [x] Right sidebar: sessions (projects) → runs with severity dots
 - [ ] Right-click context menu
-- [ ] Main tab bar + secondary tab bar (stubbed)
-- [ ] Overview tab: static stats
-- [ ] Live Monitor: real-time sparklines
+- [x] Main tab bar + secondary tab bar (real: open runs as tabs, per-run views)
+- [x] Overview tab: execution snapshot + top anomaly cards
+- [x] Live Monitor: real-time sparklines (SSE)
 - [ ] Settings page
 
 ### Phase 3 — Analytics Views (Weeks 6–9)
-- [ ] All secondary tabs populated with real data and visualizations
-- [ ] Full detection rule engine (all rules from Section 5)
-- [ ] All highlighting conventions
-- [ ] Real-time anomaly alerts in Live Monitor
+- [~] Secondary tabs populated with real data: **Overview, Memory, CPU, Syscalls** done
+      (Timeline, I/O, Network, Processes, Logs pending — Logs needs stdout capture)
+- [~] Detection rule engine — foundational subset live (6 rules); full §5 set pending
+- [x] Severity highlighting (dots, colored anomaly cards, threshold lines, red error counts)
+- [ ] Real-time anomaly alerts in Live Monitor *(metrics stream live; anomalies computed at finalize)*
 
 ### Phase 4 — LLM Integration (Weeks 10–11)
 - [ ] Streaming LLM call → sectioned cards in Overview

@@ -1,16 +1,19 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import './App.css'
-import { MainTabBarPlaceholder } from './components/MainTabBarPlaceholder'
-import { SecondaryTabBarPlaceholder } from './components/SecondaryTabBarPlaceholder'
+import { MainTabs } from './components/MainTabs'
+import { SecondaryTabs } from './components/SecondaryTabs'
 import {
   MainContentPlaceholder,
   type BackendStatus,
 } from './components/MainContentPlaceholder'
-import { SessionList } from './components/SessionList'
+import { RunView, RUN_VIEWS } from './components/RunView'
+import { RunSidebar } from './components/RunSidebar'
+import { LiveMonitor } from './components/LiveMonitor'
 import { Terminal } from './components/Terminal'
 import { TracingToggle } from './components/TracingToggle'
 import { useTracing } from './state/useTracing'
-import { useSessions } from './state/useSessions'
+import { useOpenTrace } from './state/useOpenTrace'
+import { useRunDetail } from './state/useRunDetail'
 
 const BACKEND_URL =
   (typeof window !== 'undefined' && window.opentrace?.backendUrl) ||
@@ -19,9 +22,47 @@ const BACKEND_URL =
 function App() {
   const [backendStatus, setBackendStatus] = useState<BackendStatus>('connecting')
   const { enabled: tracing, setEnabled: setTracing, ready: tracingReady } = useTracing()
-  const sessionsApi = useSessions(BACKEND_URL)
-  // Track the current terminal's session id so we can PATCH it on exit.
-  const currentSessionId = useRef<string | null>(null)
+  const ot = useOpenTrace(BACKEND_URL)
+
+  // Open run tabs + which one is focused + which analytics view.
+  const [openRunIds, setOpenRunIds] = useState<string[]>([])
+  const [focusedRunId, setFocusedRunId] = useState<string | null>(null)
+  const [activeView, setActiveView] = useState('overview')
+
+  const openRuns = openRunIds
+    .map((id) => ot.runs.find((r) => r.id === id))
+    .filter((r): r is NonNullable<typeof r> => Boolean(r))
+  const focusedRun = ot.runs.find((r) => r.id === focusedRunId) ?? null
+  const detail = useRunDetail(BACKEND_URL, focusedRunId, focusedRun?.status)
+  const focusedLive = focusedRunId ? ot.live[focusedRunId] ?? null : null
+
+  const openRun = (id: string) => {
+    setOpenRunIds((prev) => (prev.includes(id) ? prev : [...prev, id]))
+    setFocusedRunId(id)
+    setActiveView('overview')
+  }
+  const closeRun = (id: string) => {
+    setOpenRunIds((prev) => {
+      const idx = prev.indexOf(id)
+      const next = prev.filter((x) => x !== id)
+      if (focusedRunId === id) {
+        // Focus the right neighbour, or the left one if we closed the last tab.
+        setFocusedRunId(next[idx] ?? next[idx - 1] ?? null)
+      }
+      return next
+    })
+  }
+
+  // Prune open/focused tabs whose run no longer exists (deleted elsewhere), so
+  // we never render a dangling tab or fetch detail for a 404'd run.
+  useEffect(() => {
+    const ids = new Set(ot.runs.map((r) => r.id))
+    setOpenRunIds((prev) => {
+      const next = prev.filter((id) => ids.has(id))
+      return next.length === prev.length ? prev : next // keep ref if unchanged
+    })
+    if (focusedRunId && !ids.has(focusedRunId)) setFocusedRunId(null)
+  }, [ot.runs, focusedRunId])
 
   useEffect(() => {
     let cancelled = false
@@ -44,7 +85,11 @@ function App() {
 
   return (
     <div className="app-shell">
-      <MainTabBarPlaceholder
+      <MainTabs
+        openRuns={openRuns}
+        activeRunId={focusedRunId}
+        onSelect={setFocusedRunId}
+        onClose={closeRun}
         rightSlot={
           <TracingToggle
             enabled={tracing}
@@ -53,37 +98,50 @@ function App() {
           />
         }
       />
-      <SecondaryTabBarPlaceholder />
-      <MainContentPlaceholder backendStatus={backendStatus} />
+      {focusedRun ? (
+        <SecondaryTabs views={RUN_VIEWS} active={activeView} onSelect={setActiveView} />
+      ) : (
+        <div className="region region--secondary-tabs" data-placeholder="secondary-tab-bar">
+          <span className="region__label" />
+        </div>
+      )}
+      {focusedRun ? (
+        <RunView
+          run={focusedRun}
+          detail={detail}
+          live={focusedLive}
+          activeView={activeView}
+          backendUrl={BACKEND_URL}
+        />
+      ) : (
+        <MainContentPlaceholder backendStatus={backendStatus} />
+      )}
       <div className="region region--sidebar">
-        <SessionList
-          sessions={sessionsApi.sessions}
-          loading={sessionsApi.loading}
-          error={sessionsApi.error}
+        <RunSidebar
+          projects={ot.projects}
+          runs={ot.runs}
+          connected={ot.connected}
+          onSelectRun={(run) => openRun(run.id)}
         />
       </div>
       <div className="region region--bottom-panel" data-placeholder="bottom-panel">
-        <Terminal
-          onStart={async (info) => {
-            const sess = await sessionsApi.create({
-              command: info.shellName,
-              cwd: info.cwd,
-              process_name: info.shellName,
-              tags: tracing ? ['tracing'] : undefined,
-            })
-            currentSessionId.current = sess?.id ?? null
-          }}
-          onExit={async (info) => {
-            const id = currentSessionId.current
-            if (!id) return
-            await sessionsApi.update(id, {
-              ended_at: Date.now(),
-              exit_code: info.exitCode,
-              exit_signal: info.signal ? String(info.signal) : undefined,
-            })
-            currentSessionId.current = null
-          }}
-        />
+        <div className="bottom-split">
+          <div className="bottom-split__terminal">
+            <Terminal
+              onStart={() => {
+                void ot.refresh()
+              }}
+              onExit={() => {
+                void ot.refresh()
+              }}
+            />
+          </div>
+          <LiveMonitor
+            activeRun={ot.runs.find((r) => r.id === ot.liveRunId) ?? null}
+            live={ot.liveRunId ? ot.live[ot.liveRunId] ?? null : null}
+            tracing={tracing}
+          />
+        </div>
       </div>
     </div>
   )

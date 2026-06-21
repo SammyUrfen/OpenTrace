@@ -3,13 +3,15 @@
 Tracks the eight items from `OpenTrace_Roadmap.md` §10.
 
 - [x] Monorepo: `/backend`, `/frontend`, `/electron`, `/docs`
-- [ ] `opentrace` CLI binary: opens Electron window, passes CWD
+- [x] `opentrace` CLI binary: opens Electron window, passes CWD *(dev launcher `app.cli`; PyInstaller packaging deferred to Phase 7)*
 - [x] Electron boots, starts FastAPI backend as child process
 - [x] xterm.js + node-pty terminal in bottom panel
-- [ ] Command interception: wraps execution with strace + psutil when ON
+- [x] Command interception: wraps execution with strace + psutil when ON *(Phase 1: zsh `accept-line` widget → `otrace`)*
 - [x] SQLite initialized on first run
 - [x] `config.json` created with defaults
-- [x] OpenTrace ON/OFF toggle functional (stub: writes banner to terminal, real wrapper deferred)
+- [x] OpenTrace ON/OFF toggle functional *(now a real `OPENTRACE_ENABLE_STRACE` toggle read by the hook, not a banner stub)*
+
+> Phase 0 is complete; the data pipeline lives in `docs/phase1-checklist.md`.
 
 ## Build order
 

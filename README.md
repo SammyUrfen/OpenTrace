@@ -7,23 +7,40 @@ behavior without juggling `strace`, `lsof`, `htop`, and friends by hand.
 
 ## Current State
 
-Phase 0 — Foundation is mostly in place.
+Phase 0 (Foundation) is complete and the **Phase 1 data pipeline works end to end**:
+type a normal command in the embedded terminal with OpenTrace ON and it is
+transparently traced, measured, analyzed, and saved as a *run*.
 
 What works now:
 
-- Electron starts the FastAPI backend as a child process and waits on `/health`.
-- The renderer loads a React/Vite frontend with placeholder layout regions.
-- The bottom panel hosts `xterm.js` backed by `node-pty`.
+- **Three-level data model** — `sessions` (projects) → `terminals` → `runs`, with
+  per-run `events`, `metrics`, `anomalies`, `artifacts`, and `run_views`
+  (`backend/app/db.py`). On-disk runs hold `meta.json`, `events.ndjson.zst`,
+  `metrics.ndjson.zst`, `strace.log`, and `artifacts/`.
+- **Transparent command interception (zsh)** — a line-editor `accept-line` widget
+  rewrites a simple foreground command to `otrace -- <cmd>` *before* the shell
+  parses it, so the wrapper runs as a native foreground job (exit codes, Ctrl-C,
+  job control, quoting all behave normally). Builtins, pipelines, TUIs, and bare
+  REPLs run untraced. Bash gets an explicit `ot <cmd>` helper.
+- **Trace engine** — `strace -f -T -ttt` parsed into normalized events; a `psutil`
+  poller samples the process tree every 250 ms (CPU, RSS/VMS, FDs, threads, I/O);
+  syscall-rate is derived; a rule engine flags anomalies (FD growth, memory
+  growth, slow syscalls, repeated opens, failed opens, CPU-bound loops).
+- **Live + persisted UI** — the sidebar groups runs under projects with severity
+  dots; a Live Monitor streams CPU/Memory/FD sparklines over SSE during a run.
+- **Analytics tabs** — clicking a run opens it as a tab with **Overview**
+  (execution snapshot + ranked anomaly cards), **Memory** & **CPU** (time-series
+  charts with leak banners and 50/90% threshold lines), and **Syscalls** (a
+  sortable per-syscall table with P50/P95/P99 latency and error counts).
 - SQLite and `config.json` are created on first run under `~/.opentrace`.
-- Session rows are created and updated through the backend `/sessions` API.
-- The OpenTrace toggle is wired; in Phase 0 it only writes a banner into the terminal stream.
-- The repo root launcher `./start.sh` builds the frontend if needed, ensures Electron deps exist, sets the launch CWD, and opens the desktop window.
 
 What is still incomplete:
 
-- A packaged `opentrace` CLI binary.
-- Full command interception with real `strace` + `psutil` collection when tracing is ON.
-- The richer analysis / replay UI from later phases.
+- A packaged `opentrace` CLI binary (the `app.cli` launcher works in dev).
+- Remaining analytics tabs (Timeline, I/O, Network, Processes, Logs), diff view,
+  and LLM summaries from later phases.
+- First-run wizard, settings page, right-click context menu (Phase 2 polish).
+- bash transparent auto-interception (zsh is the fully-wrapped path).
 
 ## Repository layout
 
