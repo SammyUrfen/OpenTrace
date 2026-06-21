@@ -23,6 +23,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from starlette.responses import StreamingResponse
 
 from . import db, paths, sessions, storage
 from .util import new_id, now_ms
@@ -246,6 +247,7 @@ class RunStartResponse(BaseModel):
     run: Run
     strace_log_path: str
     run_dir: str
+    collectors: dict | None = None
 
 
 class PidReport(BaseModel):
@@ -270,6 +272,7 @@ def http_start(data: RunCreate) -> RunStartResponse:
         run=run,
         strace_log_path=str(Path(run.run_dir) / "strace.log"),
         run_dir=run.run_dir,
+        collectors=run.collector_config,
     )
 
 
@@ -376,3 +379,75 @@ def http_syscalls(rid: str) -> list[dict]:
     run = _require(rid)
     events = storage.read_ndjson_zst(Path(run.run_dir) / "events.ndjson.zst")
     return aggregate.syscall_stats(events)
+
+
+@router.get("/{rid}/io")
+def http_io(rid: str) -> list[dict]:
+    """Per-file I/O stats (opens/reads/writes/bytes/leaked) for the I/O tab."""
+    from . import aggregate
+
+    run = _require(rid)
+    events = storage.read_ndjson_zst(Path(run.run_dir) / "events.ndjson.zst")
+    return aggregate.io_stats(events)
+
+
+@router.get("/{rid}/network")
+def http_network(rid: str) -> list[dict]:
+    """Outbound connections parsed from connect() syscalls for the Network tab."""
+    from . import aggregate
+
+    run = _require(rid)
+    events = storage.read_ndjson_zst(Path(run.run_dir) / "events.ndjson.zst")
+    return aggregate.network_stats(events)
+
+
+@router.get("/{rid}/processes")
+def http_processes(rid: str) -> list[dict]:
+    """Per-process summary (command, parent, syscalls, lifespan) from events."""
+    from . import aggregate
+
+    run = _require(rid)
+    events = storage.read_ndjson_zst(Path(run.run_dir) / "events.ndjson.zst")
+    return aggregate.process_stats(events)
+
+
+@router.get("/{rid}/logs")
+def http_logs(rid: str) -> list[dict]:
+    """Program stdout/stderr reconstructed from strace's write-data dumps."""
+    from .program_output import extract_output
+
+    run = _require(rid)
+    return extract_output(Path(run.run_dir) / "strace.log")
+
+
+@router.get("/{rid}/ai-summary")
+def http_ai_summary(rid: str) -> dict:
+    """The cached AI summary for a run, or a pending/config status."""
+    from . import llm, summarize
+
+    run = _require(rid)
+    cached = summarize.read_cached(run)
+    configured = llm.is_configured()
+    if cached:
+        return {**cached, "pending": False, "configured": configured}
+    return {"text": None, "pending": True, "configured": configured}
+
+
+@router.get("/{rid}/ai-summary/stream")
+async def http_ai_summary_stream(rid: str, force: bool = False) -> StreamingResponse:
+    """Stream the AI summary as SSE (thinking/content/error/done), persisting it
+    on completion. Reuses the cached summary unless `force=true`."""
+    from . import summarize
+
+    run = _require(rid)
+
+    async def gen():
+        yield ": connected\n\n"
+        async for ev in summarize.stream_summary(run, force=force):
+            yield f"data: {json.dumps(ev, separators=(',', ':'))}\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

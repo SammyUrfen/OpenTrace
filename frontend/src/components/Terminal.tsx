@@ -34,6 +34,30 @@ interface Props {
  * through main.js and App.tsx respectively. Tracing surfaces here as ordinary
  * pty data (the banner main injects on toggle).
  */
+// xterm palettes matching the app's espresso (dark) / warm-paper (light) themes.
+const TERM_DARK = {
+  background: '#15100b', foreground: '#f0e7db', cursor: '#ff8c42',
+  cursorAccent: '#15100b', selectionBackground: '#3d2f25',
+  black: '#271e18', red: '#f06a51', green: '#9ccc65', yellow: '#ffb454',
+  blue: '#7fb3d5', magenta: '#c39ac9', cyan: '#5fbfb3', white: '#d6c8b6',
+  brightBlack: '#a8957f', brightRed: '#ff8266', brightGreen: '#b6e07a',
+  brightYellow: '#ffc777', brightBlue: '#99c7e0', brightMagenta: '#d6b3da',
+  brightCyan: '#7fd6c9', brightWhite: '#f0e7db',
+}
+const TERM_LIGHT = {
+  background: '#efe4d2', foreground: '#2e2318', cursor: '#d9722b',
+  cursorAccent: '#efe4d2', selectionBackground: '#e2d5c1',
+  black: '#2e2318', red: '#b03a28', green: '#4a7c2f', yellow: '#a8701a',
+  blue: '#2c6a9a', magenta: '#8a4b8f', cyan: '#2a7d72', white: '#6b5a44',
+  brightBlack: '#8a7660', brightRed: '#c84a35', brightGreen: '#5a8f3a',
+  brightYellow: '#bf8420', brightBlue: '#3a7aad', brightMagenta: '#9d5aa2',
+  brightCyan: '#369085', brightWhite: '#2e2318',
+}
+
+function currentTermTheme() {
+  return document.documentElement.dataset.theme === 'light' ? TERM_LIGHT : TERM_DARK
+}
+
 export function Terminal({ onStart, onExit }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   // Keep callbacks current without re-running the heavy setup effect.
@@ -52,12 +76,21 @@ export function Terminal({ onStart, onExit }: Props) {
       cursorBlink: true,
       fontFamily: 'ui-monospace, Menlo, Consolas, monospace',
       fontSize: 13,
-      theme: { background: '#0f1014' },
+      theme: currentTermTheme(),
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(host)
     fit.fit()
+
+    // Re-theme the terminal when the app theme toggles.
+    const themeObserver = new MutationObserver(() => {
+      term.options.theme = currentTermTheme()
+    })
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-theme'],
+    })
 
     const unsubscribeData = api.onData((data) => term.write(data))
     const unsubscribeExit = api.onExit((info) => {
@@ -95,6 +128,7 @@ export function Terminal({ onStart, onExit }: Props) {
 
     return () => {
       observer.disconnect()
+      themeObserver.disconnect()
       inputDisposable.dispose()
       unsubscribeData()
       unsubscribeExit()

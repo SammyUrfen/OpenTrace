@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { Project, Run } from '../state/useOpenTrace'
 import {
   formatDuration,
@@ -11,15 +12,37 @@ interface Props {
   projects: Project[]
   runs: Run[]
   connected: boolean
+  activeRunId?: string | null
+  activeSessionId?: string | null
   onSelectRun?: (run: Run) => void
+  onDeleteRun?: (run: Run) => void
+  onSelectSession?: (project: Project) => void
+  onCreateSession?: (name: string) => void
 }
 
-function RunRow({ run, onSelect }: { run: Run; onSelect?: (r: Run) => void }) {
+interface MenuState {
+  run: Run
+  x: number
+  y: number
+}
+
+function RunRow({
+  run,
+  active,
+  onSelect,
+  onContextMenu,
+}: {
+  run: Run
+  active: boolean
+  onSelect?: (r: Run) => void
+  onContextMenu?: (e: React.MouseEvent, r: Run) => void
+}) {
   return (
     <button
       type="button"
-      className="run-row"
+      className={`run-row ${active ? 'run-row--active' : ''}`}
       onClick={() => onSelect?.(run)}
+      onContextMenu={(e) => onContextMenu?.(e, run)}
       title={run.command}
     >
       <span
@@ -43,7 +66,23 @@ function RunRow({ run, onSelect }: { run: Run; onSelect?: (r: Run) => void }) {
  * Right sidebar: projects (sessions), each expandable into its runs newest
  * first, with a severity dot per run. Mirrors the roadmap's Sessions section.
  */
-export function RunSidebar({ projects, runs, connected, onSelectRun }: Props) {
+export function RunSidebar({
+  projects,
+  runs,
+  connected,
+  activeRunId,
+  activeSessionId,
+  onSelectRun,
+  onDeleteRun,
+  onSelectSession,
+  onCreateSession,
+}: Props) {
+  const [menu, setMenu] = useState<MenuState | null>(null)
+
+  const newSession = () => {
+    const name = window.prompt('New session name:', 'Project')
+    if (name && name.trim()) onCreateSession?.(name.trim())
+  }
   const runsByProject = new Map<string, Run[]>()
   for (const r of runs) {
     const list = runsByProject.get(r.session_id) ?? []
@@ -51,17 +90,35 @@ export function RunSidebar({ projects, runs, connected, onSelectRun }: Props) {
     runsByProject.set(r.session_id, list)
   }
 
+  const openMenu = (e: React.MouseEvent, run: Run) => {
+    e.preventDefault()
+    setMenu({ run, x: e.clientX, y: e.clientY })
+  }
+  const closeMenu = () => setMenu(null)
+  const doDelete = (run: Run) => {
+    closeMenu()
+    if (
+      window.confirm(
+        `Delete run "${run.display_name}"? This permanently removes its data and cannot be undone.`,
+      )
+    ) {
+      onDeleteRun?.(run)
+    }
+  }
+
   return (
     <div className="session-list">
       <div className="session-list__header">
-        <span className="region__label">Sessions</span>
-        <span className="session-list__count">
+        <span className="region__label">
           <span
             className={`conn-dot ${connected ? 'conn-dot--on' : ''}`}
             title={connected ? 'live' : 'disconnected'}
           />
-          {runs.length}
+          Sessions
         </span>
+        <button type="button" className="session-new" title="New session" onClick={newSession}>
+          + New
+        </button>
       </div>
       <div className="session-list__body">
         {projects.length === 0 && (
@@ -69,22 +126,51 @@ export function RunSidebar({ projects, runs, connected, onSelectRun }: Props) {
         )}
         {projects.map((p) => {
           const projectRuns = runsByProject.get(p.id) ?? []
+          const isActive = p.id === activeSessionId
           return (
             <div key={p.id} className="project-group">
-              <div className="project-group__header">
-                <span className="project-group__name">{p.display_name}</span>
+              <button
+                type="button"
+                className={`project-group__header ${isActive ? 'project-group__header--active' : ''}`}
+                onClick={() => onSelectSession?.(p)}
+                title={isActive ? 'Active — new runs go here' : 'Switch to this session'}
+              >
+                <span className="project-group__name">
+                  {isActive && <span className="project-group__active-dot" />}
+                  {p.display_name}
+                </span>
                 <span className="project-group__count">{projectRuns.length}</span>
-              </div>
+              </button>
               {projectRuns.length === 0 && (
                 <div className="project-group__empty">no runs yet</div>
               )}
               {projectRuns.map((r) => (
-                <RunRow key={r.id} run={r} onSelect={onSelectRun} />
+                <RunRow
+                  key={r.id}
+                  run={r}
+                  active={r.id === activeRunId}
+                  onSelect={onSelectRun}
+                  onContextMenu={openMenu}
+                />
               ))}
             </div>
           )
         })}
       </div>
+
+      {menu && (
+        <>
+          <div className="ctx-backdrop" onClick={closeMenu} onContextMenu={(e) => { e.preventDefault(); closeMenu() }} />
+          <div className="ctx-menu" style={{ left: menu.x, top: menu.y }}>
+            <button type="button" className="ctx-item" onClick={() => { closeMenu(); onSelectRun?.(menu.run) }}>
+              Open
+            </button>
+            <button type="button" className="ctx-item ctx-item--danger" onClick={() => doDelete(menu.run)}>
+              Delete
+            </button>
+          </div>
+        </>
+      )}
     </div>
   )
 }

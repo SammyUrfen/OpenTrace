@@ -27,4 +27,7 @@ contextBridge.exposeInMainWorld('opentrace', {
     set: (enabled) => ipcRenderer.invoke('tracing:set', enabled),
     get: () => ipcRenderer.invoke('tracing:get'),
   },
+  session: {
+    set: (id) => ipcRenderer.invoke('session:set', id),
+  },
 })

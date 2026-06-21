@@ -63,8 +63,13 @@ interface Hook {
   runs: Run[]
   live: Record<string, LiveState>
   liveRunId: string | null
+  /** The most recently finalized run, as `{id, n}` — `n` increments per end so
+   *  the same run ending twice (rare) still triggers a re-open. */
+  lastEnded: { id: string; n: number } | null
   connected: boolean
   refresh: () => Promise<void>
+  deleteRun: (id: string) => Promise<void>
+  createSession: (displayName: string) => Promise<Project | null>
 }
 
 /**
@@ -76,8 +81,10 @@ export function useOpenTrace(backendUrl: string): Hook {
   const [runs, setRuns] = useState<Run[]>([])
   const [live, setLive] = useState<Record<string, LiveState>>({})
   const [liveRunId, setLiveRunId] = useState<string | null>(null)
+  const [lastEnded, setLastEnded] = useState<{ id: string; n: number } | null>(null)
   const [connected, setConnected] = useState(false)
   const esRef = useRef<EventSource | null>(null)
+  const endCount = useRef(0)
 
   const refresh = useCallback(async () => {
     try {
@@ -98,6 +105,37 @@ export function useOpenTrace(backendUrl: string): Hook {
       return [run, ...without].sort((a, b) => b.started_at - a.started_at)
     })
   }, [])
+
+  const deleteRun = useCallback(
+    async (id: string) => {
+      try {
+        await fetch(`${backendUrl}/runs/${id}`, { method: 'DELETE' })
+      } catch {
+        /* ignore; we still drop it locally */
+      }
+      setRuns((prev) => prev.filter((r) => r.id !== id))
+    },
+    [backendUrl],
+  )
+
+  const createSession = useCallback(
+    async (displayName: string): Promise<Project | null> => {
+      try {
+        const r = await fetch(`${backendUrl}/sessions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ display_name: displayName }),
+        })
+        if (!r.ok) return null
+        const proj: Project = await r.json()
+        setProjects((prev) => [proj, ...prev.filter((p) => p.id !== proj.id)])
+        return proj
+      } catch {
+        return null
+      }
+    },
+    [backendUrl],
+  )
 
   useEffect(() => {
     void refresh()
@@ -124,6 +162,8 @@ export function useOpenTrace(backendUrl: string): Hook {
       } else if (type === 'run_ended') {
         if (data && data.id) upsertRun(data as Run)
         setLiveRunId((cur) => (cur === run_id ? null : cur))
+        endCount.current += 1
+        setLastEnded({ id: run_id, n: endCount.current })
         // Drop the finished run's live ring buffers so `live` can't grow without
         // bound over a long session (the run's metrics are persisted server-side).
         setLive((prev) => {
@@ -163,5 +203,8 @@ export function useOpenTrace(backendUrl: string): Hook {
     }
   }, [backendUrl, refresh, upsertRun])
 
-  return { projects, runs, live, liveRunId, connected, refresh }
+  return {
+    projects, runs, live, liveRunId, lastEnded, connected, refresh,
+    deleteRun, createSession,
+  }
 }

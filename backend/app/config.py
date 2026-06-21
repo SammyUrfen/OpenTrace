@@ -37,8 +37,18 @@ class TerminalConfig(BaseModel):
     scrollback: int = 5000
 
 
+class CollectorsConfig(BaseModel):
+    """Which collectors run for a traced command. strace and psutil are
+    functional today; ltrace/perf are reserved for Phase 6 (opt-in profiling)."""
+    strace: bool = True   # syscalls / I/O / network / processes / logs
+    psutil: bool = True   # CPU / memory / FDs / threads
+    ltrace: bool = False  # library + malloc/free calls (Phase 6)
+    perf: bool = False    # hardware counters / flamegraph (Phase 6)
+
+
 class TracingConfig(BaseModel):
     default_enabled: bool = False
+    collectors: CollectorsConfig = Field(default_factory=CollectorsConfig)
 
 
 class Config(BaseModel):

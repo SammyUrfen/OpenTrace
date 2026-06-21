@@ -28,18 +28,30 @@ What works now:
   growth, slow syscalls, repeated opens, failed opens, CPU-bound loops).
 - **Live + persisted UI** — the sidebar groups runs under projects with severity
   dots; a Live Monitor streams CPU/Memory/FD sparklines over SSE during a run.
-- **Analytics tabs** — clicking a run opens it as a tab with **Overview**
-  (execution snapshot + ranked anomaly cards), **Memory** & **CPU** (time-series
-  charts with leak banners and 50/90% threshold lines), and **Syscalls** (a
-  sortable per-syscall table with P50/P95/P99 latency and error counts).
+- **Analytics tabs** — clicking a run opens it as a tab (and a finished run
+  auto-opens) with **Overview** (snapshot + ranked anomaly cards + streaming AI
+  summary), **Memory** & **CPU** (time-series with leak banners + 50/90% threshold
+  lines), **I/O** (per-file reads/writes/bytes + ⊘ fd-leak markers), **Network**
+  (connections + timeouts), **Syscalls** (sortable P50/P95/P99 table), and **Logs**
+  (program stdout/stderr with stderr + anomaly-window highlighting).
+- **AI summaries** — a configurable OpenAI-compatible LLM (default Google
+  Gemini/Gemma) writes a sectioned analysis that streams into the Overview;
+  configured in Settings, API key kept in the OS-local secret store.
+- **Sessions, collectors, theme** — create/switch sessions (projects) in the
+  sidebar; pick which collectors run (Resource metrics / Syscall trace; ltrace &
+  perf are Phase-6 opt-ins) in the Live Monitor; an **espresso (dark) / warm-paper
+  (light)** theme with a toggle (the terminal re-themes too); a first-run wizard.
 - SQLite and `config.json` are created on first run under `~/.opentrace`.
 
 What is still incomplete:
 
 - A packaged `opentrace` CLI binary (the `app.cli` launcher works in dev).
-- Remaining analytics tabs (Timeline, I/O, Network, Processes, Logs), diff view,
-  and LLM summaries from later phases.
-- First-run wizard, settings page, right-click context menu (Phase 2 polish).
+- Remaining analytics tabs: **Timeline** (waterfall) and **Processes** (graph),
+  and the diff view (Phase 5).
+- First-run wizard + full settings page (a Settings modal for the LLM exists),
+  right-click context menu (Phase 2 polish).
+- **Phase 6 profiling** — ltrace (malloc/free) + perf (flamegraph, hotspots).
+  Tools are now installed on the host, so this is unblocked.
 - bash transparent auto-interception (zsh is the fully-wrapped path).
 
 ## Repository layout

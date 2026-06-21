@@ -677,26 +677,33 @@ API key stored in OS keyring (libsecret / Secret Service API). Never in config f
 > Live updates use **SSE** rather than WebSocket (no extra native dep).
 
 ### Phase 2 — Setup UX + Sidebar (Weeks 4–5)
-- [ ] First-run wizard (LLM config + collector defaults)
+- [x] First-run wizard (LLM config + collector defaults)
 - [ ] API key in libsecret *(file-based secret store exists; keyring swap deferred)*
-- [x] Right sidebar: sessions (projects) → runs with severity dots
-- [ ] Right-click context menu
+- [x] Right sidebar: sessions (projects) → runs with severity dots; **create + switch sessions**
+- [x] Right-click context menu (Open / Delete a run; middle-click closes a tab)
 - [x] Main tab bar + secondary tab bar (real: open runs as tabs, per-run views)
 - [x] Overview tab: execution snapshot + top anomaly cards
-- [x] Live Monitor: real-time sparklines (SSE)
-- [ ] Settings page
+- [x] Live Monitor: real-time sparklines (SSE) + **collector toggles** (strace/psutil
+      functional; ltrace/perf opt-in Phase 6)
+- [~] Settings (LLM modal + Test Connection; first-run wizard covers onboarding)
+- [x] *(§2)* first-class light/dark theme — **espresso (dark) / warm-paper (light)**,
+      shared tokens, toggle, terminal re-themes
 
 ### Phase 3 — Analytics Views (Weeks 6–9)
-- [~] Secondary tabs populated with real data: **Overview, Memory, CPU, Syscalls** done
-      (Timeline, I/O, Network, Processes, Logs pending — Logs needs stdout capture)
-- [~] Detection rule engine — foundational subset live (6 rules); full §5 set pending
-- [x] Severity highlighting (dots, colored anomaly cards, threshold lines, red error counts)
-- [ ] Real-time anomaly alerts in Live Monitor *(metrics stream live; anomalies computed at finalize)*
+- [x] Secondary tabs with real data — all 9 built: **Overview, Timeline, Memory, CPU,
+      I/O, Network, Processes, Syscalls, Logs** (custom SVG timeline + process table)
+- [~] Detection rule engine — foundational subset live (7 rules incl. slow-network);
+      full §5 set pending
+- [x] Severity highlighting (dots, colored anomaly cards, threshold lines, red errors,
+      ⊘ fd-leak markers, anomaly-window shading in Timeline + Logs)
+- [ ] Real-time anomaly alerts in Live Monitor *(metrics stream live; anomalies at finalize)*
 
 ### Phase 4 — LLM Integration (Weeks 10–11)
-- [ ] Streaming LLM call → sectioned cards in Overview
-- [ ] Rule-based fallback descriptions
-- [ ] Re-analyze button, error handling
+- [x] Streaming LLM call → sectioned summary in Overview (OpenAI-compatible;
+      default Google Gemini/Gemma; thought-chunk filtering for reasoning models)
+- [x] Rule-based fallback descriptions (anomaly cards render without an LLM)
+- [x] Re-analyze button, error handling, Settings modal (base/model/key + test),
+      API key in the secret store (never in config)
 
 ### Phase 5 — Diff View (Week 12)
 - [ ] "Compare with…" context menu

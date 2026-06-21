@@ -2,11 +2,14 @@ import type { LiveState, Run } from '../state/useOpenTrace'
 import type { Anomaly, RunDetail } from '../state/useRunDetail'
 import { SEVERITY_COLOR, formatDuration, formatTime, statusLabel } from '../state/format'
 import { Sparkline } from './Sparkline'
+import { AiSummary } from './AiSummary'
 
 interface Props {
   run: Run
   detail: RunDetail
   live: LiveState | null
+  backendUrl: string
+  onOpenSettings: () => void
 }
 
 function num(v: number | null | undefined, suffix = '', digits = 0): string {
@@ -40,7 +43,7 @@ function AnomalyCard({ a }: { a: Anomaly }) {
   )
 }
 
-export function OverviewTab({ run, detail, live }: Props) {
+export function OverviewTab({ run, detail, live, backendUrl, onOpenSettings }: Props) {
   const { summary, metrics, anomalies, loading } = detail
 
   const cpuSeries = metrics.length
@@ -76,11 +79,11 @@ export function OverviewTab({ run, detail, live }: Props) {
         {run.cwd}
       </div>
 
-      {/* AI summary placeholder (Phase 4) */}
-      <div className="overview__ai">
-        <span className="overview__ai-dot" /> AI summary — available once an LLM is
-        configured (Phase 4)
-      </div>
+      <AiSummary
+        backendUrl={backendUrl}
+        runId={run.id}
+        onOpenSettings={onOpenSettings}
+      />
 
       {/* Anomalies */}
       <h3 className="overview__h">Top findings</h3>

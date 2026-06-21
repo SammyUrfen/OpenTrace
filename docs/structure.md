@@ -57,8 +57,15 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
     interrupted by a backend restart.
 - `rules/engine.py` — anomaly rules (repeated opens, failed opens, slow syscall,
   monotonic memory growth, fd-count growth, CPU-bound) → severity + plain-English text.
-- `aggregate.py` — pure per-syscall stats (count, latency P50/P95/P99, errors,
-  %time) over the event stream; backs `GET /runs/{id}/syscalls`.
+- `aggregate.py` — pure aggregations over the event stream: per-syscall stats,
+  per-file I/O (fd→path resolution, leak detection), and outbound connections
+  (sockaddr parsing); back `GET /runs/{id}/{syscalls,io,network}`.
+- `program_output.py` — reconstructs stdout/stderr from `strace -e write=1,2`
+  hex dumps (keeps tty fidelity); backs `GET /runs/{id}/logs`.
+- `llm.py` — OpenAI-compatible streaming client (httpx) + `/config/llm` router;
+  filters reasoning-model "thought" chunks. API key in the secret store.
+- `summarize.py` — builds the run-summary prompt and streams/persists the AI
+  summary; backs `GET /runs/{id}/ai-summary[/stream]`.
 - `tests/` — pytest: parser, rules, CRUD/storage, syscall aggregation, a live
   end-to-end pipeline, and real-workload scenario tests (leak/fd-leak/exit-code).
 
@@ -91,7 +98,17 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   - sidebar/live: `RunSidebar` (projects → runs + dots), `LiveMonitor`, `Sparkline`.
   - tabs: `MainTabs` (open runs), `SecondaryTabs` (per-run views), `RunView` (dispatch).
   - analytics tabs: `OverviewTab` (snapshot + anomaly cards), `MemoryTab` / `CpuTab`
-    (`TimeSeriesChart`), `SyscallTab` (`SyscallTable`, sortable).
+    (`TimeSeriesChart`), `IoTab`, `NetworkTab`, `SyscallTab` (sortable tables),
+    `LogsTab` (program output, stderr + anomaly-window highlighting).
+  - data: `useRunDetail` (summary/metrics/anomalies), `useSyscalls`,
+    `useRunResource` (generic lazy fetch for io/network/logs/processes/events),
+    `useAiSummary` (SSE), `useTheme` (espresso/warm-paper), `useCollectors`.
+  - chrome: `RunSidebar` (create/switch sessions + run context menu), `LiveMonitor`
+    (collector toggles), `SettingsModal` (LLM), `FirstRunWizard` (onboarding),
+    `Markdown` (safe LLM-summary renderer).
+- Theme: shared CSS tokens in `index.css` — `:root` espresso (dark) +
+  `:root[data-theme=light]` warm paper; `state/useTheme.ts` + a ☾/☀ toggle; the
+  xterm terminal re-themes via a `data-theme` MutationObserver.
   - shell: `Terminal` (xterm), `TracingToggle`, layout placeholders.
 - `App.tsx` — composition: main+secondary tabs, RunView (or welcome), sidebar, and a
   bottom panel split into Terminal + Live Monitor. Clicking a sidebar run opens it as a tab.

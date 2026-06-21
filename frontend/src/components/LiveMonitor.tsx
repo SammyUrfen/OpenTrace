@@ -1,4 +1,5 @@
 import type { LiveState, Run } from '../state/useOpenTrace'
+import type { Collectors } from '../state/useCollectors'
 import { formatBytesPerSec, formatDuration } from '../state/format'
 import { Sparkline } from './Sparkline'
 
@@ -6,6 +7,55 @@ interface Props {
   activeRun: Run | null
   live: LiveState | null
   tracing: boolean
+  collectors: Collectors | null
+  onToggleCollector: (key: keyof Collectors) => void
+}
+
+const COLLECTOR_ROWS: {
+  key: keyof Collectors
+  label: string
+  sub: string
+  enabled: boolean
+}[] = [
+  { key: 'psutil', label: 'Resource metrics', sub: 'CPU · Memory · FDs', enabled: true },
+  { key: 'strace', label: 'Syscall trace', sub: 'Syscalls · I/O · Network', enabled: true },
+  { key: 'ltrace', label: 'Library calls', sub: 'malloc/free — Phase 6', enabled: false },
+  { key: 'perf', label: 'Hardware perf', sub: 'flamegraph — Phase 6', enabled: false },
+]
+
+function Collectors({
+  collectors,
+  onToggle,
+}: {
+  collectors: Collectors | null
+  onToggle: (key: keyof Collectors) => void
+}) {
+  return (
+    <div className="collectors">
+      <div className="collectors__title">Collectors</div>
+      {COLLECTOR_ROWS.map((c) => {
+        const on = collectors ? collectors[c.key] : false
+        return (
+          <label
+            key={c.key}
+            className={`collector ${c.enabled ? '' : 'collector--disabled'}`}
+            title={c.enabled ? '' : 'Available in Phase 6'}
+          >
+            <input
+              type="checkbox"
+              checked={on}
+              disabled={!c.enabled || !collectors}
+              onChange={() => onToggle(c.key)}
+            />
+            <span className="collector__text">
+              <span className="collector__label">{c.label}</span>
+              <span className="collector__sub">{c.sub}</span>
+            </span>
+          </label>
+        )
+      })}
+    </div>
+  )
 }
 
 function Metric({
@@ -34,7 +84,7 @@ function Metric({
  * Right pane of the bottom panel. Shows live metrics for the currently running
  * trace (streamed over SSE) or an idle/last-value state otherwise.
  */
-export function LiveMonitor({ activeRun, live, tracing }: Props) {
+export function LiveMonitor({ activeRun, live, tracing, collectors, onToggleCollector }: Props) {
   const latest = live?.latest ?? null
   const running = activeRun?.status === 'running'
 
@@ -44,6 +94,8 @@ export function LiveMonitor({ activeRun, live, tracing }: Props) {
         <span className="region__label">Live Monitor</span>
         <span className={`live-dot ${running ? 'live-dot--on' : ''}`} />
       </div>
+
+      <Collectors collectors={collectors} onToggle={onToggleCollector} />
 
       {!activeRun && (
         <div className="live-monitor__idle">

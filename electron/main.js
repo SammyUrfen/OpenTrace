@@ -108,6 +108,10 @@ function createWindow() {
             )
             await new Promise((r) => setTimeout(r, 1200)) // let fetch + render settle
           }
+          if (process.env.OPENTRACE_SMOKE_JS) {
+            await win.webContents.executeJavaScript(process.env.OPENTRACE_SMOKE_JS)
+            await new Promise((r) => setTimeout(r, 600))
+          }
           const img = await win.webContents.capturePage()
           require('fs').writeFileSync(outPath, img.toPNG())
           console.log(`[smoke] captured ${outPath}`)
@@ -140,6 +144,10 @@ function registerIpc() {
     return pty.isTracing()
   })
   ipcMain.handle('tracing:get', () => pty.isTracing())
+  ipcMain.handle('session:set', (_event, id) => {
+    pty.setSessionEnv(id)
+    return true
+  })
 }
 
 app.whenReady().then(async () => {

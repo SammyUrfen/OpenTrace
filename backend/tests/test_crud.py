@@ -57,6 +57,19 @@ def test_run_dir_unique_on_collision(ot_home, monkeypatch):
     assert Path(r1.run_dir).is_dir() and Path(r2.run_dir).is_dir()
 
 
+def test_run_delete_removes_row_and_dir(ot_home):
+    s = sessions.create(sessions.SessionCreate(display_name="Proj"))
+    r = runs.create(runs.RunCreate(command="x", cwd="/", session_id=s.id))
+    run_dir = Path(r.run_dir)
+    assert run_dir.is_dir()
+    assert runs.delete(r.id) is True
+    assert runs.get(r.id) is None
+    assert not run_dir.exists()
+    assert runs.delete("nope") is False
+    # deleting a run leaves its session intact
+    assert sessions.get(s.id) is not None
+
+
 def test_run_views_upsert(ot_home):
     s = sessions.create(sessions.SessionCreate(display_name="Proj"))
     r = runs.create(runs.RunCreate(command="x", cwd="/", session_id=s.id))

@@ -1,10 +1,21 @@
 :root {
-  --bg: #16171d;
-  --bg-elevated: #1c1d24;
-  --border: #2e303a;
-  --text: #e8e8ea;
-  --text-dim: #8a8f99;
-  --accent: #c084fc;
+  /* Espresso (dark, default). Light overrides in :root[data-theme="light"]. */
+  --bg: #1c1611;
+  --bg-elevated: #271e18;
+  --border: #3d2f25;
+  --text: #f0e7db;
+  --text-dim: #a8957f;
+  --accent: #ff8c42;
+
+  --hover: rgba(255, 255, 255, 0.045);
+  --shadow: rgba(0, 0, 0, 0.5);
+  --code-bg: rgba(255, 255, 255, 0.06);
+  --terminal-bg: #15100b; /* terminal + program output, themed */
+
+  /* accent tints (follow --accent automatically) */
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-faint: color-mix(in srgb, var(--accent) 7%, transparent);
+  --accent-line: color-mix(in srgb, var(--accent) 50%, transparent);
 
   --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, Consolas, monospace;
@@ -19,6 +30,22 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Warm-paper light mode (brownish-orange, burnt-orange accent). */
+:root[data-theme='light'] {
+  --bg: #f4ebdd;
+  --bg-elevated: #fffaf1;
+  --border: #e2d5c1;
+  --text: #2e2318;
+  --text-dim: #8a7660;
+  --accent: #d9722b;
+
+  --hover: rgba(70, 45, 20, 0.05);
+  --shadow: rgba(60, 40, 20, 0.14);
+  --code-bg: rgba(70, 45, 20, 0.06);
+  --terminal-bg: #efe4d2;
+  color-scheme: light;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -26,19 +53,10 @@
 body {
   margin: 0;
   overflow: hidden;
+  background: var(--bg);
 }
 
 #root {
   height: 100vh;
   width: 100vw;
-}
-
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #ffffff;
-    --bg-elevated: #f7f7f9;
-    --border: #e5e4e7;
-    --text: #08060d;
-    --text-dim: #6b6375;
-  }
 }

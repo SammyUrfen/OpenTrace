@@ -58,11 +58,17 @@ run_dir="$(_field "$resp" run_dir)"
 log="$(_field "$resp" strace_log_path)"
 { [ -z "$run_id" ] || [ -z "$log" ]; } && exec "$@"
 
+# Whether the syscall collector (strace) is enabled for this run.
+use_strace="$(printf '%s' "$resp" | grep -o '"strace":[a-z]*' | head -1 | cut -d: -f2)"
+
 export OPENTRACE_IN_RUN="$run_id"
 
-# Launch the workload under strace (or bare, if strace is unavailable).
-if command -v strace >/dev/null 2>&1; then
-  strace -f -T -ttt -o "$log" -- "$@" &
+# Launch the workload under strace, or bare if strace is disabled/unavailable.
+# `-e write=1,2` dumps the bytes the program writes to stdout/stderr into the
+# log so the Logs tab can reconstruct its output WITHOUT teeing its fds (stdio
+# and isatty() stay exactly as a native run).
+if [ "$use_strace" != "false" ] && command -v strace >/dev/null 2>&1; then
+  strace -f -T -ttt -e write=1,2 -o "$log" -- "$@" &
 else
   "$@" &
 fi

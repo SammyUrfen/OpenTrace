@@ -19,6 +19,9 @@ declare global {
         set: (enabled: boolean) => Promise<boolean>
         get: () => Promise<boolean>
       }
+      session?: {
+        set: (id: string) => Promise<boolean>
+      }
     }
   }
 }

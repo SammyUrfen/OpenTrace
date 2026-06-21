@@ -42,7 +42,7 @@ const baseDetail: RunDetail = {
 
 describe('OverviewTab', () => {
   it('renders command, findings, and the execution snapshot', () => {
-    render(<OverviewTab run={mkRun()} detail={baseDetail} live={null} />)
+    render(<OverviewTab run={mkRun()} detail={baseDetail} live={null} backendUrl="http://x" onOpenSettings={() => {}} />)
     expect(screen.getByText('python3 train.py')).toBeInTheDocument()
     // anomaly card
     expect(screen.getByText('Memory grew 80MB → 250MB')).toBeInTheDocument()
@@ -58,7 +58,7 @@ describe('OverviewTab', () => {
 
   it('shows a clean message when there are no anomalies', () => {
     const clean: RunDetail = { ...baseDetail, anomalies: [], summary: { ...baseDetail.summary!, anomalies: [] } }
-    render(<OverviewTab run={mkRun({ max_severity: 'clean' })} detail={clean} live={null} />)
+    render(<OverviewTab run={mkRun({ max_severity: 'clean' })} detail={clean} live={null} backendUrl="http://x" onOpenSettings={() => {}} />)
     expect(screen.getByText(/no anomalies detected/i)).toBeInTheDocument()
   })
 })

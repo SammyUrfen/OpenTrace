@@ -145,6 +145,14 @@ function write(data) {
   if (session) session.proc.write(data)
 }
 
+// Point the shell at a different OpenTrace session (project) so subsequent
+// traced runs attach there. Leading space keeps it out of history.
+function setSessionEnv(sessionId) {
+  if (session && sessionId) {
+    session.proc.write(` export OPENTRACE_SESSION=${sessionId}\r`)
+  }
+}
+
 function isTracing() {
   return tracingEnabled
 }
@@ -155,6 +163,7 @@ module.exports = {
   resize,
   dispose,
   setTracing,
+  setSessionEnv,
   isTracing,
   getInfo,
 }

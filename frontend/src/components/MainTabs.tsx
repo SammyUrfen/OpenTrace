@@ -23,6 +23,13 @@ export function MainTabs({ openRuns, activeRunId, onSelect, onClose, rightSlot }
             key={run.id}
             className={`main-tab ${run.id === activeRunId ? 'main-tab--active' : ''}`}
             onClick={() => onSelect(run.id)}
+            // Middle-click closes the tab, like a browser.
+            onAuxClick={(e) => {
+              if (e.button === 1) {
+                e.preventDefault()
+                onClose(run.id)
+              }
+            }}
             role="tab"
             aria-selected={run.id === activeRunId}
             title={run.command}

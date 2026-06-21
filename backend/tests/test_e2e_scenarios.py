@@ -100,3 +100,29 @@ def test_exit_code_preserved(ot_home):
     final, _, _ = _run_scenario("import sys; sys.exit(42)", ot_home=ot_home)
     assert final.exit_code == 42
     assert final.status == runs.COMPLETED
+
+
+def test_metrics_only_when_strace_disabled(ot_home):
+    """With the syscall collector off, the command runs BARE (no strace) but the
+    psutil poller still samples it directly (descendants_only flips to include
+    the workload root)."""
+    s = sessions.create(sessions.SessionCreate(display_name="MetricsOnly"))
+    run = orchestrator.start_run(runs.RunCreate(
+        command="python3 sleeper", cwd="/tmp", session_id=s.id,
+        collector_config={"strace": False, "psutil": True},
+    ))
+    # otrace would run the command bare here; the reported pid IS the workload.
+    proc = subprocess.Popen(
+        ["python3", "-c", "import time\nfor _ in range(8): time.sleep(0.25)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    assert orchestrator.report_pid(run.id, proc.pid) is True
+    proc.wait(timeout=30)
+    final = orchestrator.end_run(run.id, exit_code=proc.returncode, ended_at=now_ms())
+
+    assert final.status == runs.COMPLETED
+    metrics = storage.read_metrics(run.id)
+    assert len(metrics) >= 4, "psutil should sample even without strace"
+    # no strace.log -> no events -> clean (no anomalies need events)
+    assert not (Path(run.run_dir) / "strace.log").exists()
+    assert final.max_severity == "clean"

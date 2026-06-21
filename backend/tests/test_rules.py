@@ -105,6 +105,37 @@ def test_cpu_bound_no_syscalls():
     assert a is not None and a.severity == "medium"
 
 
+def test_cpu_bound_single_core_on_manycore_host():
+    # Regression: a single-threaded hot loop reads ~100% (one core) even on a
+    # 20-core host — it must NOT be diluted by the total core count.
+    metrics = [metric(i * 250, cpu_pct=100, syscall_rate=2) for i in range(10)]
+    out = run_rules(RuleContext(events=[], metrics=metrics, cpu_cores=20))
+    assert fired(out, "cpu_bound_no_syscalls") is not None
+
+
+def test_slow_network_connect_via_nonblocking_poll():
+    # Python settimeout pattern: connect -> EINPROGRESS (fast), poll blocks 2.5s
+    events = [
+        ev(0, "connect", error="EINPROGRESS", retval="-1", latency_ms=0.1),
+        ev(1, "poll", latency_ms=2503.0),
+    ]
+    a = fired(run_rules(RuleContext(events=events)), "slow_network_connect")
+    assert a is not None and a.severity == "high" and a.occurrence_count == 1
+
+
+def test_slow_network_connect_blocking():
+    events = [ev(0, "connect", retval="-1", error="ETIMEDOUT", latency_ms=2500.0)]
+    assert fired(run_rules(RuleContext(events=events)), "slow_network_connect") is not None
+
+
+def test_fast_connect_does_not_trigger_network():
+    events = [
+        ev(0, "connect", error="EINPROGRESS", retval="-1", latency_ms=0.1),
+        ev(1, "poll", latency_ms=2.0),  # connected quickly
+    ]
+    assert fired(run_rules(RuleContext(events=events)), "slow_network_connect") is None
+
+
 def test_clean_run_has_no_anomalies():
     events = [ev(i, "read", fd=3, retval="100") for i in range(5)]
     metrics = [metric(i * 250, cpu_pct=10, rss_mb=50, open_fds=8, syscall_rate=20) for i in range(10)]

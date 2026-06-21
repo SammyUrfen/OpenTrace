@@ -161,6 +161,57 @@ _BLOCKING_SYSCALLS = {
 }
 
 
+_POLL_FAMILY = {
+    "poll", "ppoll", "select", "pselect6", "epoll_wait", "epoll_pwait",
+}
+_SLOW_NET_MS = 1000.0
+
+
+def slow_network_connect(ctx: RuleContext) -> Anomaly | None:
+    """A network connect that took over 1s (HIGH).
+
+    Handles both shapes: a directly-blocking `connect()` whose own latency is
+    high, and the non-blocking pattern (`connect` returns EINPROGRESS, then a
+    `poll`/`select`/`epoll_wait` blocks waiting for it) that Python's
+    `socket.settimeout` produces — where the slow time lives in the poll, not
+    the connect, so the generic slow-syscall rule (which ignores poll) misses it.
+    """
+    pending: dict[int, TraceEvent] = {}  # pid -> in-flight connect
+    slow: list[TraceEvent] = []
+    for ev in ctx.events:
+        if ev.syscall == "connect":
+            if ev.latency_ms is not None and ev.latency_ms > _SLOW_NET_MS:
+                slow.append(ev)  # blocking connect, slow on its own
+                pending.pop(ev.pid, None)
+            elif ev.error in ("EINPROGRESS", "EALREADY"):
+                pending[ev.pid] = ev
+            else:
+                pending.pop(ev.pid, None)  # completed quickly
+        elif ev.syscall in _POLL_FAMILY and ev.pid in pending:
+            if ev.latency_ms is not None and ev.latency_ms > _SLOW_NET_MS:
+                slow.append(pending[ev.pid])  # the connect this poll waited on
+            pending.pop(ev.pid, None)
+    if not slow:
+        return None
+    n = len(slow)
+    return Anomaly(
+        rule_id="slow_network_connect",
+        severity="high",
+        severity_score=_score("high", n),
+        title=f"Slow network connect — {n} connection(s) blocked >1s",
+        description=(
+            f"{n} outbound connect() attempt(s) took longer than 1s to complete "
+            f"or time out. An unreachable/slow host, a missing route, or DNS/"
+            f"firewall delay stalls the program here — add timeouts and retries, "
+            f"and check the destination is reachable."
+        ),
+        evidence=slow[:20],
+        first_seen_ms=min(e.timestamp_ms for e in slow),
+        last_seen_ms=max(e.timestamp_ms for e in slow),
+        occurrence_count=n,
+    )
+
+
 def slow_syscall(ctx: RuleContext) -> Anomaly | None:
     """A non-blocking syscall that took over 1s (HIGH)."""
     slow = [
@@ -258,18 +309,20 @@ def fd_count_growing(ctx: RuleContext) -> Anomaly | None:
 
 
 def cpu_bound_no_syscalls(ctx: RuleContext) -> Anomaly | None:
-    """Sustained high CPU with almost no syscalls — pure compute (MEDIUM)."""
+    """Sustained high CPU with almost no syscalls — pure compute (MEDIUM).
+
+    `cpu_pct` is psutil's per-core percentage summed across the tree (100% = one
+    fully-busy core), so a single-threaded hot loop reads ~100% regardless of how
+    many cores the host has. We threshold on raw saturation of ~one core, NOT on
+    a fraction of all cores (which would never trip on a many-core machine).
+    """
     rows = [
         m for m in ctx.metrics
         if m.get("cpu_pct") is not None and m.get("syscall_rate") is not None
     ]
     if len(rows) < 8:
         return None
-    cores = max(1, ctx.cpu_cores)
-    hot = [
-        m for m in rows
-        if (m["cpu_pct"] / cores) > 90 and m["syscall_rate"] < 50
-    ]
+    hot = [m for m in rows if m["cpu_pct"] > 90 and m["syscall_rate"] < 50]
     # Require ~2s of sustained hot samples (≈8 ticks at 250ms).
     if len(hot) < 8:
         return None
@@ -294,6 +347,7 @@ RULES: list[Callable[[RuleContext], Anomaly | None]] = [
     repeated_open_same_file,
     failed_file_opens,
     slow_syscall,
+    slow_network_connect,
     monotonic_memory_growth,
     fd_count_growing,
     cpu_bound_no_syscalls,

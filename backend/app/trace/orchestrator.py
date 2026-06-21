@@ -77,6 +77,9 @@ def _sweep_stale() -> None:
 
 def start_run(data: runs.RunCreate) -> runs.Run:
     _sweep_stale()
+    if data.collector_config is None:
+        from .. import config
+        data.collector_config = config.load().tracing.collectors.model_dump()
     run = runs.create(data)
     with _lock:
         _active[run.id] = _RunContext(run=run, created_ms=now_ms())
@@ -89,6 +92,13 @@ def report_pid(run_id: str, pid: int) -> bool:
     run = runs.get(run_id)
     if run is None:
         return False
+    collectors = run.collector_config or {}
+    # No psutil collector -> acknowledge but don't poll metrics.
+    if not collectors.get("psutil", True):
+        return True
+    # When strace traces the tree, `pid` is strace and we watch its children;
+    # without strace, `pid` is the workload itself, so include the root.
+    descendants_only = collectors.get("strace", True)
     with _lock:
         ctx = _active.get(run_id)
         if ctx is None:
@@ -101,10 +111,12 @@ def report_pid(run_id: str, pid: int) -> bool:
             pid,
             on_sample=lambda s, rid=run_id: _on_sample(rid, s),
             on_exhausted=lambda rid=run_id: _auto_finalize(rid),
+            descendants_only=descendants_only,
         )
         ctx.poller = poller
     poller.start()
-    log.info("run %s polling pid tree under %d", run_id, pid)
+    log.info("run %s polling pid tree under %d (descendants_only=%s)",
+             run_id, pid, descendants_only)
     return True
 
 

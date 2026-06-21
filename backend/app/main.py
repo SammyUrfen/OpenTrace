@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import config, db, paths, run_views, runs, sessions, terminals
+from . import config, db, llm, paths, run_views, runs, sessions, terminals
 from .streaming import sse_response
 from .trace import metrics as metrics_mod
 from .trace import orchestrator
@@ -46,11 +46,25 @@ app.include_router(sessions.router)
 app.include_router(terminals.router)
 app.include_router(runs.router)
 app.include_router(run_views.router)
+app.include_router(llm.router)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/config/tracing", response_model=config.TracingConfig)
+def get_tracing_config() -> config.TracingConfig:
+    return config.load().tracing
+
+
+@app.put("/config/tracing", response_model=config.TracingConfig)
+def put_tracing_config(data: config.TracingConfig) -> config.TracingConfig:
+    cfg = config.load()
+    cfg.tracing = data
+    config.save(cfg)
+    return cfg.tracing
 
 
 @app.get("/info")
