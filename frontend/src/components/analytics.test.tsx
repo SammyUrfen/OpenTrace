@@ -64,23 +64,25 @@ describe('OverviewTab', () => {
 })
 
 describe('MainTabs', () => {
-  it('renders a tab per open run and fires select/close', () => {
+  const tabs = [
+    { key: 'run:r1', label: 'python_20260621_120000', dotColor: '#fb923c' },
+    { key: 'diff:r1:r2', label: 'python ↔ node', diff: true },
+  ]
+
+  it('renders run + diff tabs and fires select/close by key', () => {
     const onSelect = vi.fn()
     const onClose = vi.fn()
-    const runs = [mkRun(), mkRun({ id: 'r2', display_name: 'node_20260621_120100', max_severity: 'clean' })]
-    render(
-      <MainTabs openRuns={runs} activeRunId="r1" onSelect={onSelect} onClose={onClose} />,
-    )
+    render(<MainTabs tabs={tabs} activeKey="run:r1" onSelect={onSelect} onClose={onClose} />)
     expect(screen.getByText('python_20260621_120000')).toBeInTheDocument()
-    expect(screen.getByText('node_20260621_120100')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('node_20260621_120100'))
-    expect(onSelect).toHaveBeenCalledWith('r2')
+    expect(screen.getByText('python ↔ node')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('python ↔ node'))
+    expect(onSelect).toHaveBeenCalledWith('diff:r1:r2')
     fireEvent.click(screen.getAllByLabelText('close tab')[0])
-    expect(onClose).toHaveBeenCalledWith('r1')
+    expect(onClose).toHaveBeenCalledWith('run:r1')
   })
 
-  it('shows a hint when no runs are open', () => {
-    render(<MainTabs openRuns={[]} activeRunId={null} onSelect={vi.fn()} onClose={vi.fn()} />)
+  it('shows a hint when no tabs are open', () => {
+    render(<MainTabs tabs={[]} activeKey={null} onSelect={vi.fn()} onClose={vi.fn()} />)
     expect(screen.getByText(/click a run in the sidebar/i)).toBeInTheDocument()
   })
 })

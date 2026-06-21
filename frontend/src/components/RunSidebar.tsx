@@ -16,6 +16,7 @@ interface Props {
   activeSessionId?: string | null
   onSelectRun?: (run: Run) => void
   onDeleteRun?: (run: Run) => void
+  onCompareRuns?: (a: Run, b: Run) => void
   onSelectSession?: (project: Project) => void
   onCreateSession?: (name: string) => void
 }
@@ -24,6 +25,7 @@ interface MenuState {
   run: Run
   x: number
   y: number
+  mode: 'main' | 'compare'
 }
 
 function RunRow({
@@ -74,6 +76,7 @@ export function RunSidebar({
   activeSessionId,
   onSelectRun,
   onDeleteRun,
+  onCompareRuns,
   onSelectSession,
   onCreateSession,
 }: Props) {
@@ -92,7 +95,7 @@ export function RunSidebar({
 
   const openMenu = (e: React.MouseEvent, run: Run) => {
     e.preventDefault()
-    setMenu({ run, x: e.clientX, y: e.clientY })
+    setMenu({ run, x: e.clientX, y: e.clientY, mode: 'main' })
   }
   const closeMenu = () => setMenu(null)
   const doDelete = (run: Run) => {
@@ -162,12 +165,42 @@ export function RunSidebar({
         <>
           <div className="ctx-backdrop" onClick={closeMenu} onContextMenu={(e) => { e.preventDefault(); closeMenu() }} />
           <div className="ctx-menu" style={{ left: menu.x, top: menu.y }}>
-            <button type="button" className="ctx-item" onClick={() => { closeMenu(); onSelectRun?.(menu.run) }}>
-              Open
-            </button>
-            <button type="button" className="ctx-item ctx-item--danger" onClick={() => doDelete(menu.run)}>
-              Delete
-            </button>
+            {menu.mode === 'main' ? (
+              <>
+                <button type="button" className="ctx-item" onClick={() => { closeMenu(); onSelectRun?.(menu.run) }}>
+                  Open
+                </button>
+                <button
+                  type="button"
+                  className="ctx-item"
+                  disabled={runs.length < 2}
+                  onClick={() => setMenu({ ...menu, mode: 'compare' })}
+                >
+                  Compare with… ▸
+                </button>
+                <button type="button" className="ctx-item ctx-item--danger" onClick={() => doDelete(menu.run)}>
+                  Delete
+                </button>
+              </>
+            ) : (
+              <div className="ctx-submenu">
+                <div className="ctx-submenu__head">Compare with…</div>
+                {runs
+                  .filter((r) => r.id !== menu.run.id)
+                  .slice(0, 12)
+                  .map((other) => (
+                    <button
+                      key={other.id}
+                      type="button"
+                      className="ctx-item"
+                      onClick={() => { closeMenu(); onCompareRuns?.(menu.run, other) }}
+                      title={other.command}
+                    >
+                      {other.display_name}
+                    </button>
+                  ))}
+              </div>
+            )}
           </div>
         </>
       )}

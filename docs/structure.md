@@ -64,8 +64,9 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   hex dumps (keeps tty fidelity); backs `GET /runs/{id}/logs`.
 - `llm.py` — OpenAI-compatible streaming client (httpx) + `/config/llm` router;
   filters reasoning-model "thought" chunks. API key in the secret store.
-- `summarize.py` — builds the run-summary prompt and streams/persists the AI
-  summary; backs `GET /runs/{id}/ai-summary[/stream]`.
+- `summarize.py` — builds the run-summary + run-diff prompts and streams/persists
+  AI summaries; backs `GET /runs/{id}/ai-summary[/stream]` and
+  `GET /diff/{a}/{b}/ai-summary/stream`.
 - `tests/` — pytest: parser, rules, CRUD/storage, syscall aggregation, a live
   end-to-end pipeline, and real-workload scenario tests (leak/fd-leak/exit-code).
 
@@ -103,9 +104,12 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   - data: `useRunDetail` (summary/metrics/anomalies), `useSyscalls`,
     `useRunResource` (generic lazy fetch for io/network/logs/processes/events),
     `useAiSummary` (SSE), `useTheme` (espresso/warm-paper), `useCollectors`.
-  - chrome: `RunSidebar` (create/switch sessions + run context menu), `LiveMonitor`
-    (collector toggles), `SettingsModal` (LLM), `FirstRunWizard` (onboarding),
-    `Markdown` (safe LLM-summary renderer).
+  - diff: `DiffView` (+ `DIFF_VIEWS`) + `DiffPanels` (Memory/CPU/Syscall/Anomaly Δ);
+    `useDiff` (both runs' data), AI diff card streams `/diff/{a}/{b}/ai-summary`.
+  - chrome: `RunSidebar` (create/switch sessions + run context menu incl. "Compare
+    with…"), `LiveMonitor` (collector toggles), `SettingsModal` (LLM),
+    `FirstRunWizard` (onboarding), `Markdown` (safe LLM-summary renderer).
+  - tabs: `useTabs` (unified run + diff tab model; `tabKey`), `MainTabs` (generic).
 - Theme: shared CSS tokens in `index.css` — `:root` espresso (dark) +
   `:root[data-theme=light]` warm paper; `state/useTheme.ts` + a ☾/☀ toggle; the
   xterm terminal re-themes via a `data-theme` MutationObserver.

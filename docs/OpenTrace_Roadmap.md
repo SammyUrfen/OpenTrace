@@ -7,6 +7,22 @@
 
 ---
 
+## Current Milestone
+
+> **Status (as of 2026-06-21):** Phases **0, 1, 2, 3, 4, 5 complete**. The full
+> loop works — type a command → transparent strace+psutil trace → 9 analytics
+> tabs (Overview, Timeline, Memory, CPU, I/O, Network, Processes, Syscalls, Logs)
+> → AI summary → run-to-run **diff view**. Plus sessions (create/switch),
+> selectable collectors, an espresso/warm-paper theme, and a first-run wizard.
+> **93 tests** (63 backend pytest + 30 frontend vitest), verified end-to-end.
+>
+> **Next:** Phase 6 (ltrace/perf profiling — tools installed), Phase 7
+> (packaging + libsecret keyring + session export), Phase 8 (advanced). Open
+> Phase-2/3 remainders: real-time anomaly alerts in the Live Monitor; the full
+> §5 rule set. See per-phase checkboxes in §10.
+
+---
+
 ## Table of Contents
 
 1. [Product Philosophy](#1-product-philosophy)
@@ -705,10 +721,11 @@ API key stored in OS keyring (libsecret / Secret Service API). Never in config f
 - [x] Re-analyze button, error handling, Settings modal (base/model/key + test),
       API key in the secret store (never in config)
 
-### Phase 5 — Diff View (Week 12)
-- [ ] "Compare with…" context menu
-- [ ] All diff secondary tabs
-- [ ] AI diff summary
+### Phase 5 — Diff View (Week 12) — DONE
+- [x] "Compare with…" context menu → opens an A ↔ B diff tab
+- [x] Diff secondary tabs: Overview Δ · Memory Δ · CPU Δ · Syscalls Δ · Anomalies Δ
+      (∆ column with better/worse colouring; overlaid metric charts; 3-column anomaly diff)
+- [x] AI diff summary (streaming "what changed, better or worse?")
 
 ### Phase 6 — Function Profiling (Weeks 13–14)
 - [ ] ltrace integration (malloc/free tracking)

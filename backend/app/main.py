@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import config, db, llm, paths, run_views, runs, sessions, terminals
@@ -92,3 +92,28 @@ def stream_all():
 def stream_run(rid: str):
     """Live channel scoped to a single run."""
     return sse_response(rid)
+
+
+@app.get("/diff/{a}/{b}/ai-summary/stream")
+async def diff_ai_summary_stream(a: str, b: str):
+    """Stream an AI comparison of two runs as SSE (no cache — regenerated)."""
+    import json as _json
+
+    from starlette.responses import StreamingResponse
+
+    from . import summarize
+
+    run_a, run_b = runs.get(a), runs.get(b)
+    if run_a is None or run_b is None:
+        raise HTTPException(status_code=404, detail="run not found")
+
+    async def gen():
+        yield ": connected\n\n"
+        async for ev in summarize.stream_diff_summary(run_a, run_b):
+            yield f"data: {_json.dumps(ev, separators=(',', ':'))}\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

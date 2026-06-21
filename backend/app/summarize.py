@@ -72,6 +72,91 @@ def build_messages(run: runs.Run, summary: dict | None, anomalies: list[dict]) -
     ]
 
 
+DIFF_SYSTEM_PROMPT = (
+    "You compare two runs (A and B) of usually the same program for the developer "
+    "who ran them. Explain WHAT CHANGED and whether B is better, worse, or mixed "
+    "versus A. Respond in markdown using EXACTLY these headers:\n"
+    "## Verdict\n## What Changed\n## Likely Cause\n## What to Check\n\n"
+    "'Verdict' is one line (better / worse / mixed + the headline). Quantify the "
+    "deltas, focus on the biggest changes (runtime, memory, syscalls, anomalies), "
+    "and note metrics are under strace overhead. Don't invent data."
+)
+
+
+def _run_block(tag: str, run: runs.Run, summary: dict | None, anomalies: list[dict]) -> str:
+    s = summary or {}
+    peaks = s.get("peaks", {})
+    totals = s.get("totals", {})
+    lines = [
+        f"Run {tag}: {run.command}",
+        f"  duration={run.duration_ms}ms exit={run.exit_code} "
+        f"peakCPU={peaks.get('cpu_pct')}% peakRSS={peaks.get('rss_mb')}MB "
+        f"syscalls={totals.get('syscall_events')} errors={totals.get('errors')}",
+    ]
+    if anomalies:
+        lines.append(f"  anomalies: " + "; ".join(
+            f"[{a['severity']}] {a['title']}" for a in anomalies
+        ))
+    else:
+        lines.append("  anomalies: none")
+    return "\n".join(lines)
+
+
+def build_diff_messages(
+    run_a: runs.Run, sum_a: dict | None, anom_a: list[dict],
+    run_b: runs.Run, sum_b: dict | None, anom_b: list[dict],
+) -> list[dict]:
+    a_rules = {x["rule_id"] for x in anom_a}
+    b_rules = {x["rule_id"] for x in anom_b}
+    added = [x["title"] for x in anom_b if x["rule_id"] not in a_rules]
+    removed = [x["title"] for x in anom_a if x["rule_id"] not in b_rules]
+
+    def delta(key: str, path: str) -> str:
+        pa = (sum_a or {}).get(path, {}).get(key)
+        pb = (sum_b or {}).get(path, {}).get(key)
+        if pa is None or pb is None:
+            return f"{key}: A={pa} B={pb}"
+        return f"{key}: A={pa} B={pb} (Δ {pb - pa:+})"
+
+    user = "\n".join([
+        _run_block("A", run_a, sum_a, anom_a),
+        _run_block("B", run_b, sum_b, anom_b),
+        "\nKey deltas (B − A):",
+        f"  duration: A={run_a.duration_ms} B={run_b.duration_ms} "
+        f"(Δ {(run_b.duration_ms or 0) - (run_a.duration_ms or 0):+}ms)",
+        f"  {delta('rss_mb', 'peaks')}",
+        f"  {delta('cpu_pct', 'peaks')}",
+        f"  {delta('syscall_events', 'totals')}",
+        f"  {delta('errors', 'totals')}",
+        f"  anomalies added in B: {added or 'none'}",
+        f"  anomalies gone in B: {removed or 'none'}",
+        "\nWrite the comparison now.",
+    ])
+    return [
+        {"role": "system", "content": DIFF_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+
+
+async def stream_diff_summary(run_a: runs.Run, run_b: runs.Run) -> AsyncIterator[dict]:
+    if not llm.is_configured():
+        yield {"type": "error", "message": "LLM is not configured"}
+        return
+    sum_a = _load_meta(run_a)
+    sum_b = _load_meta(run_b)
+    messages = build_diff_messages(
+        run_a, sum_a, storage.read_anomalies(run_a.id),
+        run_b, sum_b, storage.read_anomalies(run_b.id),
+    )
+    async for ev in llm.stream_chat(messages):
+        yield ev
+
+
+def _load_meta(run: runs.Run) -> dict | None:
+    meta = Path(run.run_dir) / "meta.json"
+    return json.loads(meta.read_text()) if meta.exists() else None
+
+
 def ai_summary_path(run: runs.Run) -> Path:
     return Path(run.run_dir) / "ai_summary.md"
 

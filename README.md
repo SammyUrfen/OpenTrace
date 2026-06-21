@@ -37,6 +37,10 @@ What works now:
 - **AI summaries** — a configurable OpenAI-compatible LLM (default Google
   Gemini/Gemma) writes a sectioned analysis that streams into the Overview;
   configured in Settings, API key kept in the OS-local secret store.
+- **Diff view** — right-click a run → "Compare with…" opens an A ↔ B tab:
+  Overview Δ (a ∆ table with better/worse colouring), Memory/CPU Δ (overlaid
+  charts), Syscalls Δ, Anomalies Δ (only-A / both / only-B), and a streaming
+  **AI diff summary** ("what changed, better or worse?").
 - **Sessions, collectors, theme** — create/switch sessions (projects) in the
   sidebar; pick which collectors run (Resource metrics / Syscall trace; ltrace &
   perf are Phase-6 opt-ins) in the Live Monitor; an **espresso (dark) / warm-paper
@@ -46,13 +50,12 @@ What works now:
 What is still incomplete:
 
 - A packaged `opentrace` CLI binary (the `app.cli` launcher works in dev).
-- Remaining analytics tabs: **Timeline** (waterfall) and **Processes** (graph),
-  and the diff view (Phase 5).
-- First-run wizard + full settings page (a Settings modal for the LLM exists),
-  right-click context menu (Phase 2 polish).
 - **Phase 6 profiling** — ltrace (malloc/free) + perf (flamegraph, hotspots).
-  Tools are now installed on the host, so this is unblocked.
-- bash transparent auto-interception (zsh is the fully-wrapped path).
+  Tools are installed on the host, so this is unblocked.
+- **Phase 7** — `.deb`/`.AppImage` packaging, libsecret keyring, session export.
+- Smaller gaps: real-time anomaly alerts in the Live Monitor (anomalies are
+  computed at finalize today); the full §5 rule set; bash transparent
+  auto-interception (zsh is the fully-wrapped path).
 
 ## Repository layout
 

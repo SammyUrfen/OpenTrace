@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import './App.css'
-import { MainTabs } from './components/MainTabs'
+import { MainTabs, type TabInfo } from './components/MainTabs'
 import { SecondaryTabs } from './components/SecondaryTabs'
 import {
   MainContentPlaceholder,
   type BackendStatus,
 } from './components/MainContentPlaceholder'
 import { RunView, RUN_VIEWS } from './components/RunView'
+import { DiffView, DIFF_VIEWS } from './components/DiffView'
 import { RunSidebar } from './components/RunSidebar'
 import { LiveMonitor } from './components/LiveMonitor'
 import { Terminal } from './components/Terminal'
@@ -18,6 +19,9 @@ import { useOpenTrace } from './state/useOpenTrace'
 import { useRunDetail } from './state/useRunDetail'
 import { useTheme } from './state/useTheme'
 import { useCollectors } from './state/useCollectors'
+import { useTabs, tabKey } from './state/useTabs'
+import { severityColor } from './state/format'
+import { commandBasename } from './state/text'
 
 const BACKEND_URL =
   (typeof window !== 'undefined' && window.opentrace?.backendUrl) ||
@@ -29,19 +33,15 @@ function App() {
   const { resolved: themeResolved, toggle: toggleTheme } = useTheme()
   const { collectors, toggle: toggleCollector } = useCollectors(BACKEND_URL)
   const ot = useOpenTrace(BACKEND_URL)
+  const tabsApi = useTabs()
+  const { tabs, activeKey, activeView, setActiveView, openRun, openDiff, select, close } = tabsApi
 
-  // Open run tabs + which one is focused + which analytics view.
-  const [openRunIds, setOpenRunIds] = useState<string[]>([])
-  const [focusedRunId, setFocusedRunId] = useState<string | null>(null)
-  const [activeView, setActiveView] = useState('overview')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [onboarded, setOnboarded] = useState(
     () => localStorage.getItem('opentrace-onboarded') === '1',
   )
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
 
-  // Default the active session to the most recent project once loaded (the
-  // terminal already attached to it, so we don't push it back to the shell).
   useEffect(() => {
     if (!activeSessionId && ot.projects.length > 0) {
       setActiveSessionId(ot.projects[0].id)
@@ -50,53 +50,41 @@ function App() {
 
   const selectSession = (id: string) => {
     setActiveSessionId(id)
-    void window.opentrace?.session?.set(id) // new traced runs attach here
+    void window.opentrace?.session?.set(id)
   }
   const createSession = async (name: string) => {
     const proj = await ot.createSession(name)
     if (proj) selectSession(proj.id)
   }
 
-  const openRuns = openRunIds
-    .map((id) => ot.runs.find((r) => r.id === id))
-    .filter((r): r is NonNullable<typeof r> => Boolean(r))
-  const focusedRun = ot.runs.find((r) => r.id === focusedRunId) ?? null
+  const focusedTab = tabs.find((t) => tabKey(t) === activeKey) ?? null
+  const focusedRunId = focusedTab?.kind === 'run' ? focusedTab.runId : null
+  const focusedRun = focusedRunId ? ot.runs.find((r) => r.id === focusedRunId) ?? null : null
   const detail = useRunDetail(BACKEND_URL, focusedRunId, focusedRun?.status)
   const focusedLive = focusedRunId ? ot.live[focusedRunId] ?? null : null
 
-  const openRun = useCallback((id: string) => {
-    setOpenRunIds((prev) => (prev.includes(id) ? prev : [...prev, id]))
-    setFocusedRunId(id)
-    setActiveView('overview')
-  }, [])
-
-  // When a run finishes, open it as the focused tab so the result is never lost
-  // ("where did my run go?"). Mirrors the roadmap: a tab opens on completion.
+  // Finished runs auto-open as the focused tab (roadmap behaviour).
   useEffect(() => {
     if (ot.lastEnded) openRun(ot.lastEnded.id)
   }, [ot.lastEnded, openRun])
-  const closeRun = (id: string) => {
-    setOpenRunIds((prev) => {
-      const idx = prev.indexOf(id)
-      const next = prev.filter((x) => x !== id)
-      if (focusedRunId === id) {
-        // Focus the right neighbour, or the left one if we closed the last tab.
-        setFocusedRunId(next[idx] ?? next[idx - 1] ?? null)
-      }
-      return next
-    })
-  }
 
-  // Prune open/focused tabs whose run no longer exists (deleted elsewhere), so
-  // we never render a dangling tab or fetch detail for a 404'd run.
+  // Prune tabs whose run(s) no longer exist; reconcile the active tab.
   useEffect(() => {
     const ids = new Set(ot.runs.map((r) => r.id))
-    setOpenRunIds((prev) => {
-      const next = prev.filter((id) => ids.has(id))
-      return next.length === prev.length ? prev : next // keep ref if unchanged
+    tabsApi.setTabs((prev) => {
+      const next = prev.filter((t) =>
+        t.kind === 'run' ? ids.has(t.runId) : ids.has(t.aId) && ids.has(t.bId),
+      )
+      return next.length === prev.length ? prev : next
     })
-    if (focusedRunId && !ids.has(focusedRunId)) setFocusedRunId(null)
-  }, [ot.runs, focusedRunId])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ot.runs])
+  useEffect(() => {
+    if (activeKey && !tabs.some((t) => tabKey(t) === activeKey)) {
+      tabsApi.setActiveKey(tabs.length ? tabKey(tabs[tabs.length - 1]) : null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabs, activeKey])
 
   useEffect(() => {
     let cancelled = false
@@ -117,13 +105,36 @@ function App() {
     }
   }, [])
 
+  // Build the tab bar info (resolve run names / diff labels).
+  const tabInfos: TabInfo[] = tabs.map((t) => {
+    if (t.kind === 'run') {
+      const r = ot.runs.find((x) => x.id === t.runId)
+      return {
+        key: tabKey(t),
+        label: r?.display_name ?? t.runId.slice(0, 8),
+        dotColor: r ? severityColor(r.max_severity, r.status) : undefined,
+        title: r?.command,
+      }
+    }
+    const a = ot.runs.find((x) => x.id === t.aId)
+    const b = ot.runs.find((x) => x.id === t.bId)
+    return {
+      key: tabKey(t),
+      label: `${commandBasename(a?.command ?? '?')} ↔ ${commandBasename(b?.command ?? '?')}`,
+      diff: true,
+      title: `Diff: ${a?.display_name ?? t.aId} ↔ ${b?.display_name ?? t.bId}`,
+    }
+  })
+
+  const views = focusedTab?.kind === 'diff' ? DIFF_VIEWS : RUN_VIEWS
+
   return (
     <div className="app-shell">
       <MainTabs
-        openRuns={openRuns}
-        activeRunId={focusedRunId}
-        onSelect={setFocusedRunId}
-        onClose={closeRun}
+        tabs={tabInfos}
+        activeKey={activeKey}
+        onSelect={select}
+        onClose={close}
         rightSlot={
           <>
             <button
@@ -142,22 +153,18 @@ function App() {
             >
               ⚙
             </button>
-            <TracingToggle
-              enabled={tracing}
-              onChange={setTracing}
-              disabled={!tracingReady}
-            />
+            <TracingToggle enabled={tracing} onChange={setTracing} disabled={!tracingReady} />
           </>
         }
       />
-      {focusedRun ? (
-        <SecondaryTabs views={RUN_VIEWS} active={activeView} onSelect={setActiveView} />
+      {focusedTab ? (
+        <SecondaryTabs views={views} active={activeView} onSelect={setActiveView} />
       ) : (
         <div className="region region--secondary-tabs" data-placeholder="secondary-tab-bar">
           <span className="region__label" />
         </div>
       )}
-      {focusedRun ? (
+      {focusedTab?.kind === 'run' && focusedRun ? (
         <RunView
           run={focusedRun}
           detail={detail}
@@ -165,6 +172,14 @@ function App() {
           activeView={activeView}
           backendUrl={BACKEND_URL}
           onOpenSettings={() => setSettingsOpen(true)}
+        />
+      ) : focusedTab?.kind === 'diff' ? (
+        <DiffView
+          backendUrl={BACKEND_URL}
+          aId={focusedTab.aId}
+          bId={focusedTab.bId}
+          runs={ot.runs}
+          activeView={activeView}
         />
       ) : (
         <MainContentPlaceholder backendStatus={backendStatus} />
@@ -178,6 +193,7 @@ function App() {
           activeSessionId={activeSessionId}
           onSelectRun={(run) => openRun(run.id)}
           onDeleteRun={(run) => void ot.deleteRun(run.id)}
+          onCompareRuns={(a, b) => openDiff(a.id, b.id)}
           onSelectSession={(p) => selectSession(p.id)}
           onCreateSession={createSession}
         />
@@ -185,14 +201,7 @@ function App() {
       <div className="region region--bottom-panel" data-placeholder="bottom-panel">
         <div className="bottom-split">
           <div className="bottom-split__terminal">
-            <Terminal
-              onStart={() => {
-                void ot.refresh()
-              }}
-              onExit={() => {
-                void ot.refresh()
-              }}
-            />
+            <Terminal onStart={() => void ot.refresh()} onExit={() => void ot.refresh()} />
           </div>
           <LiveMonitor
             activeRun={ot.runs.find((r) => r.id === ot.liveRunId) ?? null}
