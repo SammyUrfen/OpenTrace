@@ -16,9 +16,10 @@ interface Props {
   activeSessionId?: string | null
   onSelectRun?: (run: Run) => void
   onDeleteRun?: (run: Run) => void
+  onRenameRun?: (run: Run) => void
   onCompareRuns?: (a: Run, b: Run) => void
   onSelectSession?: (project: Project) => void
-  onCreateSession?: (name: string) => void
+  onRenameSession?: (project: Project) => void
 }
 
 interface MenuState {
@@ -45,14 +46,15 @@ function RunRow({
       className={`run-row ${active ? 'run-row--active' : ''}`}
       onClick={() => onSelect?.(run)}
       onContextMenu={(e) => onContextMenu?.(e, run)}
-      title={run.command}
+      title={run.label ? `${run.label} — ${run.command}` : run.command}
     >
       <span
         className="run-row__dot"
         style={{ background: severityColor(run.max_severity, run.status) }}
       />
       <span className="run-row__main">
-        <span className="run-row__command">{run.command}</span>
+        {/* the run's name: a user-given label if renamed, else the command */}
+        <span className="run-row__command">{run.label ?? run.command}</span>
         <span className="run-row__meta">
           {formatTime(run.started_at)} · {formatDuration(run.duration_ms)}
         </span>
@@ -76,16 +78,12 @@ export function RunSidebar({
   activeSessionId,
   onSelectRun,
   onDeleteRun,
+  onRenameRun,
   onCompareRuns,
   onSelectSession,
-  onCreateSession,
+  onRenameSession,
 }: Props) {
   const [menu, setMenu] = useState<MenuState | null>(null)
-
-  const newSession = () => {
-    const name = window.prompt('New session name:', 'Project')
-    if (name && name.trim()) onCreateSession?.(name.trim())
-  }
   const runsByProject = new Map<string, Run[]>()
   for (const r of runs) {
     const list = runsByProject.get(r.session_id) ?? []
@@ -102,7 +100,7 @@ export function RunSidebar({
     closeMenu()
     if (
       window.confirm(
-        `Delete run "${run.display_name}"? This permanently removes its data and cannot be undone.`,
+        `Delete run "${run.label ?? run.display_name}"? This permanently removes its data and cannot be undone.`,
       )
     ) {
       onDeleteRun?.(run)
@@ -119,9 +117,9 @@ export function RunSidebar({
           />
           Sessions
         </span>
-        <button type="button" className="session-new" title="New session" onClick={newSession}>
-          + New
-        </button>
+        <span className="session-list__hint" title="Create from the menu (File ▸ New Session) or ⌘/Ctrl+K">
+          ⌘K
+        </span>
       </div>
       <div className="session-list__body">
         {projects.length === 0 && (
@@ -136,7 +134,8 @@ export function RunSidebar({
                 type="button"
                 className={`project-group__header ${isActive ? 'project-group__header--active' : ''}`}
                 onClick={() => onSelectSession?.(p)}
-                title={isActive ? 'Active — new runs go here' : 'Switch to this session'}
+                onDoubleClick={() => onRenameSession?.(p)}
+                title={isActive ? 'Active — new runs go here (double-click to rename)' : 'Switch (double-click to rename)'}
               >
                 <span className="project-group__name">
                   {isActive && <span className="project-group__active-dot" />}
@@ -170,6 +169,9 @@ export function RunSidebar({
                 <button type="button" className="ctx-item" onClick={() => { closeMenu(); onSelectRun?.(menu.run) }}>
                   Open
                 </button>
+                <button type="button" className="ctx-item" onClick={() => { closeMenu(); onRenameRun?.(menu.run) }}>
+                  Rename…
+                </button>
                 <button
                   type="button"
                   className="ctx-item"
@@ -196,7 +198,7 @@ export function RunSidebar({
                       onClick={() => { closeMenu(); onCompareRuns?.(menu.run, other) }}
                       title={other.command}
                     >
-                      {other.display_name}
+                      {other.label ?? other.display_name}
                     </button>
                   ))}
               </div>

@@ -12,6 +12,8 @@
  */
 const pty = require('node-pty')
 const path = require('path')
+const os = require('os')
+const fs = require('fs')
 
 const HOOKS_DIR = path.join(__dirname, 'shell-hooks')
 const OTRACE_PATH = path.join(HOOKS_DIR, 'otrace')
@@ -19,6 +21,22 @@ const DEFAULT_BACKEND_URL = 'http://localhost:8000'
 
 let session = null
 let tracingEnabled = false
+// Live tracing/session state lives in a small file the shell hook sources each
+// command — NOT typed into the shell — so `export OPENTRACE_*` lines never echo
+// into the terminal. `null` until a pty is started.
+let rtFile = null
+let activeSessionId = null
+
+function writeRuntime() {
+  if (!rtFile) return
+  let body = `export OPENTRACE_ENABLE_STRACE=${tracingEnabled ? '1' : '0'}\n`
+  if (activeSessionId) body += `export OPENTRACE_SESSION=${activeSessionId}\n`
+  try {
+    fs.writeFileSync(rtFile, body)
+  } catch {
+    // best-effort; the hook falls back to env vars if the file is missing
+  }
+}
 
 function shellType(shellPath) {
   const base = path.basename(shellPath)
@@ -50,12 +68,21 @@ function start({ webContents, cwd, cols = 80, rows = 24, backendUrl }) {
   const resolvedCwd = cwd || process.cwd()
   const type = shellType(shell)
 
+  // Per-pty runtime-state file the hook sources (toggling tracing / switching
+  // session updates this file, not the shell's input, so nothing echoes).
+  rtFile = path.join(os.tmpdir(), `opentrace-rt-${process.pid}-${Date.now()}`)
+  writeRuntime()
+
   // The hook reads these on source / on each command. Setting them in the spawn
   // env means the very first command already sees the right tracing state.
+  // Prepending the hooks dir to PATH lets the zsh widget rewrite a traced
+  // command to a short `otrace -- <cmd>` instead of an absolute path.
   const env = {
     ...process.env,
+    PATH: `${HOOKS_DIR}${path.delimiter}${process.env.PATH || ''}`,
     OPENTRACE_API: backendUrl || process.env.OPENTRACE_API || DEFAULT_BACKEND_URL,
     OPENTRACE_OTRACE: OTRACE_PATH,
+    OPENTRACE_RT: rtFile,
     OPENTRACE_ENABLE_STRACE: tracingEnabled ? '1' : '0',
   }
 
@@ -123,17 +150,23 @@ function dispose() {
     }
     session = null
   }
+  if (rtFile) {
+    try {
+      fs.unlinkSync(rtFile)
+    } catch {
+      // best-effort cleanup
+    }
+    rtFile = null
+  }
 }
 
 function setTracing(enabled) {
   tracingEnabled = Boolean(enabled)
-  if (!session) return
+  // Update the file the hook sources (no echo). The hook picks it up before the
+  // next command runs.
+  writeRuntime()
 
-  // Update the live env var the hook reads on each command. Leading space keeps
-  // it out of history.
-  session.proc.write(` export OPENTRACE_ENABLE_STRACE=${tracingEnabled ? '1' : '0'}\r`)
-
-  if (!session.webContents.isDestroyed()) {
+  if (session && !session.webContents.isDestroyed()) {
     session.webContents.send(
       'pty:data',
       banner(`tracing ${tracingEnabled ? 'enabled' : 'disabled'}`),
@@ -146,11 +179,11 @@ function write(data) {
 }
 
 // Point the shell at a different OpenTrace session (project) so subsequent
-// traced runs attach there. Leading space keeps it out of history.
+// traced runs attach there — written to the runtime file, never typed.
 function setSessionEnv(sessionId) {
-  if (session && sessionId) {
-    session.proc.write(` export OPENTRACE_SESSION=${sessionId}\r`)
-  }
+  if (!sessionId) return
+  activeSessionId = sessionId
+  writeRuntime()
 }
 
 function isTracing() {

@@ -21,7 +21,7 @@ interface Props {
   yUnit?: string
 }
 
-const PAD_L = 44
+const PAD_L = 52
 const PAD_R = 12
 const PAD_T = 10
 const PAD_B = 22
@@ -129,8 +129,15 @@ export function TimeSeriesChart({
       {/* x axis labels */}
       <text x={PAD_L} y={H - 6} className="ts-axis">0s</text>
       <text x={W - PAD_R} y={H - 6} textAnchor="end" className="ts-axis">{elapsed}s</text>
+      {/* y-axis unit: rotated vertical label, clear of the value column */}
       {yUnit && (
-        <text x={PAD_L - 6} y={PAD_T + 2} textAnchor="end" className="ts-axis">{yUnit}</text>
+        <text
+          transform={`translate(9 ${PAD_T + (H - PAD_T - PAD_B) / 2}) rotate(-90)`}
+          textAnchor="middle"
+          className="ts-axis ts-unit"
+        >
+          {yUnit}
+        </text>
       )}
       {!hasData && (
         <text x={W / 2} y={H / 2} textAnchor="middle" className="ts-axis">

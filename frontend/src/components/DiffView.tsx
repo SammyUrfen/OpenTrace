@@ -151,12 +151,12 @@ function OverviewDiff({
       <div className="diff-header">
         <div className="diff-header__col">
           <div className="diff-header__tag diff-header__tag--a">A</div>
-          <div className="diff-header__name" title={a.run?.command}>{a.run?.display_name ?? a.run?.id}</div>
+          <div className="diff-header__name" title={a.run?.command}>{a.run?.label ?? a.run?.display_name ?? a.run?.id}</div>
         </div>
         <span className="diff-header__vs">↔</span>
         <div className="diff-header__col">
           <div className="diff-header__tag diff-header__tag--b">B</div>
-          <div className="diff-header__name" title={b.run?.command}>{b.run?.display_name ?? b.run?.id}</div>
+          <div className="diff-header__name" title={b.run?.command}>{b.run?.label ?? b.run?.display_name ?? b.run?.id}</div>
         </div>
       </div>
 

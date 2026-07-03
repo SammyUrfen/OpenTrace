@@ -47,7 +47,9 @@ cwd_j="$(_json_escape "$PWD")"
 payload="{\"command\":\"$cmd_j\",\"cwd\":\"$cwd_j\""
 [ -n "${OPENTRACE_SESSION:-}" ] && payload="$payload,\"session_id\":\"$OPENTRACE_SESSION\""
 [ -n "${OPENTRACE_TERMINAL:-}" ] && payload="$payload,\"terminal_id\":\"$OPENTRACE_TERMINAL\""
-payload="$payload,\"collector_config\":{\"strace\":true,\"psutil\":true}}"
+# No collector_config here on purpose: the backend fills it from the live config
+# (config.tracing.collectors) so the Live Monitor's collector toggles take effect.
+payload="$payload}"
 
 resp="$(curl -sf --max-time 2 -X POST "$API/runs/start" \
     -H 'content-type: application/json' -d "$payload" 2>/dev/null)"
@@ -58,20 +60,35 @@ run_dir="$(_field "$resp" run_dir)"
 log="$(_field "$resp" strace_log_path)"
 { [ -z "$run_id" ] || [ -z "$log" ]; } && exec "$@"
 
-# Whether the syscall collector (strace) is enabled for this run.
+# Which collectors are enabled for this run (from the /start response).
 use_strace="$(printf '%s' "$resp" | grep -o '"strace":[a-z]*' | head -1 | cut -d: -f2)"
+use_ltrace="$(printf '%s' "$resp" | grep -o '"ltrace":[a-z]*' | head -1 | cut -d: -f2)"
+use_perf="$(printf '%s' "$resp" | grep -o '"perf":[a-z]*' | head -1 | cut -d: -f2)"
 
 export OPENTRACE_IN_RUN="$run_id"
 
-# Launch the workload under strace, or bare if strace is disabled/unavailable.
-# `-e write=1,2` dumps the bytes the program writes to stdout/stderr into the
-# log so the Logs tab can reconstruct its output WITHOUT teeing its fds (stdio
-# and isatty() stay exactly as a native run).
-if [ "$use_strace" != "false" ] && command -v strace >/dev/null 2>&1; then
-  strace -f -T -ttt -e write=1,2 -o "$log" -- "$@" &
-else
-  "$@" &
+# Build the trace command. strace and ltrace both use ptrace, so they are
+# mutually exclusive — ltrace mode wins if both are somehow set. `ltrace -S`
+# logs library calls (malloc/free + the hotspot table) AND @SYS syscalls.
+# strace's `-e write=1,2` dumps stdout/stderr bytes into the log so the Logs tab
+# can reconstruct output WITHOUT teeing the fds (stdio/isatty stay native).
+inner=("$@")
+if [ "$use_ltrace" = "true" ] && [ -n "$run_dir" ] && command -v ltrace >/dev/null 2>&1; then
+  inner=(ltrace -S -f -ttt -T -o "$run_dir/ltrace.log" -- "$@")
+elif [ "$use_strace" != "false" ] && command -v strace >/dev/null 2>&1; then
+  inner=(strace -f -T -ttt -e write=1,2 -o "$log" -- "$@")
 fi
+
+# Optionally layer perf sampling on top (independent of the ptrace backend — a
+# flamegraph is most accurate with the tracer off). Probe `perf record` first so
+# a perms failure stays fail-open and the workload still runs.
+cmd=("${inner[@]}")
+if [ "$use_perf" = "true" ] && [ -n "$run_dir" ] && command -v perf >/dev/null 2>&1 \
+    && perf record -o /dev/null -- true >/dev/null 2>&1; then
+  cmd=(perf record -g -F 999 -o "$run_dir/perf.data" -- "${inner[@]}")
+fi
+
+"${cmd[@]}" &
 child=$!
 
 [ -n "$run_dir" ] && printf '%s\n' "$child" > "$run_dir/strace.pid" 2>/dev/null

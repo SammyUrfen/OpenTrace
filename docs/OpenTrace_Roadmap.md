@@ -9,17 +9,26 @@
 
 ## Current Milestone
 
-> **Status (as of 2026-06-21):** Phases **0, 1, 2, 3, 4, 5 complete**. The full
-> loop works — type a command → transparent strace+psutil trace → 9 analytics
-> tabs (Overview, Timeline, Memory, CPU, I/O, Network, Processes, Syscalls, Logs)
+> **Status (as of 2026-06-22):** Phases **0, 1, 2, 3, 4, 5, 6 complete**. The full
+> loop works — type a command → transparent strace+psutil trace → analytics tabs
+> (Overview, Timeline, Memory, CPU, I/O, Network, Processes, Syscalls, Logs)
 > → AI summary → run-to-run **diff view**. Plus sessions (create/switch),
-> selectable collectors, an espresso/warm-paper theme, and a first-run wizard.
-> **93 tests** (63 backend pytest + 30 frontend vitest), verified end-to-end.
+> selectable collectors, an espresso/warm-paper theme, a first-run wizard,
+> **18 detection rules**, **real-time anomaly alerts**, **resizable panels**, and
+> paired v1/v2 demo fixtures in `test-files/`.
 >
-> **Next:** Phase 6 (ltrace/perf profiling — tools installed), Phase 7
-> (packaging + libsecret keyring + session export), Phase 8 (advanced). Open
-> Phase-2/3 remainders: real-time anomaly alerts in the Live Monitor; the full
-> §5 rule set. See per-phase checkboxes in §10.
+> **Phase 6 (profiling) is in:** a **collector-mode choice** — strace OR ltrace
+> (both ptrace, mutually exclusive) plus an independent **perf** sampler. ltrace
+> mode adds a **Profiling tab** (malloc/free ledger: bytes alloc/freed, peak live,
+> leaked blocks, + a library-call hotspot table) and a `heap_leak` /
+> `alloc_free_imbalance` anomaly. perf adds a **Flamegraph tab** (an inline
+> click-to-zoom flame chart + self/total symbol hotspots). **134 tests** (94
+> backend pytest + 40 frontend vitest), verified end-to-end through the real
+> `otrace` launcher (real ltrace + perf captures rendered in both tabs), and
+> hardened against an adversarial multi-agent review of the diff.
+>
+> **Next:** Phase 7 (packaging `.deb`/`.AppImage` + libsecret keyring + session
+> export), Phase 8 (advanced).
 
 ---
 
@@ -708,11 +717,13 @@ API key stored in OS keyring (libsecret / Secret Service API). Never in config f
 ### Phase 3 — Analytics Views (Weeks 6–9)
 - [x] Secondary tabs with real data — all 9 built: **Overview, Timeline, Memory, CPU,
       I/O, Network, Processes, Syscalls, Logs** (custom SVG timeline + process table)
-- [~] Detection rule engine — foundational subset live (7 rules incl. slow-network);
-      full §5 set pending
+- [x] Detection rule engine — **18 rules** covering most of §5 (file I/O, memory,
+      CPU/spin/infinite-loop, network errors/reuse, mutex contention, I/O retry,
+      read/write storms, subprocess spawning). ltrace/perf-derived rules → Phase 6.
 - [x] Severity highlighting (dots, colored anomaly cards, threshold lines, red errors,
       ⊘ fd-leak markers, anomaly-window shading in Timeline + Logs)
-- [ ] Real-time anomaly alerts in Live Monitor *(metrics stream live; anomalies at finalize)*
+- [x] Real-time anomaly alerts in Live Monitor (live FD>200 / memory-spike /
+      sustained-CPU alerts streamed over SSE during the run)
 
 ### Phase 4 — LLM Integration (Weeks 10–11)
 - [x] Streaming LLM call → sectioned summary in Overview (OpenAI-compatible;
@@ -727,10 +738,16 @@ API key stored in OS keyring (libsecret / Secret Service API). Never in config f
       (∆ column with better/worse colouring; overlaid metric charts; 3-column anomaly diff)
 - [x] AI diff summary (streaming "what changed, better or worse?")
 
-### Phase 6 — Function Profiling (Weeks 13–14)
-- [ ] ltrace integration (malloc/free tracking)
-- [ ] perf record integration + flamegraph
-- [ ] Function hotspot table
+### Phase 6 — Function Profiling (Weeks 13–14) — DONE
+- [x] ltrace integration (malloc/free tracking) — `ltrace -S -f -ttt -T` parser
+      (`trace/ltrace_parser.py`) as a **collector-mode** choice (ptrace-exclusive
+      with strace); malloc/free ledger + leak/imbalance anomalies (`profile.py`)
+- [x] perf record integration + flamegraph — `perf record -g` → `perf script`
+      folded into an inline click-to-zoom flame chart (`perf.py` + `FlamegraphTab`)
+- [x] Function hotspot table — library-call hotspots (ltrace) in the **Profiling**
+      tab; CPU self/total symbol hotspots (perf) in the **Flamegraph** tab
+- [x] *(bonus)* UI fixes: chart unit-label overlap, Timeline lane clipping +
+      per-lane scales, AI summary survives tab switches
 
 ### Phase 7 — Polish & Release (Weeks 15–16)
 - [ ] Session export (JSON, HTML report)

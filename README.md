@@ -41,21 +41,31 @@ What works now:
   Overview Δ (a ∆ table with better/worse colouring), Memory/CPU Δ (overlaid
   charts), Syscalls Δ, Anomalies Δ (only-A / both / only-B), and a streaming
   **AI diff summary** ("what changed, better or worse?").
-- **Sessions, collectors, theme** — create/switch sessions (projects) in the
-  sidebar; pick which collectors run (Resource metrics / Syscall trace; ltrace &
-  perf are Phase-6 opt-ins) in the Live Monitor; an **espresso (dark) / warm-paper
-  (light)** theme with a toggle (the terminal re-themes too); a first-run wizard.
+- **18 detection rules + live alerts** — covering file I/O, memory, CPU/spin
+  loops, network, locks, and more; real-time alerts (FD>200, memory spikes,
+  pegged CPU) stream into the Live Monitor *during* a run.
+- **Profiling (Phase 6)** — a collector-mode choice between **strace** and
+  **ltrace** (both ptrace, mutually exclusive), plus an independent **perf**
+  sampler. ltrace runs get a **Profiling tab** — a malloc/free ledger (bytes
+  allocated/freed, peak live, leaked blocks) + a library-call hotspot table, and
+  a `heap_leak` anomaly. perf runs get a **Flamegraph tab** — an inline,
+  click-to-zoom flame chart + self/total CPU symbol hotspots. (`test-files/alloc_demo.c`
+  is a ready leak demo for ltrace mode.)
+- **Sessions, collectors, theme, resizable panels** — create/switch sessions
+  (projects); pick which collectors run (Resource metrics / Syscall trace /
+  Library calls / Hardware perf); an **espresso (dark) / warm-paper (light)** theme
+  with a toggle (the terminal re-themes too); drag-to-resize sidebar & bottom
+  panel; a first-run wizard. Paired `test-files/workload_*_v1/v2.py` fixtures
+  demo the diff viewer on a small code change.
 - SQLite and `config.json` are created on first run under `~/.opentrace`.
 
 What is still incomplete:
 
 - A packaged `opentrace` CLI binary (the `app.cli` launcher works in dev).
-- **Phase 6 profiling** — ltrace (malloc/free) + perf (flamegraph, hotspots).
-  Tools are installed on the host, so this is unblocked.
 - **Phase 7** — `.deb`/`.AppImage` packaging, libsecret keyring, session export.
-- Smaller gaps: real-time anomaly alerts in the Live Monitor (anomalies are
-  computed at finalize today); the full §5 rule set; bash transparent
-  auto-interception (zsh is the fully-wrapped path).
+- Smaller gaps: bash transparent auto-interception (zsh is the fully-wrapped
+  path); ltrace mode only sees calls from the main binary's PLT, so it suits
+  native (C/C++/Rust) programs rather than interpreted ones like Python.
 
 ## Repository layout
 

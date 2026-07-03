@@ -1,11 +1,13 @@
-const { app, BrowserWindow, ipcMain } = require('electron')
+const { app, BrowserWindow, ipcMain, Menu } = require('electron')
 const { spawn } = require('child_process')
 const path = require('path')
 const http = require('http')
 const pty = require('./pty')
 
 const BACKEND_PORT = 8000
-const BACKEND_URL = `http://localhost:${BACKEND_PORT}`
+// Point at an already-running backend (dev/testing) instead of spawning one.
+const EXTERNAL_BACKEND = process.env.OPENTRACE_BACKEND_URL || null
+const BACKEND_URL = EXTERNAL_BACKEND || `http://localhost:${BACKEND_PORT}`
 const FRONTEND_DEV_URL = 'http://localhost:5173'
 const FRONTEND_DIST = path.resolve(__dirname, '..', 'frontend', 'dist', 'index.html')
 
@@ -66,10 +68,14 @@ function createWindow() {
   const { existsSync } = require('fs')
   const useDist = !process.env.OPENTRACE_DEV && existsSync(FRONTEND_DIST)
 
+  const [winW, winH] = (process.env.OPENTRACE_WIN || '1280x800')
+    .split('x')
+    .map((n) => parseInt(n, 10) || 0)
   const win = new BrowserWindow({
-    width: 1280,
-    height: 800,
+    width: winW || 1280,
+    height: winH || 800,
     title: 'OpenTrace',
+    autoHideMenuBar: true, // native OS menu bar hidden; the app renders its own MenuBar
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -126,6 +132,62 @@ function createWindow() {
   return win
 }
 
+// Build the application menu. Custom items dispatch a string action to the
+// renderer (window.opentrace.menu.onAction); native items use built-in roles.
+function buildMenu(win) {
+  const send = (action) => () => win.webContents.send('menu:action', action)
+  const isMac = process.platform === 'darwin'
+  const template = [
+    {
+      label: 'File',
+      submenu: [
+        { label: 'New Session', accelerator: 'CmdOrCtrl+N', click: send('new-session') },
+        { type: 'separator' },
+        { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: send('settings') },
+        { type: 'separator' },
+        isMac ? { role: 'close' } : { role: 'quit' },
+      ],
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' }, { role: 'redo' }, { type: 'separator' },
+        { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' },
+      ],
+    },
+    {
+      label: 'View',
+      submenu: [
+        { label: 'Command Palette…', accelerator: 'CmdOrCtrl+K', click: send('command-palette') },
+        { type: 'separator' },
+        { label: 'Toggle Sidebar', accelerator: 'CmdOrCtrl+B', click: send('toggle-sidebar') },
+        { label: 'Toggle Terminal', accelerator: 'CmdOrCtrl+J', click: send('toggle-terminal') },
+        { type: 'separator' },
+        { role: 'reload' }, { role: 'toggleDevTools' }, { type: 'separator' },
+        { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' },
+        { role: 'togglefullscreen' },
+      ],
+    },
+    {
+      label: 'Run',
+      submenu: [
+        { label: 'Toggle Tracing', accelerator: 'CmdOrCtrl+Shift+T', click: send('toggle-tracing') },
+      ],
+    },
+    {
+      label: 'Help',
+      submenu: [
+        { label: 'How to Use OpenTrace', click: send('guide') },
+        { label: 'About OpenTrace', click: send('about') },
+      ],
+    },
+  ]
+  if (isMac) {
+    template.unshift({ role: 'appMenu' })
+  }
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+}
+
 function registerIpc() {
   ipcMain.handle('pty:start', (event, opts = {}) => {
     const info = pty.start({
@@ -150,16 +212,26 @@ function registerIpc() {
   })
 }
 
+// Optional isolated profile (fresh localStorage) for testing the first-run flow.
+if (process.env.OPENTRACE_USERDATA) {
+  app.setPath('userData', process.env.OPENTRACE_USERDATA)
+}
+
 app.whenReady().then(async () => {
   registerIpc()
-  startBackend()
+  if (!EXTERNAL_BACKEND) startBackend()
   try {
     await waitForBackend()
-    console.log('[electron] backend ready')
+    console.log(`[electron] backend ready at ${BACKEND_URL}`)
   } catch (err) {
     console.warn(`[electron] ${err.message} — opening window anyway`)
   }
-  createWindow()
+  const win = createWindow()
+  // Register the application menu for its keyboard accelerators (Ctrl+N/K/…),
+  // but keep the native bar hidden: it does not render on KDE Plasma/Wayland, so
+  // the app draws its own in-window MenuBar (which fires the same actions).
+  buildMenu(win)
+  win.setMenuBarVisibility(false)
 })
 
 app.on('window-all-closed', () => app.quit())

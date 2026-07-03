@@ -14,6 +14,7 @@ SYSCALL = "syscall"
 SIGNAL = "signal"
 EXIT = "exit"
 PROCESS = "process"  # fork/clone/exec lifecycle distilled from syscalls
+LIBCALL = "libcall"  # a library-function call from ltrace (e.g. malloc/free)
 
 
 @dataclass(slots=True)

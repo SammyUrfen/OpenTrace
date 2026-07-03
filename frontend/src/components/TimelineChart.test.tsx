@@ -26,8 +26,12 @@ describe('TimelineChart', () => {
       />,
     )
     expect(container.querySelector('svg.tl-chart')).toBeInTheDocument()
-    // 3 metric line paths
-    expect(container.querySelectorAll('path').length).toBe(3)
+    // 3 metric line paths (stroked); each lane also draws a faint area fill
+    const linePaths = Array.from(container.querySelectorAll('path')).filter((p) => {
+      const s = p.getAttribute('stroke')
+      return s && s !== 'none'
+    })
+    expect(linePaths.length).toBe(3)
     // 3 event circles
     expect(container.querySelectorAll('circle.tl-event').length).toBe(3)
     // anomaly band(s): shaded rect + lane bar => at least 2 rects with the color

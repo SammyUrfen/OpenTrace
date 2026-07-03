@@ -31,12 +31,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import db, runs, storage
+from .. import perf as perf_mod
+from .. import profile as profile_mod
 from ..rules import RuleContext, run_rules
 from ..streaming import broker
 from ..util import now_ms
 from . import metrics as metrics_mod
-from . import strace_parser
-from .events import EXIT, SIGNAL, MetricSample, TraceEvent
+from . import ltrace_parser, strace_parser
+from .events import EXIT, LIBCALL, SIGNAL, MetricSample, TraceEvent
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +55,10 @@ class _RunContext:
     samples: list[MetricSample] = field(default_factory=list)
     root_pid: int | None = None
     created_ms: int = 0
+    # live-alert state
+    last_rss: float | None = None
+    cpu_streak: int = 0
+    alerts_fired: set = field(default_factory=set)
 
 
 _active: dict[str, _RunContext] = {}
@@ -96,9 +102,13 @@ def report_pid(run_id: str, pid: int) -> bool:
     # No psutil collector -> acknowledge but don't poll metrics.
     if not collectors.get("psutil", True):
         return True
-    # When strace traces the tree, `pid` is strace and we watch its children;
-    # without strace, `pid` is the workload itself, so include the root.
-    descendants_only = collectors.get("strace", True)
+    # A wrapper (strace/ltrace/perf) is `pid`; the workload is its descendant, so
+    # watch descendants only. Running bare, `pid` IS the workload — include root.
+    descendants_only = (
+        collectors.get("strace", True)
+        or collectors.get("ltrace", False)
+        or collectors.get("perf", False)
+    )
     with _lock:
         ctx = _active.get(run_id)
         if ctx is None:
@@ -139,6 +149,47 @@ def _on_sample(run_id: str, sample: MetricSample) -> None:
     except Exception:  # noqa: BLE001
         log.debug("metric insert failed for %s", run_id, exc_info=True)
     broker.publish(run_id, "metric", sample.to_ndjson())
+    if ctx is not None:
+        _live_detect(ctx, sample)
+
+
+# Live-alert thresholds (cheap checks on the metric stream during a run).
+_FD_ALERT = 200
+_RSS_SPIKE_MB = 100.0
+_CPU_HOT = 90.0          # raw % ~= one full core
+_CPU_STREAK = 8          # ~2s sustained
+
+
+def _live_detect(ctx: _RunContext, sample: MetricSample) -> None:
+    """Emit `anomaly_alert` SSE events from metric thresholds as a run unfolds,
+    so the Live Monitor can warn the developer before the run even finishes."""
+    rid = ctx.run.id
+
+    def alert(severity: str, title: str) -> None:
+        broker.publish(rid, "anomaly_alert", {
+            "severity": severity, "title": title,
+            "timestamp_ms": sample.timestamp_ms,
+        })
+
+    def once(key: str, severity: str, title: str) -> None:
+        if key not in ctx.alerts_fired:
+            ctx.alerts_fired.add(key)
+            alert(severity, title)
+
+    if sample.open_fds is not None and sample.open_fds > _FD_ALERT:
+        once("fd", "high", f"Open file descriptors exceed {_FD_ALERT} "
+                           f"({sample.open_fds}) — possible leak")
+    if sample.rss_mb is not None:
+        if ctx.last_rss is not None and sample.rss_mb - ctx.last_rss > _RSS_SPIKE_MB:
+            alert("medium", f"Memory spiked +{sample.rss_mb - ctx.last_rss:.0f}MB "
+                            f"(now {sample.rss_mb:.0f}MB)")
+        ctx.last_rss = sample.rss_mb
+    if sample.cpu_pct is not None and sample.cpu_pct > _CPU_HOT:
+        ctx.cpu_streak += 1
+        if ctx.cpu_streak == _CPU_STREAK:
+            once("cpu", "medium", "CPU pegged for ~2s — compute-bound")
+    elif sample.cpu_pct is not None:
+        ctx.cpu_streak = 0
 
 
 def end_run(
@@ -192,34 +243,72 @@ def _finalize(
     ended_at: int | None,
 ) -> runs.Run | None:
     run_dir = Path(run.run_dir)
-    strace_log = run_dir / "strace.log"
+    collectors = run.collector_config or {}
+    use_ltrace = collectors.get("ltrace", False)
 
-    events: list[TraceEvent] = (
-        list(strace_parser.parse_file(strace_log)) if strace_log.exists() else []
-    )
+    # ltrace mode replaces strace as the ptrace backend; its log is a superset
+    # (library calls + @SYS syscalls), so the syscall pipeline still works.
+    if use_ltrace:
+        trace_log = run_dir / "ltrace.log"
+        trace_kind = "ltrace-log"
+        events: list[TraceEvent] = (
+            list(ltrace_parser.parse_file(trace_log)) if trace_log.exists() else []
+        )
+    else:
+        trace_log = run_dir / "strace.log"
+        trace_kind = "strace-log"
+        events = (
+            list(strace_parser.parse_file(trace_log)) if trace_log.exists() else []
+        )
 
     # Full event stream -> compressed ndjson (source of truth for replay).
     storage.write_ndjson_zst(
         run_dir / "events.ndjson.zst", (e.to_ndjson() for e in events)
     )
 
+    # Syscall-oriented analysis (rate, rules, summary) must NOT see ltrace
+    # LIBCALL events: they're profiled separately and would otherwise inflate the
+    # syscall rate, mislabel slow library calls as slow syscalls, and double-count
+    # libc-wrapper names (read/write/open) in the storm rules. No-op for strace.
+    syscall_events = [e for e in events if e.event_type != LIBCALL]
+
     # Metrics from DB (live inserts), then derive + backfill syscall_rate.
     metrics_rows = storage.read_metrics(run.id)
-    rate_by_ts = _syscall_rate_by_sample(events, metrics_rows)
+    rate_by_ts = _syscall_rate_by_sample(syscall_events, metrics_rows)
     storage.backfill_syscall_rate(run.id, rate_by_ts)
     for m in metrics_rows:
         if m["timestamp_ms"] in rate_by_ts:
             m["syscall_rate"] = rate_by_ts[m["timestamp_ms"]]
     storage.write_ndjson_zst(run_dir / "metrics.ndjson.zst", iter(metrics_rows))
 
-    # Detect anomalies.
+    # Detect anomalies (on syscalls/signals/exits only).
     rctx = RuleContext(
-        events=events,
+        events=syscall_events,
         metrics=metrics_rows,
         duration_ms=run.duration_ms,
         cpu_cores=metrics_mod.cpu_count(),
     )
     anomalies = run_rules(rctx)
+
+    # Phase-6 profiling artifacts (only for the collectors that ran).
+    if use_ltrace and events:
+        event_dicts = [e.to_ndjson() for e in events]
+        prof = profile_mod.malloc_profile(event_dicts)
+        storage.write_json(run_dir / "profile.json", {
+            "malloc": prof,
+            "hotspots": profile_mod.libcall_stats(event_dicts),
+        })
+        storage.record_artifact(run.id, "profile", run_dir / "profile.json")
+        anomalies.extend(profile_mod.profile_anomalies(prof, run.duration_ms))
+
+    if collectors.get("perf", False):
+        perf_data = run_dir / "perf.data"
+        if perf_data.exists():
+            flamegraph = perf_mod.build_flamegraph(perf_data)
+            storage.write_json(run_dir / "flamegraph.json", flamegraph)
+            storage.record_artifact(run.id, "flamegraph", run_dir / "flamegraph.json")
+            storage.record_artifact(run.id, "perf-data", perf_data)
+            anomalies.extend(perf_mod.perf_anomalies(flamegraph))
 
     # Persist a curated subset of events (+ anomaly evidence), then link ids.
     curated = _curate_events(events, anomalies)
@@ -232,14 +321,14 @@ def _finalize(
 
     # Register artifacts (raw + derived).
     for kind, path in (
-        ("strace-log", strace_log),
+        (trace_kind, trace_log),
         ("events", run_dir / "events.ndjson.zst"),
         ("metrics", run_dir / "metrics.ndjson.zst"),
     ):
         storage.record_artifact(run.id, kind, path)
 
-    # Human-readable meta.json summary.
-    summary = _summary(run, events, metrics_rows, anomalies, exit_code, exit_signal)
+    # Human-readable meta.json summary (syscall totals exclude library calls).
+    summary = _summary(run, syscall_events, metrics_rows, anomalies, exit_code, exit_signal)
     storage.write_meta(run_dir, summary)
     storage.record_artifact(run.id, "meta", run_dir / "meta.json")
 

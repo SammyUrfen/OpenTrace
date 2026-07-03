@@ -401,6 +401,44 @@ def http_network(rid: str) -> list[dict]:
     return aggregate.network_stats(events)
 
 
+_TEXT_SUFFIXES = {".json", ".log", ".md", ".txt", ".ndjson", ".pid"}
+_FILE_MAX_BYTES = 256 * 1024
+
+
+@router.get("/{rid}/files")
+def http_files(rid: str) -> list[dict]:
+    """List the files captured on disk for a run (meta/logs/derived artifacts)."""
+    run = _require(rid)
+    rd = Path(run.run_dir)
+    out: list[dict] = []
+    if rd.exists():
+        for p in sorted(rd.rglob("*")):
+            if p.is_file():
+                out.append({
+                    "name": p.relative_to(rd).as_posix(),
+                    "size": p.stat().st_size,
+                    "text": p.suffix in _TEXT_SUFFIXES,
+                })
+    return out
+
+
+@router.get("/{rid}/file")
+def http_file(rid: str, name: str) -> dict:
+    """Read one captured file (text only, size-capped, path-traversal-guarded)."""
+    run = _require(rid)
+    rd = Path(run.run_dir).resolve()
+    target = (rd / name).resolve()
+    if not target.is_relative_to(rd):
+        raise HTTPException(status_code=403, detail="path outside run directory")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    size = target.stat().st_size
+    content = None
+    if target.suffix in _TEXT_SUFFIXES:
+        content = target.read_bytes()[:_FILE_MAX_BYTES].decode("utf-8", errors="replace")
+    return {"name": name, "size": size, "truncated": size > _FILE_MAX_BYTES, "content": content}
+
+
 @router.get("/{rid}/processes")
 def http_processes(rid: str) -> list[dict]:
     """Per-process summary (command, parent, syscalls, lifespan) from events."""
@@ -418,6 +456,28 @@ def http_logs(rid: str) -> list[dict]:
 
     run = _require(rid)
     return extract_output(Path(run.run_dir) / "strace.log")
+
+
+@router.get("/{rid}/profile")
+def http_profile(rid: str) -> dict:
+    """Allocation ledger + library-call hotspots (ltrace runs); a `supported`
+    stub otherwise so the Profiling tab can show a friendly empty state."""
+    run = _require(rid)
+    p = Path(run.run_dir) / "profile.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"malloc": {"supported": False}, "hotspots": []}
+
+
+@router.get("/{rid}/flamegraph")
+def http_flamegraph(rid: str) -> dict:
+    """Folded perf call-stack tree + symbol hotspots (perf runs); a `supported`
+    stub otherwise so the Flamegraph tab can show a friendly empty state."""
+    run = _require(rid)
+    p = Path(run.run_dir) / "flamegraph.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"supported": False, "samples": 0, "tree": None, "hotspots": []}
 
 
 @router.get("/{rid}/ai-summary")

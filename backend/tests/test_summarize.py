@@ -19,8 +19,8 @@ def _run() -> runs.Run:
 
 
 def test_system_prompt_has_all_sections():
-    for h in ["## What's Wrong", "## Why It Matters", "## What to Investigate",
-              "## What Looks Fine", "## Confidence"]:
+    for h in ["## What Happened", "## What's Wrong", "## Why It Matters",
+              "## What to Investigate", "## Confidence"]:
         assert h in SYSTEM_PROMPT
 
 

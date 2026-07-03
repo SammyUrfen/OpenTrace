@@ -34,9 +34,19 @@ if [ -z "${OPENTRACE_TERMINAL:-}" ] && [ -n "${OPENTRACE_API:-}" ] && \
   unset __ot_payload __ot_resp __ot_hf
 fi
 
+# Pull live tracing/session state from the runtime file the app maintains (set
+# without typing into the shell, so nothing echoes into the terminal).
+opentrace_sync() { [ -r "${OPENTRACE_RT:-}" ] && . "$OPENTRACE_RT"; }
+opentrace_sync
+case ":${PROMPT_COMMAND:-}:" in
+  *opentrace_sync*) ;;
+  *) PROMPT_COMMAND="opentrace_sync${PROMPT_COMMAND:+; $PROMPT_COMMAND}" ;;
+esac
+
 # Explicit tracing helper. Respects the master toggle: if tracing is OFF, runs
 # the command plainly so `ot` is always safe to leave in muscle memory.
 ot() {
+  opentrace_sync
   if [ "${OPENTRACE_ENABLE_STRACE:-0}" = "1" ]; then
     "${OPENTRACE_OTRACE}" -- "$@"
   else

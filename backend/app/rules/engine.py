@@ -15,6 +15,7 @@ Public surface:
 """
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable
@@ -343,14 +344,289 @@ def cpu_bound_no_syscalls(ctx: RuleContext) -> Anomaly | None:
     )
 
 
+# --- additional §5 rules (syscall + metric derivable) ----------------------
+
+def infinite_loop_no_progress(ctx: RuleContext) -> Anomaly | None:
+    """Ran a long time while issuing almost no syscalls — stuck (CRITICAL)."""
+    if ctx.duration_ms is None or ctx.duration_ms < 30_000:
+        return None
+    syscalls = sum(1 for e in ctx.events if e.event_type == "syscall")
+    if syscalls > 200:
+        return None
+    return Anomaly(
+        rule_id="infinite_loop_no_progress", severity="critical",
+        severity_score=_score("critical", 1),
+        title=f"No progress for {ctx.duration_ms / 1000:.0f}s",
+        description=(
+            f"The program ran {ctx.duration_ms / 1000:.0f}s but issued only "
+            f"{syscalls} syscalls — no I/O, no waiting. That is the signature of "
+            f"an infinite/busy loop making no system calls."
+        ),
+        occurrence_count=1,
+    )
+
+
+def memory_spike(ctx: RuleContext) -> Anomaly | None:
+    """RSS jumped >100MB between two samples — an allocation burst (MEDIUM)."""
+    series = _series(ctx.metrics, "rss_mb")
+    spikes = [(t1, v1 - v0) for (_t0, v0), (t1, v1) in zip(series, series[1:]) if v1 - v0 > 100]
+    if not spikes:
+        return None
+    biggest = max(s[1] for s in spikes)
+    return Anomaly(
+        rule_id="memory_spike", severity="medium",
+        severity_score=_score("medium", len(spikes)),
+        title=f"Memory spike +{biggest:.0f}MB",
+        description=(
+            f"RSS jumped by up to {biggest:.0f}MB between two samples "
+            f"({len(spikes)} spike(s)). A large allocation burst — often loading "
+            f"a whole file/dataset into memory at once."
+        ),
+        first_seen_ms=spikes[0][0], last_seen_ms=spikes[-1][0],
+        occurrence_count=len(spikes),
+    )
+
+
+_SLOW_IO_SYSCALLS = {
+    "write", "pwrite64", "writev", "fsync", "fdatasync", "openat", "open",
+    "creat", "rename", "unlink", "truncate", "ftruncate",
+}
+
+
+def slow_file_io(ctx: RuleContext) -> Anomaly | None:
+    """A file write/open/fsync over 100ms — slow disk/FS (HIGH)."""
+    slow = [
+        e for e in ctx.events
+        if e.latency_ms is not None and e.latency_ms > 100
+        and e.syscall in _SLOW_IO_SYSCALLS and e.error is None
+    ]
+    if not slow:
+        return None
+    slow.sort(key=lambda e: e.latency_ms or 0, reverse=True)
+    worst = slow[0]
+    return Anomaly(
+        rule_id="slow_file_io", severity="high", severity_score=_score("high", len(slow)),
+        title=f"Slow file I/O — {worst.syscall}() {worst.latency_ms:.0f}ms",
+        description=(
+            f"{len(slow)} file-I/O call(s) took over 100ms; slowest "
+            f"{worst.syscall}() at {worst.latency_ms:.0f}ms"
+            + (f" on {worst.path}" if worst.path else "")
+            + ". Slow disk, a network filesystem, or fsync pressure is the cause."
+        ),
+        evidence=slow[:20],
+        first_seen_ms=min(e.timestamp_ms for e in slow),
+        last_seen_ms=max(e.timestamp_ms for e in slow),
+        occurrence_count=len(slow),
+    )
+
+
+def excessive_subprocess(ctx: RuleContext) -> Anomaly | None:
+    """More than 50 execve — shelling out in a loop (MEDIUM)."""
+    execs = [e for e in ctx.events if e.syscall in ("execve", "execveat") and e.error is None]
+    if len(execs) <= 50:
+        return None
+    return Anomaly(
+        rule_id="excessive_subprocess", severity="medium",
+        severity_score=_score("medium", len(execs)),
+        title=f"{len(execs)} subprocesses spawned",
+        description=(
+            f"The program exec'd {len(execs)} times. Spawning many short-lived "
+            f"processes (shelling out in a loop) is far slower than doing the work "
+            f"in-process or batching it."
+        ),
+        evidence=execs[:20],
+        first_seen_ms=execs[0].timestamp_ms, last_seen_ms=execs[-1].timestamp_ms,
+        occurrence_count=len(execs),
+    )
+
+
+_CONN_ERRORS = {"ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH"}
+_NET_SYSCALLS = {"connect", "sendto", "recvfrom", "send", "recv", "read", "write", "sendmsg", "recvmsg"}
+
+
+def connection_error(ctx: RuleContext) -> Anomaly | None:
+    """Network calls failing with refused/reset/timeout (HIGH)."""
+    errs = [e for e in ctx.events if e.error in _CONN_ERRORS and e.syscall in _NET_SYSCALLS]
+    if not errs:
+        return None
+    kinds = sorted({e.error for e in errs if e.error})
+    return Anomaly(
+        rule_id="connection_error", severity="high", severity_score=_score("high", len(errs)),
+        title=f"Network errors: {', '.join(kinds)}",
+        description=(
+            f"{len(errs)} network call(s) failed with {', '.join(kinds)} — the "
+            f"remote host refused the connection, reset it, or was unreachable. "
+            f"Check the destination address, port, and firewall."
+        ),
+        evidence=errs[:20],
+        first_seen_ms=errs[0].timestamp_ms, last_seen_ms=errs[-1].timestamp_ms,
+        occurrence_count=len(errs),
+    )
+
+
+_INET_ADDR = re.compile(r'inet_addr\("([^"]+)"\)')
+
+
+def no_connection_reuse(ctx: RuleContext) -> Anomaly | None:
+    """Many separate TCP connects to the same host — no pooling (HIGH)."""
+    hosts: dict[str, int] = defaultdict(int)
+    for e in ctx.events:
+        if e.syscall == "connect" and e.error in (None, "EINPROGRESS"):
+            m = _INET_ADDR.search(e.args or "")
+            if m:
+                hosts[m.group(1)] += 1
+    if not hosts:
+        return None
+    host, cnt = max(hosts.items(), key=lambda kv: kv[1])
+    if cnt <= 5:
+        return None
+    return Anomaly(
+        rule_id="no_connection_reuse", severity="high", severity_score=_score("high", cnt),
+        title=f"No connection reuse — {cnt} connects to {host}",
+        description=(
+            f"The program opened {cnt} separate TCP connections to {host}. "
+            f"Re-establishing a connection per request is slow — use a connection "
+            f"pool or HTTP keep-alive."
+        ),
+        occurrence_count=cnt,
+    )
+
+
+def mutex_contention(ctx: RuleContext) -> Anomaly | None:
+    """Repeated futex waits over 10ms — lock contention (HIGH)."""
+    slow = [e for e in ctx.events if e.syscall == "futex" and e.latency_ms is not None and e.latency_ms > 10]
+    if len(slow) <= 20:
+        return None
+    total = sum(e.latency_ms or 0 for e in slow)
+    return Anomaly(
+        rule_id="mutex_contention", severity="high", severity_score=_score("high", len(slow)),
+        title=f"Lock contention — {len(slow)} slow futex waits",
+        description=(
+            f"{len(slow)} futex (lock) waits took over 10ms ({total / 1000:.1f}s "
+            f"total). Threads are blocking on a contended lock — a serialization "
+            f"bottleneck. Shorten the critical section or shard the lock."
+        ),
+        evidence=slow[:20],
+        first_seen_ms=slow[0].timestamp_ms, last_seen_ms=slow[-1].timestamp_ms,
+        occurrence_count=len(slow),
+    )
+
+
+def io_retry_loop(ctx: RuleContext) -> Anomaly | None:
+    """Same syscall busy-retrying with EAGAIN/EINTR >100× on one fd (HIGH)."""
+    counts: dict[tuple, list[TraceEvent]] = defaultdict(list)
+    for e in ctx.events:
+        if e.error in ("EAGAIN", "EWOULDBLOCK", "EINTR") and e.fd is not None and e.syscall:
+            counts[(e.pid, e.syscall, e.fd)].append(e)
+    if not counts:
+        return None
+    (_pid, sc, fd), evs = max(counts.items(), key=lambda kv: len(kv[1]))
+    if len(evs) <= 100:
+        return None
+    return Anomaly(
+        rule_id="io_retry_loop", severity="high", severity_score=_score("high", len(evs)),
+        title=f"I/O retry loop — {sc}() retried {len(evs)}×",
+        description=(
+            f"{sc}() on fd {fd} returned EAGAIN/EINTR {len(evs)} times — the program "
+            f"is busy-retrying a non-blocking operation instead of waiting for "
+            f"readiness (poll/epoll). This burns CPU for nothing."
+        ),
+        evidence=evs[:20], occurrence_count=len(evs),
+    )
+
+
+def small_read_storm(ctx: RuleContext) -> Anomaly | None:
+    """Thousands of sub-512-byte reads on one fd — unbuffered I/O (MEDIUM)."""
+    by_fd: dict[tuple, list[TraceEvent]] = defaultdict(list)
+    for e in ctx.events:
+        if e.syscall in ("read", "pread64", "recv", "recvfrom") and e.error is None and e.fd is not None:
+            r = _retval_int(e)
+            if r is not None and 0 < r < 512:
+                by_fd[(e.pid, e.fd)].append(e)
+    if not by_fd:
+        return None
+    evs = max(by_fd.values(), key=len)
+    if len(evs) <= 2000:
+        return None
+    return Anomaly(
+        rule_id="small_read_storm", severity="medium", severity_score=_score("medium", len(evs)),
+        title=f"Small-read storm — {len(evs)} tiny reads",
+        description=(
+            f"{len(evs)} reads returned fewer than 512 bytes on a single descriptor. "
+            f"Reading in tiny chunks is slow — wrap it in a buffered reader."
+        ),
+        evidence=evs[:20],
+        first_seen_ms=evs[0].timestamp_ms, last_seen_ms=evs[-1].timestamp_ms,
+        occurrence_count=len(evs),
+    )
+
+
+def write_storm(ctx: RuleContext) -> Anomaly | None:
+    """Over 1000 writes to one file descriptor — logging in a hot loop (MEDIUM)."""
+    by_fd: dict[tuple, list[TraceEvent]] = defaultdict(list)
+    for e in ctx.events:
+        if e.syscall in ("write", "pwrite64", "writev") and e.error is None \
+                and e.fd is not None and e.fd > 2:
+            by_fd[(e.pid, e.fd)].append(e)
+    if not by_fd:
+        return None
+    evs = max(by_fd.values(), key=len)
+    if len(evs) <= 1000:
+        return None
+    return Anomaly(
+        rule_id="write_storm", severity="medium", severity_score=_score("medium", len(evs)),
+        title=f"Write storm — {len(evs)} writes to one file",
+        description=(
+            f"{len(evs)} write() calls to a single descriptor. If this is a log "
+            f"file, you are likely logging inside a hot loop — batch or rate-limit."
+        ),
+        evidence=evs[:20],
+        first_seen_ms=evs[0].timestamp_ms, last_seen_ms=evs[-1].timestamp_ms,
+        occurrence_count=len(evs),
+    )
+
+
+def spin_loop(ctx: RuleContext) -> Anomaly | None:
+    """High CPU + thousands of immediately-returning polls — busy-wait (HIGH)."""
+    immediate = [
+        e for e in ctx.events
+        if e.syscall in _POLL_FAMILY and e.latency_ms is not None and e.latency_ms < 1.0
+    ]
+    if len(immediate) <= 2000:
+        return None
+    if not any((m.get("cpu_pct") or 0) > 80 for m in ctx.metrics):
+        return None
+    return Anomaly(
+        rule_id="spin_loop", severity="high", severity_score=_score("high", len(immediate)),
+        title=f"Busy-wait spin loop — {len(immediate)} non-blocking polls",
+        description=(
+            f"{len(immediate)} poll/epoll/select calls returned immediately "
+            f"(timeout≈0) while CPU was high — the program is busy-polling in a "
+            f"tight loop instead of blocking for events. Use a blocking wait."
+        ),
+        evidence=immediate[:20], occurrence_count=len(immediate),
+    )
+
+
 RULES: list[Callable[[RuleContext], Anomaly | None]] = [
     repeated_open_same_file,
     failed_file_opens,
     slow_syscall,
     slow_network_connect,
+    slow_file_io,
     monotonic_memory_growth,
+    memory_spike,
     fd_count_growing,
     cpu_bound_no_syscalls,
+    spin_loop,
+    infinite_loop_no_progress,
+    excessive_subprocess,
+    connection_error,
+    no_connection_reuse,
+    mutex_contention,
+    io_retry_loop,
+    small_read_storm,
+    write_storm,
 ]
 
 

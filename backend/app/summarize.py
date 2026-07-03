@@ -21,22 +21,171 @@ from . import llm, runs, storage
 from .util import now_ms
 
 SYSTEM_PROMPT = (
-    "You are OpenTrace's analysis assistant. You read a structured summary of a "
-    "single Linux program run (captured with strace + psutil) and explain it to "
-    "the developer who ran it. Interpret patterns — do not just restate numbers.\n\n"
+    "You are OpenTrace's analysis assistant. You read a structured digest of a "
+    "single Linux program run (captured with strace/ltrace + psutil, and "
+    "optionally perf) — including an event TIMELINE of what happened when — and "
+    "explain it to the developer who ran it. Interpret the sequence and patterns; "
+    "use the timeline to describe what the program did over its lifetime, not just "
+    "final totals.\n\n"
     "Respond in GitHub-flavoured markdown using EXACTLY these section headers, in "
     "this order:\n"
-    "## What's Wrong\n## Why It Matters\n## What to Investigate\n"
-    "## What Looks Fine\n## Confidence\n\n"
-    "Guidelines: be concise and concrete; quantify impact where you can; point at "
-    "likely files/functions/call-patterns to check; if nothing is wrong, say so "
-    "plainly in 'What's Wrong'. Note that metrics are measured under strace, which "
+    "## What Happened\n## What's Wrong\n## Why It Matters\n## What to Investigate\n"
+    "## Confidence\n\n"
+    "'What Happened' is a 2–4 sentence narrative of the run over time (lean on the "
+    "timeline + memory/CPU trajectory). Be concise and concrete elsewhere; quantify "
+    "impact; point at likely files/functions/call-patterns. If nothing is wrong, "
+    "say so plainly in 'What's Wrong'. Metrics are measured under a tracer, which "
     "adds overhead. End 'Confidence' with a one-line honest uncertainty note. Do "
     "not invent data beyond what is given."
 )
 
 
-def build_messages(run: runs.Run, summary: dict | None, anomalies: list[dict]) -> list[dict]:
+def _hbytes(n: float | int | None) -> str:
+    if not n:
+        return "0B"
+    v = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(v) < 1024 or unit == "GB":
+            return f"{v:.0f}{unit}" if unit == "B" else f"{v:.1f}{unit}"
+        v /= 1024
+    return f"{v:.1f}GB"
+
+
+def _timeline(events: list[dict], started_at: int, *, limit: int = 22) -> list[str]:
+    """A compact 'what happened when' from curated events (errors / slow calls /
+    signals / exec / exit), collapsing consecutive identical errors into one."""
+    notable: list[tuple] = []
+    for e in events:
+        ts = e.get("timestamp_ms")
+        if ts is None:
+            continue
+        et, sc, err, lat = e.get("event_type"), e.get("syscall"), e.get("error"), e.get("latency_ms")
+        if et in ("signal", "exit"):
+            notable.append((ts, et, sc, err, lat, e.get("retval")))
+        elif err:
+            notable.append((ts, "error", sc, err, None, e.get("path")))
+        elif lat is not None and lat > 100:
+            notable.append((ts, "slow", sc, None, lat, None))
+        elif sc in ("execve", "execveat"):
+            notable.append((ts, "exec", sc, None, None, e.get("path") or (e.get("args") or "")[:50]))
+    notable.sort(key=lambda x: x[0])
+
+    def rel(t: float) -> float:
+        return (t - started_at) / 1000.0
+
+    lines: list[str] = []
+    i = 0
+    while i < len(notable):
+        ts, kind, sc, err, lat, extra = notable[i]
+        j = i + 1
+        if kind == "error":
+            while (j < len(notable) and notable[j][1] == "error"
+                   and notable[j][2] == sc and notable[j][3] == err):
+                j += 1
+        n = j - i
+        if kind == "error":
+            if n > 1:
+                lines.append(f"+{rel(ts):.2f}–{rel(notable[j-1][0]):.2f}s {sc} → {err} ×{n}")
+            else:
+                lines.append(f"+{rel(ts):.2f}s {sc} → {err}")
+        elif kind == "slow":
+            lines.append(f"+{rel(ts):.2f}s {sc} took {lat:.0f}ms")
+        elif kind == "exec":
+            lines.append(f"+{rel(ts):.2f}s exec {str(extra or '').strip()}".rstrip())
+        elif kind == "signal":
+            lines.append(f"+{rel(ts):.2f}s signal {sc}")
+        elif kind == "exit":
+            lines.append(f"+{rel(ts):.2f}s exited {extra if extra is not None else (err or '')}".rstrip())
+        i = j
+    if len(lines) > limit:
+        lines = lines[: limit - 1] + [f"… (+{len(lines) - (limit - 1)} more timeline events)"]
+    return lines
+
+
+def _trajectory(metrics: list[dict]) -> list[str]:
+    out: list[str] = []
+    rss = [m["rss_mb"] for m in metrics if m.get("rss_mb") is not None]
+    cpu = [m["cpu_pct"] for m in metrics if m.get("cpu_pct") is not None]
+    fds = [m["open_fds"] for m in metrics if m.get("open_fds") is not None]
+    if rss:
+        trend = ("rising" if rss[-1] > rss[0] * 1.2 + 1 else
+                 "falling" if rss[-1] < rss[0] * 0.8 else "steady")
+        out.append(f"RSS over time: {rss[0]:.0f}→{rss[-1]:.0f}MB, peak {max(rss):.0f}MB ({trend})")
+    if cpu:
+        out.append(f"CPU over time: avg {sum(cpu) / len(cpu):.0f}%, peak {max(cpu):.0f}%")
+    if fds and max(fds) > min(fds):
+        out.append(f"Open FDs: {fds[0]}→{fds[-1]}, peak {max(fds)}")
+    return out
+
+
+def _io_lines(io: list[dict], *, limit: int = 6) -> list[str]:
+    rows = sorted(io, key=lambda r: r.get("read_bytes", 0) + r.get("write_bytes", 0), reverse=True)
+    out = []
+    for r in rows[:limit]:
+        leak = " ⊘unclosed" if r.get("leaked") else ""
+        out.append(
+            f"{r.get('path')}: {r.get('reads', 0)}r/{r.get('writes', 0)}w, "
+            f"{_hbytes(r.get('read_bytes'))} read / {_hbytes(r.get('write_bytes'))} written{leak}"
+        )
+    return out
+
+
+def _net_lines(net: list[dict], *, limit: int = 6) -> list[str]:
+    out = []
+    for c in net[:limit]:
+        res = c.get("result")
+        out.append(
+            f"{c.get('address')}:{c.get('port')} ({c.get('family', '')}) → {res}"
+            + (f" {c.get('latency_ms'):.0f}ms" if c.get("latency_ms") else "")
+        )
+    return out
+
+
+def _profile_lines(profile: dict | None) -> list[str]:
+    m = (profile or {}).get("malloc") or {}
+    if not m.get("supported"):
+        return []
+    out = [
+        f"Allocations: {m.get('n_alloc')} vs {m.get('n_free')} frees; "
+        f"{_hbytes(m.get('bytes_allocated'))} allocated, peak live {_hbytes(m.get('peak_live_bytes'))}"
+    ]
+    if m.get("outstanding_bytes"):
+        out.append(
+            f"LEAKED at exit: {_hbytes(m['outstanding_bytes'])} in "
+            f"{m.get('outstanding_blocks')} un-freed block(s)"
+        )
+    hot = (profile or {}).get("hotspots") or []
+    if hot:
+        out.append("Top library calls by time: " + ", ".join(
+            f"{h['function']}×{h['calls']}({h['total_ms']:.0f}ms)" for h in hot[:5]
+        ))
+    return out
+
+
+def _flame_lines(flamegraph: dict | None) -> list[str]:
+    fg = flamegraph or {}
+    if not fg.get("supported"):
+        return []
+    hot = fg.get("hotspots") or []
+    if not hot:
+        return []
+    return ["CPU hotspots (perf, self%): " + ", ".join(
+        f"{h['function']} {h['self_pct']:.0f}%" for h in hot[:8]
+    )]
+
+
+def build_messages(
+    run: runs.Run,
+    summary: dict | None,
+    anomalies: list[dict],
+    *,
+    timeline: list[str] | None = None,
+    trajectory: list[str] | None = None,
+    io: list[dict] | None = None,
+    network: list[dict] | None = None,
+    profile: dict | None = None,
+    flamegraph: dict | None = None,
+) -> list[dict]:
     s = summary or {}
     totals = s.get("totals", {})
     peaks = s.get("peaks", {})
@@ -56,6 +205,21 @@ def build_messages(run: runs.Run, summary: dict | None, anomalies: list[dict]) -
         parts.append("Top syscalls (name×count): " + ", ".join(
             f"{n}×{c}" for n, c in top[:10]
         ))
+    if trajectory:
+        parts.append("\nResource trajectory:\n" + "\n".join(f"  {t}" for t in trajectory))
+    if timeline:
+        parts.append("\nEvent timeline (relative to start):\n" + "\n".join(f"  {t}" for t in timeline))
+    if io:
+        parts.append("\nTop files by I/O:\n" + "\n".join(f"  {x}" for x in _io_lines(io)))
+    net_lines = _net_lines(network) if network else []
+    if net_lines:
+        parts.append("\nOutbound connections:\n" + "\n".join(f"  {x}" for x in net_lines))
+    prof_lines = _profile_lines(profile)
+    if prof_lines:
+        parts.append("\nAllocation profile (ltrace):\n" + "\n".join(f"  {x}" for x in prof_lines))
+    flame_lines = _flame_lines(flamegraph)
+    if flame_lines:
+        parts.append("\n" + "\n".join(flame_lines))
     if anomalies:
         parts.append("\nAnomalies detected by the rule engine:")
         for a in anomalies:
@@ -184,6 +348,40 @@ def _persist(run: runs.Run, text: str) -> None:
     storage.record_artifact(run.id, "ai-summary", p)
 
 
+def _gather_context(run: runs.Run) -> dict:
+    """Assemble the token-budgeted extra context (timeline, trajectory, I/O,
+    network, profile, flamegraph) for the LLM prompt. Best-effort: any piece
+    that fails to load is simply omitted."""
+    from . import aggregate
+
+    ctx: dict = {}
+    run_dir = Path(run.run_dir)
+    try:
+        ctx["timeline"] = _timeline(storage.read_events(run.id, limit=3000), run.started_at)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ctx["trajectory"] = _trajectory(storage.read_metrics(run.id))
+    except Exception:  # noqa: BLE001
+        pass
+    events_path = run_dir / "events.ndjson.zst"
+    if events_path.exists():
+        try:
+            events = list(storage.read_ndjson_zst(events_path))
+            ctx["io"] = aggregate.io_stats(events)
+            ctx["network"] = aggregate.network_stats(events)
+        except Exception:  # noqa: BLE001
+            pass
+    for key, fname in (("profile", "profile.json"), ("flamegraph", "flamegraph.json")):
+        p = run_dir / fname
+        if p.exists():
+            try:
+                ctx[key] = json.loads(p.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+    return ctx
+
+
 async def stream_summary(run: runs.Run, *, force: bool = False) -> AsyncIterator[dict]:
     """Yield typed events (thinking/content/error/done). Streams the cached
     summary verbatim when present unless `force`; otherwise calls the LLM and
@@ -202,8 +400,7 @@ async def stream_summary(run: runs.Run, *, force: bool = False) -> AsyncIterator
     meta = Path(run.run_dir) / "meta.json"
     summary = json.loads(meta.read_text()) if meta.exists() else None
     anomalies = storage.read_anomalies(run.id)
-
-    messages = build_messages(run, summary, anomalies)
+    messages = build_messages(run, summary, anomalies, **_gather_context(run))
     acc: list[str] = []
     async for ev in llm.stream_chat(messages):
         if ev["type"] == "content":

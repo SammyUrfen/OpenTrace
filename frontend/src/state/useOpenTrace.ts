@@ -28,6 +28,7 @@ export interface Run {
   status: string
   label: string | null
   max_severity: string | null
+  collector_config: Record<string, boolean> | null
   created_at: number
 }
 
@@ -51,6 +52,13 @@ export interface LiveState {
   fds: number[]
 }
 
+/** A live anomaly alert pushed during a run (from metric thresholds). */
+export interface LiveAlert {
+  severity: string
+  title: string
+  timestamp_ms: number
+}
+
 const RING = 120 // samples kept per series for the sparklines
 
 function push(arr: number[], v: number | null): number[] {
@@ -62,14 +70,24 @@ interface Hook {
   projects: Project[]
   runs: Run[]
   live: Record<string, LiveState>
+  alerts: Record<string, LiveAlert[]>
   liveRunId: string | null
   /** The most recently finalized run, as `{id, n}` — `n` increments per end so
    *  the same run ending twice (rare) still triggers a re-open. */
   lastEnded: { id: string; n: number } | null
   connected: boolean
+  /** True once the SSE stream has errored at least once since the last open —
+   *  lets the UI distinguish "still connecting" from "backend unreachable"
+   *  without a health poll. */
+  connectionError: boolean
+  /** True once the first projects+runs fetch has resolved (used to avoid
+   *  pruning restored tabs before the run list has loaded). */
+  loaded: boolean
   refresh: () => Promise<void>
   deleteRun: (id: string) => Promise<void>
+  renameRun: (id: string, displayName: string) => Promise<void>
   createSession: (displayName: string) => Promise<Project | null>
+  renameSession: (id: string, displayName: string) => Promise<void>
 }
 
 /**
@@ -80,9 +98,12 @@ export function useOpenTrace(backendUrl: string): Hook {
   const [projects, setProjects] = useState<Project[]>([])
   const [runs, setRuns] = useState<Run[]>([])
   const [live, setLive] = useState<Record<string, LiveState>>({})
+  const [alerts, setAlerts] = useState<Record<string, LiveAlert[]>>({})
   const [liveRunId, setLiveRunId] = useState<string | null>(null)
   const [lastEnded, setLastEnded] = useState<{ id: string; n: number } | null>(null)
   const [connected, setConnected] = useState(false)
+  const [connectionError, setConnectionError] = useState(false)
+  const [loaded, setLoaded] = useState(false)
   const esRef = useRef<EventSource | null>(null)
   const endCount = useRef(0)
 
@@ -94,6 +115,7 @@ export function useOpenTrace(backendUrl: string): Hook {
       ])
       setProjects(p)
       setRuns(r)
+      setLoaded(true)
     } catch {
       /* backend not up yet; SSE + retry will catch up */
     }
@@ -118,6 +140,31 @@ export function useOpenTrace(backendUrl: string): Hook {
     [backendUrl],
   )
 
+  const renameRun = useCallback(
+    async (id: string, name: string): Promise<void> => {
+      // Empty label clears the custom name (falls back to the command / default).
+      const label = name.trim() || null
+      // Set `label` (not display_name) so the rename shows everywhere the run is
+      // referenced — tab AND sidebar AND palette — via `label ?? command`.
+      // Optimistic: reflect immediately, reconcile on response.
+      setRuns((prev) => prev.map((r) => (r.id === id ? { ...r, label } : r)))
+      try {
+        const r = await fetch(`${backendUrl}/runs/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label }),
+        })
+        if (r.ok) {
+          const run: Run = await r.json()
+          setRuns((prev) => prev.map((x) => (x.id === id ? run : x)))
+        }
+      } catch {
+        /* ignore; optimistic update stands until next refresh */
+      }
+    },
+    [backendUrl],
+  )
+
   const createSession = useCallback(
     async (displayName: string): Promise<Project | null> => {
       try {
@@ -137,12 +184,31 @@ export function useOpenTrace(backendUrl: string): Hook {
     [backendUrl],
   )
 
+  const renameSession = useCallback(
+    async (id: string, displayName: string): Promise<void> => {
+      try {
+        const r = await fetch(`${backendUrl}/sessions/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ display_name: displayName }),
+        })
+        if (r.ok) {
+          const proj: Project = await r.json()
+          setProjects((prev) => prev.map((p) => (p.id === id ? proj : p)))
+        }
+      } catch {
+        /* ignore */
+      }
+    },
+    [backendUrl],
+  )
+
   useEffect(() => {
     void refresh()
     const es = new EventSource(`${backendUrl}/stream`)
     esRef.current = es
-    es.onopen = () => setConnected(true)
-    es.onerror = () => setConnected(false)
+    es.onopen = () => { setConnected(true); setConnectionError(false) }
+    es.onerror = () => { setConnected(false); setConnectionError(true) }
     es.onmessage = (ev) => {
       let msg: { type: string; run_id: string; data: any }
       try {
@@ -154,7 +220,14 @@ export function useOpenTrace(backendUrl: string): Hook {
       if (type === 'run_started') {
         upsertRun(data as Run)
         setLiveRunId(run_id)
+        setAlerts((prev) => ({ ...prev, [run_id]: [] }))
         void refreshProjects()
+      } else if (type === 'anomaly_alert') {
+        const al = data as LiveAlert
+        setAlerts((prev) => {
+          const cur = prev[run_id] ?? []
+          return { ...prev, [run_id]: [...cur, al].slice(-12) }
+        })
       } else if (type === 'run_analyzing') {
         setRuns((prev) =>
           prev.map((r) => (r.id === run_id ? { ...r, status: 'analyzing' } : r)),
@@ -204,7 +277,7 @@ export function useOpenTrace(backendUrl: string): Hook {
   }, [backendUrl, refresh, upsertRun])
 
   return {
-    projects, runs, live, liveRunId, lastEnded, connected, refresh,
-    deleteRun, createSession,
+    projects, runs, live, alerts, liveRunId, lastEnded, connected, connectionError,
+    loaded, refresh, deleteRun, renameRun, createSession, renameSession,
   }
 }

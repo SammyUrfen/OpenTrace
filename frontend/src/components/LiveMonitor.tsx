@@ -1,11 +1,12 @@
-import type { LiveState, Run } from '../state/useOpenTrace'
+import type { LiveAlert, LiveState, Run } from '../state/useOpenTrace'
 import type { Collectors } from '../state/useCollectors'
-import { formatBytesPerSec, formatDuration } from '../state/format'
+import { SEVERITY_COLOR, formatBytesPerSec, formatDuration } from '../state/format'
 import { Sparkline } from './Sparkline'
 
 interface Props {
   activeRun: Run | null
   live: LiveState | null
+  alerts: LiveAlert[]
   tracing: boolean
   collectors: Collectors | null
   onToggleCollector: (key: keyof Collectors) => void
@@ -19,9 +20,14 @@ const COLLECTOR_ROWS: {
 }[] = [
   { key: 'psutil', label: 'Resource metrics', sub: 'CPU · Memory · FDs', enabled: true },
   { key: 'strace', label: 'Syscall trace', sub: 'Syscalls · I/O · Network', enabled: true },
-  { key: 'ltrace', label: 'Library calls', sub: 'malloc/free — Phase 6', enabled: false },
-  { key: 'perf', label: 'Hardware perf', sub: 'flamegraph — Phase 6', enabled: false },
+  { key: 'ltrace', label: 'Library calls', sub: 'malloc/free · hotspots', enabled: true },
+  { key: 'perf', label: 'Hardware perf', sub: 'CPU flamegraph', enabled: true },
 ]
+
+const COLLECTOR_HINTS: Partial<Record<keyof Collectors, string>> = {
+  ltrace: 'Library + malloc/free tracing — uses ptrace, so it replaces Syscall trace',
+  perf: 'Sample CPU call stacks for a flamegraph — most accurate with tracers off',
+}
 
 function Collectors({
   collectors,
@@ -39,7 +45,7 @@ function Collectors({
           <label
             key={c.key}
             className={`collector ${c.enabled ? '' : 'collector--disabled'}`}
-            title={c.enabled ? '' : 'Available in Phase 6'}
+            title={COLLECTOR_HINTS[c.key] ?? ''}
           >
             <input
               type="checkbox"
@@ -84,7 +90,7 @@ function Metric({
  * Right pane of the bottom panel. Shows live metrics for the currently running
  * trace (streamed over SSE) or an idle/last-value state otherwise.
  */
-export function LiveMonitor({ activeRun, live, tracing, collectors, onToggleCollector }: Props) {
+export function LiveMonitor({ activeRun, live, alerts, tracing, collectors, onToggleCollector }: Props) {
   const latest = live?.latest ?? null
   const running = activeRun?.status === 'running'
 
@@ -96,6 +102,16 @@ export function LiveMonitor({ activeRun, live, tracing, collectors, onToggleColl
       </div>
 
       <Collectors collectors={collectors} onToggle={onToggleCollector} />
+
+      {alerts.length > 0 && (
+        <div className="live-alerts">
+          {alerts.map((a, i) => (
+            <div key={i} className="live-alert" style={{ borderLeftColor: SEVERITY_COLOR[a.severity] }}>
+              ⚠ {a.title}
+            </div>
+          ))}
+        </div>
+      )}
 
       {!activeRun && (
         <div className="live-monitor__idle">

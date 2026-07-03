@@ -14,7 +14,8 @@ function mkRun(over: Partial<Run> = {}): Run {
     display_name: 'python_20260621_120000', command: 'python3 train.py',
     command_basename: 'python3', cwd: '/home/u/demo', started_at: 1_700_000_000_000,
     ended_at: 1_700_000_002_500, duration_ms: 2500, exit_code: 0, exit_signal: null,
-    status: 'completed', label: null, max_severity: 'high', created_at: 1_700_000_000_000,
+    status: 'completed', label: null, max_severity: 'high',
+    collector_config: null, created_at: 1_700_000_000_000,
     ...over,
   }
 }

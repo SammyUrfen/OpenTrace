@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 /** An open main tab: either a single run, or a diff of two runs (A ↔ B). */
 export type Tab =
@@ -9,10 +9,43 @@ export function tabKey(t: Tab): string {
   return t.kind === 'run' ? `run:${t.runId}` : `diff:${t.aId}:${t.bId}`
 }
 
+const TABS_KEY = 'opentrace-tabs'
+const ACTIVE_KEY = 'opentrace-active-tab'
+
+function loadTabs(): Tab[] {
+  try {
+    const raw = localStorage.getItem(TABS_KEY)
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr : []
+  } catch {
+    return []
+  }
+}
+
 export function useTabs() {
-  const [tabs, setTabs] = useState<Tab[]>([])
-  const [activeKey, setActiveKey] = useState<string | null>(null)
+  // Restore open tabs across restarts; App prunes any whose run(s) no longer
+  // exist once the run list has loaded.
+  const [tabs, setTabs] = useState<Tab[]>(loadTabs)
+  const [activeKey, setActiveKey] = useState<string | null>(
+    () => localStorage.getItem(ACTIVE_KEY),
+  )
   const [activeView, setActiveView] = useState('overview')
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TABS_KEY, JSON.stringify(tabs))
+    } catch {
+      /* storage full / unavailable — non-fatal */
+    }
+  }, [tabs])
+  useEffect(() => {
+    try {
+      if (activeKey) localStorage.setItem(ACTIVE_KEY, activeKey)
+      else localStorage.removeItem(ACTIVE_KEY)
+    } catch {
+      /* non-fatal */
+    }
+  }, [activeKey])
 
   const open = useCallback((t: Tab) => {
     const k = tabKey(t)

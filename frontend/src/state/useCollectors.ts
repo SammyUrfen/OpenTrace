@@ -33,10 +33,15 @@ export function useCollectors(backendUrl: string) {
     (key: keyof Collectors) => {
       setTracing((prev) => {
         if (!prev) return prev
-        const next: TracingConfig = {
-          ...prev,
-          collectors: { ...prev.collectors, [key]: !prev.collectors[key] },
-        }
+        const on = !prev.collectors[key]
+        const collectors = { ...prev.collectors, [key]: on }
+        // strace and ltrace both use ptrace and can't attach to one PID at once,
+        // so they're mutually exclusive. perf (sampling) and psutil are
+        // independent and can run alongside either — a flamegraph is just
+        // cleanest with the tracer off (noted in the wizard guide).
+        if (on && key === 'ltrace') collectors.strace = false
+        if (on && key === 'strace') collectors.ltrace = false
+        const next: TracingConfig = { ...prev, collectors }
         fetch(`${backendUrl}/config/tracing`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },

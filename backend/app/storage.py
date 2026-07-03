@@ -270,3 +270,10 @@ def write_meta(run_dir: str | Path, meta: dict) -> None:
     p = Path(run_dir) / "meta.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+
+
+def write_json(path: str | Path, doc: dict) -> None:
+    """Write a derived JSON artifact (e.g. profile.json, flamegraph.json)."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(doc, default=str), encoding="utf-8")

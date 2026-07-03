@@ -30,4 +30,9 @@ contextBridge.exposeInMainWorld('opentrace', {
   session: {
     set: (id) => ipcRenderer.invoke('session:set', id),
   },
+  // Native application-menu / keyboard-shortcut actions are delivered here as
+  // string action names (e.g. 'new-session', 'settings', 'toggle-tracing').
+  menu: {
+    onAction: (cb) => subscribe('menu:action', cb),
+  },
 })

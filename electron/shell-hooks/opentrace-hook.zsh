@@ -69,6 +69,12 @@ opentrace_should_trace() {
   (( ${#toks} )) || return 1
 
   local first="${toks[1]}"
+
+  # Never re-wrap an already-wrapped command. Recalling an old `otrace -- <cmd>`
+  # line from history (or typing `ot`/`otrace` directly) would otherwise nest as
+  # `otrace -- otrace -- <cmd>`, polluting both the terminal and the run record.
+  [[ "${first:t}" == otrace ]] && return 1
+
   local wtype="$(whence -w -- "$first" 2>/dev/null)"; wtype="${wtype##*: }"
   case "$wtype" in
     builtin|reserved|function|alias|none|'') return 1 ;;   # only real commands
@@ -88,10 +94,38 @@ opentrace_should_trace() {
   return 0
 }
 
+# Pull live tracing/session state from the runtime file the app maintains (set
+# without typing into the shell, so nothing echoes into the terminal).
+opentrace_sync() { [[ -r "${OPENTRACE_RT:-}" ]] && source "$OPENTRACE_RT"; }
+autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook precmd opentrace_sync
+opentrace_sync
+
+# Keep the `otrace --` wrapper out of shell history: when a wrapped line is about
+# to be committed, record the clean command the user actually typed and drop the
+# wrapper. This runs at history-commit time (via the zshaddhistory hook), so it
+# works regardless of the user's HIST_IGNORE_SPACE / SHARE_HISTORY settings —
+# unlike a per-widget `setopt localoptions`, whose effect is restored before the
+# commit happens.
+opentrace_addhistory() {
+  emulate -L zsh
+  local line=${1%$'\n'}
+  if [[ "$line" == "otrace -- "* ]]; then
+    print -sr -- "${line#otrace -- }"
+    return 1   # don't save the wrapped form (clean line already recorded above)
+  fi
+  return 0
+}
+autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook zshaddhistory opentrace_addhistory
+
 opentrace-accept-line() {
+  opentrace_sync
   if [[ "${OPENTRACE_ENABLE_STRACE:-0}" == "1" ]] && \
      opentrace_should_trace "$BUFFER"; then
-    BUFFER="${OPENTRACE_OTRACE} -- ${BUFFER}"
+    # `otrace` resolves via the hooks dir on PATH, so the rewritten line reads
+    # `otrace -- <cmd>` rather than an absolute path. The wrapper is stripped
+    # back out before the line is saved (see opentrace_addhistory), so history
+    # and up-arrow show the command the user actually typed.
+    BUFFER="otrace -- ${BUFFER}"
   fi
   zle .accept-line
 }

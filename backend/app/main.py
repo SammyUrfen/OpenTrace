@@ -80,6 +80,15 @@ def info() -> dict[str, object]:
     }
 
 
+@app.get("/info/tools")
+def info_tools() -> dict[str, object]:
+    """Which tracing tools (strace/ltrace/perf) are installed, with versions and
+    a distro-tailored install hint for any that are missing."""
+    from . import tools
+
+    return tools.detect()
+
+
 # --- live SSE channels ------------------------------------------------------
 
 @app.get("/stream")

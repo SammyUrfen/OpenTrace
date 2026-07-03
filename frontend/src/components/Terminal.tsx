@@ -83,6 +83,30 @@ export function Terminal({ onStart, onExit }: Props) {
     term.open(host)
     fit.fit()
 
+    // Clipboard: Ctrl+Shift+C copies the selection, Ctrl+Shift+V pastes; a
+    // right-click copies a selection or otherwise pastes. (xterm wires none of
+    // these by default, which is why copy "didn't work".)
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown' || !e.ctrlKey || !e.shiftKey) return true
+      if (e.code === 'KeyC') {
+        const sel = term.getSelection()
+        if (sel) void navigator.clipboard?.writeText(sel)
+        return false
+      }
+      if (e.code === 'KeyV') {
+        navigator.clipboard?.readText().then((t) => t && api.write(t)).catch(() => {})
+        return false
+      }
+      return true
+    })
+    const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault()
+      const sel = term.getSelection()
+      if (sel) void navigator.clipboard?.writeText(sel)
+      else navigator.clipboard?.readText().then((t) => t && api.write(t)).catch(() => {})
+    }
+    host.addEventListener('contextmenu', onContextMenu)
+
     // Re-theme the terminal when the app theme toggles.
     const themeObserver = new MutationObserver(() => {
       term.options.theme = currentTermTheme()
@@ -129,6 +153,7 @@ export function Terminal({ onStart, onExit }: Props) {
     return () => {
       observer.disconnect()
       themeObserver.disconnect()
+      host.removeEventListener('contextmenu', onContextMenu)
       inputDisposable.dispose()
       unsubscribeData()
       unsubscribeExit()

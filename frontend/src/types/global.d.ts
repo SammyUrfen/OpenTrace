@@ -22,6 +22,9 @@ declare global {
       session?: {
         set: (id: string) => Promise<boolean>
       }
+      menu?: {
+        onAction: (cb: (action: string) => void) => () => void
+      }
     }
   }
 }
