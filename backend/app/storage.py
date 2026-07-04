@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -277,3 +279,63 @@ def write_json(path: str | Path, doc: dict) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(doc, default=str), encoding="utf-8")
+
+
+# --- monitor-mode incidents (ndjson in the run dir) -------------------------
+# All access is serialized: append (poller/monitor threads), full-file rewrite
+# (backfill + AI worker threads), and read (request thread) run concurrently, so
+# without this lock a truncating rewrite races an append → torn/lost lines.
+_incidents_lock = threading.Lock()
+
+
+def _incidents_path(run_dir: str | Path) -> Path:
+    return Path(run_dir) / "incidents.ndjson"
+
+
+def _read_incidents_unlocked(run_dir: str | Path) -> list[dict]:
+    p = _incidents_path(run_dir)
+    if not p.exists():
+        return []
+    out: list[dict] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def append_incident(run_dir: str | Path, incident: dict) -> None:
+    p = _incidents_path(run_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with _incidents_lock, open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(incident, separators=(",", ":"), default=str) + "\n")
+
+
+def read_incidents(run_dir: str | Path) -> list[dict]:
+    with _incidents_lock:
+        return _read_incidents_unlocked(run_dir)
+
+
+def update_incident(run_dir: str | Path, incident_id: str, **fields) -> None:
+    """Patch fields on a stored incident (e.g. ai=..., hot=...). Atomic rewrite
+    (temp + os.replace) under the incidents lock so concurrent appends/updates
+    can't tear or lose data."""
+    with _incidents_lock:
+        incidents = _read_incidents_unlocked(run_dir)
+        changed = False
+        for inc in incidents:
+            if inc.get("id") == incident_id:
+                inc.update(fields)
+                changed = True
+        if not changed:
+            return
+        p = _incidents_path(run_dir)
+        tmp = p.with_suffix(".ndjson.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for inc in incidents:
+                f.write(json.dumps(inc, separators=(",", ":"), default=str) + "\n")
+        os.replace(tmp, p)

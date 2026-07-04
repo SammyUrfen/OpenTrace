@@ -90,3 +90,53 @@ def test_hot_function_skips_unknown_then_flags_resolved():
 
 def test_no_perf_anomaly_when_unsupported():
     assert perf.perf_anomalies({"supported": False}) == []
+
+
+# --- Phase B: universal folded-stack ingest ---------------------------------
+
+def test_fold_collapsed_self_and_total():
+    text = "main;a;b 5\nmain;a;c 3\nmain;a 2\n"
+    fg = perf.fold_collapsed(text)
+    assert fg["supported"] and fg["samples"] == 10 and fg["unit"] == "samples"
+    self_by = {h["function"]: h["self"] for h in fg["hotspots"]}
+    total_by = {h["function"]: h["total"] for h in fg["hotspots"]}
+    assert self_by["b"] == 5 and self_by["c"] == 3 and self_by["a"] == 2
+    assert total_by["a"] == 10 and total_by["main"] == 10  # a & main are in every stack
+
+
+def test_fold_collapsed_skips_malformed_and_tags_usec():
+    text = "no_count_here\ngood;leaf 4\n;;; 2\nbad;x notanumber\n"
+    fg = perf.fold_collapsed(text, count_is_usec=True)
+    assert fg["samples"] == 4 and fg["unit"] == "usec"  # only the one valid line
+    assert {h["function"] for h in fg["hotspots"]} == {"good", "leaf"}
+
+
+def test_fold_speedscope_root_to_leaf_and_merges_profiles():
+    doc = {
+        "shared": {"frames": [{"name": "root"}, {"name": "foo"}, {"name": "bar"}]},
+        "profiles": [
+            {"type": "sampled", "samples": [[0, 1], [0, 1, 2]], "weights": [1, 1]},
+            {"type": "sampled", "samples": [[0, 1]], "weights": [1]},  # 2nd thread
+        ],
+    }
+    fg = perf.fold_speedscope(doc)
+    assert fg["samples"] == 3
+    self_by = {h["function"]: h["self"] for h in fg["hotspots"]}
+    assert self_by["foo"] == 2 and self_by["bar"] == 1  # foo is a leaf twice (root->leaf order)
+
+
+def test_fold_perf_script_unchanged_by_refactor():
+    fg = perf.fold_perf_script(SAMPLE)
+    assert fg["supported"] and fg["samples"] == 2
+
+
+def test_fold_empty_capture_is_unsupported():
+    # zero-sample captures must downgrade like build_flamegraph (friendly empty state)
+    assert perf.fold_collapsed("")["supported"] is False
+    g = perf.fold_collapsed("garbage with no count\n")
+    assert g["supported"] is False and g["samples"] == 0 and "reason" in g
+    ss = perf.fold_speedscope({"shared": {"frames": [{"name": "f"}]},
+                               "profiles": [{"type": "sampled", "samples": [], "weights": []}]})
+    assert ss["supported"] is False and ss["samples"] == 0 and "reason" in ss
+    # a real capture stays supported
+    assert perf.fold_collapsed("a;b 3\n")["supported"] is True

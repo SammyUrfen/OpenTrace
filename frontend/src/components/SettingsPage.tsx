@@ -172,6 +172,7 @@ function AiPane({ backendUrl }: { backendUrl: string }) {
   const [model, setModel] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [hasKey, setHasKey] = useState(false)
+  const [continuous, setContinuous] = useState(false)
   const [test, setTest] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
@@ -180,12 +181,13 @@ function AiPane({ backendUrl }: { backendUrl: string }) {
       setBaseUrl(d.base_url ?? '')
       setModel(d.model ?? '')
       setHasKey(d.has_key)
+      setContinuous(!!d.continuous_summaries)
     }).catch(() => {})
   }, [backendUrl])
 
   const save = async () => {
     setSaving(true)
-    const body: Record<string, string> = { base_url: baseUrl, model }
+    const body: Record<string, unknown> = { base_url: baseUrl, model }
     if (apiKey.trim()) body.api_key = apiKey.trim()
     try {
       await fetch(`${backendUrl}/config/llm`, {
@@ -195,6 +197,16 @@ function AiPane({ backendUrl }: { backendUrl: string }) {
     } finally {
       setSaving(false)
     }
+  }
+  const toggleContinuous = () => {
+    const next = !continuous
+    setContinuous(next)
+    // send ONLY the flag — resending empty base_url/model (before the mount GET
+    // resolves, or when unset) would null out the saved LLM config.
+    void fetch(`${backendUrl}/config/llm`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ continuous_summaries: next }),
+    })
   }
   const onTest = async () => {
     setTest('Testing…')
@@ -231,7 +243,14 @@ function AiPane({ backendUrl }: { backendUrl: string }) {
       {test && <div className="modal__test">{test}</div>}
       <div className="settings__actions">
         <button type="button" className="ai-btn" onClick={onTest} disabled={saving}>Test connection</button>
-        <button type="button" className="ai-btn ai-btn--primary" onClick={save} disabled={saving}>Save</button>
+        <button type="button" className="ai-btn ai-btn--primary" onClick={() => void save()} disabled={saving}>Save</button>
+      </div>
+      <div className="settings__row" style={{ marginTop: 14 }}>
+        <div><div className="settings__rowlabel">Continuous incident summaries</div>
+          <div className="settings__rowsub">In monitor mode, auto-explain each detected incident with a short AI note (where in code + likely cause). One request per incident.</div></div>
+        <button type="button" className="ai-btn" onClick={toggleContinuous} disabled={saving}>
+          {continuous ? 'On' : 'Off'} — toggle
+        </button>
       </div>
     </section>
   )

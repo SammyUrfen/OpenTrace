@@ -145,12 +145,14 @@ class LLMSettings(BaseModel):
     model: str | None = None
     configured: bool = False
     has_key: bool = False
+    continuous_summaries: bool = False
 
 
 class LLMUpdate(BaseModel):
     base_url: str | None = None
     model: str | None = None
     api_key: str | None = None  # write-only; stored in the secret store
+    continuous_summaries: bool | None = None
 
 
 def _settings_view(cfg: config.Config) -> LLMSettings:
@@ -159,6 +161,7 @@ def _settings_view(cfg: config.Config) -> LLMSettings:
         model=cfg.llm.model,
         configured=is_configured(cfg),
         has_key=bool(get_api_key(cfg)),
+        continuous_summaries=cfg.llm.continuous_summaries,
     )
 
 
@@ -174,6 +177,8 @@ def http_put(data: LLMUpdate) -> LLMSettings:
         cfg.llm.base_url = data.base_url.strip() or None
     if data.model is not None:
         cfg.llm.model = data.model.strip() or None
+    if data.continuous_summaries is not None:
+        cfg.llm.continuous_summaries = data.continuous_summaries
     config.save(cfg)
     if data.api_key:  # only set when a non-empty key is provided
         secrets.set_secret(cfg.llm.api_key_secret_name, data.api_key.strip())

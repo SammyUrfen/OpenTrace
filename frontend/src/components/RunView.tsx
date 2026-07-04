@@ -1,7 +1,8 @@
 import type { ReactNode } from 'react'
-import type { LiveState, Run } from '../state/useOpenTrace'
+import type { Incident, LiveState, Run } from '../state/useOpenTrace'
 import type { RunDetail } from '../state/useRunDetail'
 import type { ViewDef } from './SecondaryTabs'
+import { IncidentFeed } from './IncidentFeed'
 import { TabGuide } from './TabGuide'
 import { OverviewTab } from './OverviewTab'
 import { MemoryTab } from './MemoryTab'
@@ -42,10 +43,13 @@ export function runViews(run: Run | null): ViewDef[] {
   const hasStrace = !known || !!c.strace
   const views: ViewDef[] = [
     { key: 'overview', label: 'Overview' },
+  ]
+  if (c.monitor) views.push({ key: 'incidents', label: 'Incidents' })
+  views.push(
     { key: 'timeline', label: 'Timeline' },
     { key: 'memory', label: 'Memory' },
     { key: 'cpu', label: 'CPU' },
-  ]
+  )
   if (hasSyscalls)
     views.push(
       { key: 'io', label: 'I/O' },
@@ -69,13 +73,31 @@ interface Props {
   onOpenSettings: () => void
   /** Optional banner rendered above the view (e.g. the name-this-run prompt). */
   topSlot?: ReactNode
+  /** monitor-mode incidents (live from SSE) + a stop control for a live monitor run. */
+  incidents?: Incident[]
+  onStopMonitor?: () => void
 }
 
 /** Main content for an open run: renders the selected analytics view. */
-export function RunView({ run, detail, live, activeView, backendUrl, onOpenSettings, topSlot }: Props) {
+export function RunView({
+  run, detail, live, activeView, backendUrl, onOpenSettings, topSlot, incidents, onStopMonitor,
+}: Props) {
+  const isLiveMonitor = !!run.collector_config?.monitor && run.status === 'running'
   return (
     <div className="region region--main-content run-view" data-placeholder="main-content">
+      {isLiveMonitor && (
+        <div className="monitor-bar">
+          <span className="monitor-bar__dot" />
+          <span className="monitor-bar__label">Monitoring live — capturing incidents</span>
+          <button type="button" className="ai-btn monitor-bar__stop" onClick={onStopMonitor}>
+            Stop
+          </button>
+        </div>
+      )}
       {topSlot}
+      {activeView === 'incidents' && (
+        <IncidentFeed backendUrl={backendUrl} runId={run.id} live={incidents ?? []} />
+      )}
       {activeView === 'overview' && (
         <OverviewTab
           run={run}

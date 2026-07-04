@@ -760,6 +760,51 @@ API key stored in OS keyring (libsecret / Secret Service API). Never in config f
 - [ ] Plugin API for custom anomaly detectors
 - [ ] VS Code extension
 
+### Phase 9 — Production Profiling: Attach-to-PID + Universal Flamegraphs
+
+> Full design + per-runtime detail + privilege/symbolization caveats live in
+> **[`Profiling_Roadmap.md`](Profiling_Roadmap.md)**. This is the tracker.
+
+**Why:** OpenTrace today only *launches* a command (`otrace -- cmd`); a running
+production service (Spring Boot / Django / Rails / Node / Go / .NET / …) is already
+up. The unlock is **attach-to-a-running-PID** + **runtime auto-detection** + a
+**universal folded-stack ingest** that reuses the existing `perf.py` folding +
+`flamegraph.json` + `FlamegraphTab` for every language's sampler.
+
+- [x] **Phase A — Attach spine + native/Go perf attach** *(done 2026-07-04, verified end-to-end)*
+  - [x] `backend/app/attach.py`: `detect_runtime(pid)` (scan `/proc/<pid>/maps` + exe fallback) + `list_targets()` + `target_info()`
+  - [x] `POST /runs/attach {pid|port, window_s}` + `GET /runs/attach/targets` (`runs.py`)
+  - [x] orchestrator attach flow: `start_attach_run` → `perf record -p PID -g -F 99 -- sleep N` → `build_flamegraph()` (bounded window + subprocess-timeout watchdog, fail-open to psutil-only)
+  - [x] reuse `_begin_polling(pid, descendants_only=False)` for the psutil timeline; `FlamegraphTab` unchanged
+  - [x] frontend `AttachModal` picker (Run menu + palette) with per-runtime badges + symbolization hints
+  - Verified: attach to a live CPU-burner → flamegraph (501 samples, real symbols) + psutil timeline; picker detects Node/JVM/native. Tests in `test_attach.py`.
+- [x] **Phase A.1 — Live monitor mode + Incident Feed** *(done 2026-07-04, verified)* —
+  a *monitor* mode keeps the attach run live: continuous psutil metrics + back-to-back
+  bounded profiling snapshots (refresh the flamegraph + hot path) + sliding-window rule
+  scans, until **Stop** or target-exit. Each anomaly becomes an **incident** with
+  **when · what · where (the dominant hot call path = which classes/functions) · leading
+  metric context**, streamed to an Incident Feed. Optional **continuous AI** (Settings ▸
+  AI toggle) adds a short per-incident explanation. Metrics ring-buffered (retention cap).
+  - [x] `start_attach_run(..., monitor=True)` → `_run_attach_monitor` loop; `POST /runs/{id}/stop`; incidents via `_make_incident` + sliding-window `_eval_sliding_rules`; hot-path **backfill** for incidents that fire before the first snapshot
+  - [x] `GET /runs/{id}/incidents`; incidents in `incidents.ndjson` (storage append/read/update); continuous AI = `summarize.incident_summary` gated by `config.llm.continuous_summaries`
+  - [x] AttachModal "keep monitoring" toggle; RunView **Incidents** tab + "● Monitoring — Stop" bar; `IncidentFeed`; useOpenTrace incident SSE + `stopMonitor`
+  - Verified: monitor a busy process → live incident "CPU pegged" with backfilled where `<module> → render_report`, Stop finalizes. Honest limit: on-CPU sampling can't attribute OFF-CPU causes (I/O/lock/DB waits) — flagged in the feed; eBPF off-CPU is Phase D.
+- [x] **Phase B — Universal folded ingest + Python/Ruby/JVM samplers** *(done 2026-07-04, verified with py-spy)*
+  - [x] refactor `fold_perf_script` → shared `_fold_stacks`; add `fold_collapsed` + `fold_speedscope` (perf.py)
+  - [x] sampler registry (`attach.py` `_SAMPLERS` / `profiler_plan` / `sampler_argv`): py-spy (Python), rbspy (Ruby), asprof (JVM) — used if installed, else perf; picker shows a per-runtime sampler badge + install hint
+  - [x] orchestrator: attach picks the sampler; `_run_attach_profile` runs it; `_finalize` folds by format (`_fold_profile`)
+  - Verified: attach a Python process with py-spy installed → flamegraph shows real Python frames (`burn` 100%), not CPython C frames. Tests: `test_perf.py` (fold_collapsed/speedscope) + `test_attach.py` (registry).
+  - [ ] *(deferred)* `tools.py` detection panel for the samplers; async-profiler cpu/wall/alloc/lock event selector + unit badges
+- [ ] **Phase C — .NET / PHP / Node / BEAM + Go pprof**
+  - [ ] `dotnet-trace` (speedscope, per-thread merge); `phpspy` pool fan-out; Node V8 CDP + `fold_cpuprofile`; BEAM `+JPperf`/remsh
+  - [ ] `pprof.py` profile.proto decoder (cpu/heap/lock, no root)
+- [ ] **Phase D — eBPF on-CPU + off-CPU**
+  - [ ] `ebpf` collector (libbpf-tools `profile`/`offcputime`); `GET /system/ebpf-capabilities` + wizard gating
+  - [ ] `offcpu-flamegraph.json` via `fold_collapsed(count_is_usec=True)`; Off-CPU/Wall-clock toggle
+- [ ] **Phase E — eBPF latency histograms + USDT + containers**
+  - [ ] `runqlat`/`biolatency`/syscall-latency → `latency.json` + Latency tab + 2 new rules
+  - [ ] bundled USDT bpftrace scripts (GC/query) → timeline events; container→host PID resolution
+
 ---
 
 ## 11. Resolved Decisions

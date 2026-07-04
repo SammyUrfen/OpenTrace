@@ -25,6 +25,8 @@ class LLMConfig(BaseModel):
     base_url: str | None = None
     model: str | None = None
     api_key_secret_name: str = "llm_api_key"
+    # monitor mode: auto-explain each detected incident with a short AI note.
+    continuous_summaries: bool = False
 
 
 class UIConfig(BaseModel):

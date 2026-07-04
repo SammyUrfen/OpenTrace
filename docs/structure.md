@@ -64,9 +64,11 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
 - `profile.py` — allocation profiling from ltrace `LIBCALL` events: a malloc/free
   ledger (bytes alloc/freed, peak live, outstanding/leaked blocks, unmatched
   frees), library-call hotspots, and `heap_leak`/`alloc_free_imbalance` anomalies.
-- `perf.py` — folds `perf script` output (leaf-first stacks) into a nested
-  `{name,value,children}` flame tree + self/total symbol hotspots, pruned for the
-  UI. `fold_perf_script` is pure; `build_flamegraph` shells out to `perf`.
+- `perf.py` — folds profiler output into a nested `{name,value,children}` flame
+  tree + self/total symbol hotspots, pruned for the UI. `_fold_stacks` is the
+  shared core (weighted root→leaf stacks); `fold_perf_script` (perf script),
+  `fold_collapsed` (py-spy/asprof/phpspy/bpftrace), and `fold_speedscope`
+  (rbspy/dotnet) all feed it. `build_flamegraph` shells out to `perf`.
 - `rules/engine.py` — 18 anomaly rules (file I/O, memory growth/spike, CPU/spin/
   infinite-loop, slow syscalls/file-I/O, network errors/reuse, mutex contention,
   I/O retry, read/write storms, subprocess spawning) → severity + plain-English text.
@@ -89,6 +91,17 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   `GET /info/tools` (the wizard tool-check + Settings ▸ Tracing tools).
   Run files are browsable via `GET /runs/{id}/files` + `GET /runs/{id}/file?name=`
   (text-only, size-capped, path-traversal-guarded) behind the Files tab.
+- `attach.py` — attach-to-running-PID profiling (roadmap Phase A). `detect_runtime(pid)`
+  infers the language runtime from `/proc/<pid>/maps` (+ exe fallback);
+  `list_targets()` enumerates same-uid attachable processes; backs
+  `GET /runs/attach/targets`. `POST /runs/attach {pid|port,window_s}` →
+  `orchestrator.start_attach_run`, which watches the target with psutil
+  (`descendants_only=False`) and runs the runtime's profiler for a bounded window,
+  reusing `perf.py` → `flamegraph.json` (fail-open to a psutil-only timeline).
+  Phase B: a sampler registry (`_SAMPLERS` / `profiler_plan` / `sampler_argv`)
+  picks a dedicated sampler when installed — **py-spy** (Python), **rbspy** (Ruby),
+  **asprof/async-profiler** (JVM) — for real app symbols; else perf. `_finalize`
+  folds the output by format (`_fold_profile` → `fold_collapsed`/`fold_speedscope`/perf).
 - `tests/` — pytest: parser, rules, CRUD/storage, syscall aggregation, a live
   end-to-end pipeline, and real-workload scenario tests (leak/fd-leak/exit-code).
 

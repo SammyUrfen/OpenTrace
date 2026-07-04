@@ -87,15 +87,20 @@ def _iter_stacks(text: str):
         yield s
 
 
-def fold_perf_script(text: str) -> dict:
+def _fold_stacks(weighted_stacks) -> dict:
+    """Fold an iterable of `(root->leaf frame list, weight)` into the flame tree +
+    self/total hotspots. The shared core behind every profiler format — perf
+    (weight 1/sample), collapsed (weight=count), speedscope (weight=sample weight)."""
     root: dict = {"name": "all", "value": 0, "children": {}}
     self_ct: dict[str, int] = {}
     total_ct: dict[str, int] = {}
     n_samples = 0
 
-    for stack in _iter_stacks(text):
-        n_samples += 1
-        root["value"] += 1
+    for stack, weight in weighted_stacks:
+        if not stack or weight <= 0:
+            continue
+        n_samples += weight
+        root["value"] += weight
         node = root
         for depth, sym in enumerate(stack):
             if depth >= _MAX_DEPTH:
@@ -104,14 +109,13 @@ def fold_perf_script(text: str) -> dict:
             if child is None:
                 child = {"name": sym, "value": 0, "children": {}}
                 node["children"][sym] = child
-            child["value"] += 1
+            child["value"] += weight
             node = child
-        # hotspots
+        # hotspots: total = weight anywhere in the stack; self = weight at the leaf
         for sym in set(stack):
-            total_ct[sym] = total_ct.get(sym, 0) + 1
-        if stack:
-            leaf = stack[-1]
-            self_ct[leaf] = self_ct.get(leaf, 0) + 1
+            total_ct[sym] = total_ct.get(sym, 0) + weight
+        leaf = stack[-1]
+        self_ct[leaf] = self_ct.get(leaf, 0) + weight
 
     min_value = max(1, round(n_samples * _PRUNE_FRACTION))
     tree = _to_list(root, min_value)
@@ -128,12 +132,76 @@ def fold_perf_script(text: str) -> dict:
     ]
     hotspots.sort(key=lambda r: (r["self"], r["total"]), reverse=True)
 
-    return {
-        "supported": True,
+    # A capture that parses to zero samples is "unsupported" (target idle / window
+    # too short) — same downgrade build_flamegraph applies, so every profiler format
+    # yields the friendly empty state instead of a degenerate 0-value flame bar.
+    out = {
+        "supported": n_samples > 0,
         "samples": n_samples,
         "tree": tree,
         "hotspots": hotspots[:_MAX_HOTSPOTS],
     }
+    if n_samples == 0:
+        out["reason"] = "no samples (target idle, or too short a window)."
+    return out
+
+
+def fold_perf_script(text: str) -> dict:
+    """Fold `perf script` output (leaf-first stacks) — one unit per sample."""
+    return _fold_stacks((stack, 1) for stack in _iter_stacks(text))
+
+
+def fold_collapsed(text: str, *, count_is_usec: bool = False) -> dict:
+    """Fold Brendan-Gregg collapsed/folded stacks: `root;a;b;leaf <count>` per line,
+    already root->leaf. Covers py-spy `--format raw`, async-profiler `-o collapsed`,
+    phpspy/stackcollapse, and bpftrace/`offcputime -f`. `count_is_usec` tags the unit
+    (off-CPU time) without changing the tree shape."""
+    def _stacks():
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            head, _, tail = line.rpartition(" ")
+            if not head:
+                continue
+            try:
+                count = int(tail)
+            except ValueError:
+                continue
+            frames = [f for f in head.split(";") if f]
+            if frames:
+                yield frames, count
+
+    fg = _fold_stacks(_stacks())
+    fg["unit"] = "usec" if count_is_usec else "samples"
+    return fg
+
+
+def fold_speedscope(doc: dict) -> dict:
+    """Fold a speedscope JSON (rbspy / dotnet-trace). Frames live in
+    `shared.frames`; each `sampled` profile has `samples` (frame-index lists,
+    root->leaf) + `weights`. Per-thread profiles are merged."""
+    frames = [
+        (f.get("name") or "[unknown]")
+        for f in ((doc.get("shared") or {}).get("frames") or [])
+    ]
+
+    def _stacks():
+        for prof in (doc.get("profiles") or []):
+            if prof.get("type") != "sampled":
+                continue
+            samples = prof.get("samples") or []
+            weights = prof.get("weights") or []
+            for i, sample in enumerate(samples):
+                try:
+                    weight = int(weights[i]) if i < len(weights) else 1
+                except (TypeError, ValueError):
+                    weight = 1
+                stack = [frames[idx] for idx in sample if 0 <= idx < len(frames)]
+                if stack:
+                    yield stack, weight
+
+    return _fold_stacks(_stacks())
 
 
 def _to_list(node: dict, min_value: int) -> dict:

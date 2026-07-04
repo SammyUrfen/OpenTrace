@@ -410,3 +410,62 @@ async def stream_summary(run: runs.Run, *, force: bool = False) -> AsyncIterator
             return
     if acc:
         _persist(run, "".join(acc).strip())
+
+
+# --- monitor-mode incident explanations (continuous AI) ---------------------
+
+INCIDENT_SYSTEM_PROMPT = (
+    "You are OpenTrace. A live monitor of a running process just detected a "
+    "performance anomaly. Given the anomaly and the CPU hot call path captured at "
+    "that moment, explain in 2-3 sentences WHAT likely happened and WHERE in the "
+    "code — name the function/class from the hot path, and if it points at a "
+    "specific operation (an HTTP handler, a scheduled/cron task, a cache/GC/"
+    "serialization routine) say so. If the cause is likely OFF-CPU (waiting on I/O, "
+    "a database, or a lock), note that a CPU profile can't confirm it. Be concrete "
+    "and terse — no preamble, no headers."
+)
+
+
+def _incident_context(incident: dict) -> str:
+    hot = incident.get("hot") or {}
+    stack = hot.get("stack") or []
+    funcs = hot.get("functions") or []
+    metrics = incident.get("metrics") or []
+
+    def _last(key: str):
+        vals = [m.get(key) for m in metrics if m.get(key) is not None]
+        return vals[-1] if vals else None
+
+    return "\n".join([
+        f"Anomaly: {incident.get('title')}",
+        f"Severity: {incident.get('severity')}",
+        f"CPU hot call path (root->leaf): {' -> '.join(stack[:10]) or 'n/a (no profile at this moment)'}",
+        f"Top functions by self time: {', '.join(funcs[:5]) or 'n/a'}",
+        f"At the incident: cpu={_last('cpu_pct')}% rss={_last('rss_mb')}MB fds={_last('open_fds')} threads={_last('threads')}",
+        f"Metric samples in the leading window: {len(metrics)}",
+    ])
+
+
+def incident_summary(incident: dict) -> str:
+    """A short synchronous AI explanation of a monitor incident. Called from a
+    worker thread (runs its own event loop). Returns '' on any failure."""
+    import asyncio
+
+    messages = [
+        {"role": "system", "content": INCIDENT_SYSTEM_PROMPT},
+        {"role": "user", "content": _incident_context(incident)},
+    ]
+
+    async def _collect() -> str:
+        acc: list[str] = []
+        async for ev in llm.stream_chat(messages, max_tokens=400):
+            if ev.get("type") == "content":
+                acc.append(ev["text"])
+            elif ev.get("type") == "error":
+                return ""
+        return "".join(acc).strip()
+
+    try:
+        return asyncio.run(_collect())
+    except Exception:  # noqa: BLE001
+        return ""

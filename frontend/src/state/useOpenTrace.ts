@@ -59,6 +59,19 @@ export interface LiveAlert {
   timestamp_ms: number
 }
 
+/** A monitor-mode incident: an anomaly with when / where (hot path) / context. */
+export interface Incident {
+  id: string
+  run_id: string
+  ts: number
+  rule_id: string
+  severity: string
+  title: string
+  hot: { functions: string[]; stack: string[]; samples?: number } | null
+  metrics: MetricSample[]
+  ai: string | null
+}
+
 const RING = 120 // samples kept per series for the sparklines
 
 function push(arr: number[], v: number | null): number[] {
@@ -71,6 +84,8 @@ interface Hook {
   runs: Run[]
   live: Record<string, LiveState>
   alerts: Record<string, LiveAlert[]>
+  /** monitor-mode incidents keyed by runId, newest first */
+  incidents: Record<string, Incident[]>
   liveRunId: string | null
   /** The most recently finalized run, as `{id, n}` — `n` increments per end so
    *  the same run ending twice (rare) still triggers a re-open. */
@@ -85,6 +100,7 @@ interface Hook {
   loaded: boolean
   refresh: () => Promise<void>
   deleteRun: (id: string) => Promise<void>
+  stopMonitor: (id: string) => Promise<void>
   renameRun: (id: string, displayName: string) => Promise<void>
   createSession: (displayName: string) => Promise<Project | null>
   renameSession: (id: string, displayName: string) => Promise<void>
@@ -99,6 +115,7 @@ export function useOpenTrace(backendUrl: string): Hook {
   const [runs, setRuns] = useState<Run[]>([])
   const [live, setLive] = useState<Record<string, LiveState>>({})
   const [alerts, setAlerts] = useState<Record<string, LiveAlert[]>>({})
+  const [incidents, setIncidents] = useState<Record<string, Incident[]>>({})
   const [liveRunId, setLiveRunId] = useState<string | null>(null)
   const [lastEnded, setLastEnded] = useState<{ id: string; n: number } | null>(null)
   const [connected, setConnected] = useState(false)
@@ -136,6 +153,25 @@ export function useOpenTrace(backendUrl: string): Hook {
         /* ignore; we still drop it locally */
       }
       setRuns((prev) => prev.filter((r) => r.id !== id))
+      const drop = <T,>(m: Record<string, T>) => {
+        if (!(id in m)) return m
+        const { [id]: _gone, ...rest } = m
+        return rest
+      }
+      setIncidents(drop)
+      setAlerts(drop)
+      setLive(drop)
+    },
+    [backendUrl],
+  )
+
+  const stopMonitor = useCallback(
+    async (id: string): Promise<void> => {
+      try {
+        await fetch(`${backendUrl}/runs/${id}/stop`, { method: 'POST' })
+      } catch {
+        /* ignore; the run finalizes on target exit regardless */
+      }
     },
     [backendUrl],
   )
@@ -228,6 +264,19 @@ export function useOpenTrace(backendUrl: string): Hook {
           const cur = prev[run_id] ?? []
           return { ...prev, [run_id]: [...cur, al].slice(-12) }
         })
+      } else if (type === 'incident') {
+        const inc = data as Incident
+        setIncidents((prev) => ({
+          ...prev,
+          [run_id]: [inc, ...(prev[run_id] ?? [])].slice(0, 100),
+        }))
+      } else if (type === 'incident_update' || type === 'incident_ai') {
+        const patch = data as { id: string } & Partial<Incident>
+        setIncidents((prev) => {
+          const cur = prev[run_id]
+          if (!cur) return prev
+          return { ...prev, [run_id]: cur.map((i) => (i.id === patch.id ? { ...i, ...patch } : i)) }
+        })
       } else if (type === 'run_analyzing') {
         setRuns((prev) =>
           prev.map((r) => (r.id === run_id ? { ...r, status: 'analyzing' } : r)),
@@ -240,6 +289,12 @@ export function useOpenTrace(backendUrl: string): Hook {
         // Drop the finished run's live ring buffers so `live` can't grow without
         // bound over a long session (the run's metrics are persisted server-side).
         setLive((prev) => {
+          if (!(run_id in prev)) return prev
+          const { [run_id]: _dropped, ...rest } = prev
+          return rest
+        })
+        // live alerts are superseded by the finalized anomalies/incidents; drop them
+        setAlerts((prev) => {
           if (!(run_id in prev)) return prev
           const { [run_id]: _dropped, ...rest } = prev
           return rest
@@ -277,7 +332,8 @@ export function useOpenTrace(backendUrl: string): Hook {
   }, [backendUrl, refresh, upsertRun])
 
   return {
-    projects, runs, live, alerts, liveRunId, lastEnded, connected, connectionError,
-    loaded, refresh, deleteRun, renameRun, createSession, renameSession,
+    projects, runs, live, alerts, incidents, liveRunId, lastEnded, connected,
+    connectionError, loaded, refresh, deleteRun, stopMonitor, renameRun,
+    createSession, renameSession,
   }
 }

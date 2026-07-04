@@ -16,6 +16,7 @@ import { TracingToggle } from './components/TracingToggle'
 import { SettingsPage, type SettingsSection } from './components/SettingsPage'
 import { CommandPalette, type Command } from './components/CommandPalette'
 import { SessionModal } from './components/SessionModal'
+import { AttachModal } from './components/AttachModal'
 import { RunNameBar } from './components/RunNameBar'
 import { FirstRunWizard } from './components/FirstRunWizard'
 import { useTracing } from './state/useTracing'
@@ -42,6 +43,7 @@ function App() {
 
   const [settings, setSettings] = useState<{ section: SettingsSection } | null>(null)
   const [paletteOpen, setPaletteOpen] = useState(false)
+  const [attachOpen, setAttachOpen] = useState(false)
   const [sessionModal, setSessionModal] = useState<
     { mode: 'create' } | { mode: 'rename'; id: string; name: string } | null
   >(null)
@@ -97,6 +99,7 @@ function App() {
       case 'guide': setSettings({ section: 'guide' }); break
       case 'about': setSettings({ section: 'about' }); break
       case 'command-palette': setPaletteOpen((v) => !v); break
+      case 'attach-process': setAttachOpen(true); break
       case 'toggle-tracing': setTracing(!tracing); break
       case 'toggle-sidebar': setSidebarHidden((v) => !v); break
       case 'toggle-terminal': setTerminalHidden((v) => !v); break
@@ -128,6 +131,8 @@ function App() {
     ] },
     { label: 'Run', items: [
       { label: tracing ? 'Turn Tracing Off' : 'Turn Tracing On', action: 'toggle-tracing', accel: 'Ctrl+Shift+T' },
+      { separator: true },
+      { label: 'Attach to running process…', action: 'attach-process' },
     ] },
     { label: 'Help', items: [
       { label: 'How to Use OpenTrace', action: 'guide' },
@@ -233,6 +238,7 @@ function App() {
   // Command-palette entries: actions + every session + every run.
   const commands: Command[] = [
     { id: 'a-new-session', group: 'Action', label: 'New session', run: () => setSessionModal({ mode: 'create' }) },
+    { id: 'a-attach', group: 'Action', label: 'Attach to running process', run: () => setAttachOpen(true) },
     { id: 'a-settings', group: 'Action', label: 'Open settings', run: () => setSettings({ section: 'general' }) },
     { id: 'a-tracing', group: 'Action', label: tracing ? 'Turn tracing OFF' : 'Turn tracing ON', run: () => setTracing(!tracing) },
     { id: 'a-theme', group: 'Action', label: 'Toggle theme', run: toggleTheme },
@@ -299,6 +305,8 @@ function App() {
           activeView={activeView}
           backendUrl={BACKEND_URL}
           onOpenSettings={() => setSettings({ section: 'ai' })}
+          incidents={ot.incidents[focusedRun.id] ?? []}
+          onStopMonitor={() => void ot.stopMonitor(focusedRun.id)}
           topSlot={
             namePrompt && nameBarRunId === focusedRun.id ? (
               <RunNameBar
@@ -373,6 +381,14 @@ function App() {
           onToggleCollector={toggleCollector}
           namePrompt={namePrompt}
           onToggleNamePrompt={toggleNamePrompt}
+        />
+      )}
+      {attachOpen && (
+        <AttachModal
+          backendUrl={BACKEND_URL}
+          sessionId={activeSessionId}
+          onClose={() => setAttachOpen(false)}
+          onAttached={() => void ot.refresh()}
         />
       )}
       {runRename && (

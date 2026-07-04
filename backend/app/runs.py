@@ -260,6 +260,14 @@ class EndReport(BaseModel):
     ended_at: int | None = None
 
 
+class AttachRequest(BaseModel):
+    pid: int | None = None
+    port: int | None = None
+    window_s: int = 20
+    session_id: str | None = None
+    monitor: bool = False
+
+
 @router.post("/start", response_model=RunStartResponse)
 def http_start(data: RunCreate) -> RunStartResponse:
     from .trace import orchestrator
@@ -274,6 +282,68 @@ def http_start(data: RunCreate) -> RunStartResponse:
         run_dir=run.run_dir,
         collectors=run.collector_config,
     )
+
+
+# --- attach-to-running-PID profiling (Phase A) ------------------------------
+# Declared before the `/{rid}` routes so "attach" is never captured as a run id.
+
+
+@router.get("/attach/targets")
+def http_attach_targets() -> list[dict]:
+    """Attachable candidate processes (same-uid, real procs) with detected runtime."""
+    from . import attach
+
+    return attach.list_targets()
+
+
+def _pid_for_port(port: int) -> int | None:
+    import psutil
+
+    try:
+        for c in psutil.net_connections(kind="inet"):
+            if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == port and c.pid:
+                return c.pid
+    except (psutil.Error, OSError):
+        return None
+    return None
+
+
+@router.post("/attach", response_model=Run)
+def http_attach(data: AttachRequest) -> Run:
+    """Attach to a running process (by pid or listening port) and profile it for a
+    bounded window. Returns the created run immediately (status running); the
+    flamegraph lands when the window elapses."""
+    from .trace import orchestrator
+
+    pid = data.pid
+    if pid is None and data.port is not None:
+        pid = _pid_for_port(data.port)
+        if pid is None:
+            raise HTTPException(status_code=404, detail=f"no listening process on port {data.port}")
+    if pid is None:
+        raise HTTPException(status_code=400, detail="pid or port required")
+    try:
+        return orchestrator.start_attach_run(
+            pid, window_s=data.window_s, session_id=data.session_id, monitor=data.monitor,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/{rid}/stop", response_model=Run)
+def http_stop(rid: str) -> Run:
+    """Ask a live monitor run to wrap up + finalize."""
+    from .trace import orchestrator
+
+    orchestrator.stop_monitor(rid)
+    return _require(rid)
+
+
+@router.get("/{rid}/incidents")
+def http_incidents(rid: str) -> list[dict]:
+    """Monitor-mode incidents (anomaly + when + hot path + leading metrics)."""
+    run = _require(rid)
+    return storage.read_incidents(run.run_dir)
 
 
 @router.post("/{rid}/pid")
