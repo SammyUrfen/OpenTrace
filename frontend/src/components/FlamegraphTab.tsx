@@ -19,14 +19,24 @@ interface Flamegraph {
   tree: FlameNode | null
   hotspots: PerfHotspot[]
   reason?: string
+  unit?: string
 }
 
 interface Props {
   backendUrl: string
   runId: string
+  /** run captured an eBPF off-CPU profile → offer the On-CPU / Off-CPU toggle */
+  offCpu?: boolean
 }
 
 const ROW_H = 20
+
+/** µs → a readable duration ("5.72 s" / "820 ms" / "500 µs"). */
+function fmtDuration(us: number): string {
+  if (us >= 1e6) return `${(us / 1e6).toFixed(2)} s`
+  if (us >= 1000) return `${Math.round(us / 1000).toLocaleString()} ms`
+  return `${us.toLocaleString()} µs`
+}
 
 interface Rect {
   key: string
@@ -63,9 +73,28 @@ function frameColor(name: string, depth: number): string {
   return `hsl(${hue} 68% ${light}%)`
 }
 
-export function FlamegraphTab({ backendUrl, runId }: Props) {
-  const { data, loading } = useRunObject<Flamegraph>(backendUrl, runId, 'flamegraph')
+export function FlamegraphTab({ backendUrl, runId, offCpu }: Props) {
+  const [mode, setMode] = useState<'on' | 'off'>('on')
+  const resource = mode === 'off' ? 'offcpu-flamegraph' : 'flamegraph'
+  const { data, loading } = useRunObject<Flamegraph>(backendUrl, runId, resource)
   const [focus, setFocus] = useState<FlameNode | null>(null)
+
+  const isOff = mode === 'off'
+  // Format from the LOADED data's unit, not the toggle — while a switch is in
+  // flight `data` is still the previous resource, so keying off `isOff` would
+  // briefly render on-CPU counts through fmtDuration (and mislabel cells).
+  const dataIsOff = data?.unit === 'usec'
+  const cellUnit = dataIsOff ? 'µs' : 'samples'  // browser tooltip — not CSS-uppercased
+  const toggle = offCpu ? (
+    <div className="flame-toggle" role="tablist">
+      <button type="button" role="tab" aria-selected={!isOff}
+        className={`flame-toggle__btn${!isOff ? ' flame-toggle__btn--on' : ''}`}
+        onClick={() => { setMode('on'); setFocus(null) }}>On-CPU</button>
+      <button type="button" role="tab" aria-selected={isOff}
+        className={`flame-toggle__btn${isOff ? ' flame-toggle__btn--on' : ''}`}
+        onClick={() => { setMode('off'); setFocus(null) }}>Off-CPU</button>
+    </div>
+  ) : null
 
   const root = data?.tree ?? null
   const view = focus ?? root
@@ -74,10 +103,11 @@ export function FlamegraphTab({ backendUrl, runId }: Props) {
     [view],
   )
 
-  if (loading && !data) {
+  if ((loading && !data) || (loading && isOff !== dataIsOff)) {
     return (
       <div className="overview" data-testid="flamegraph-tab">
-        <div className="overview__muted">Loading flamegraph…</div>
+        {toggle}
+        <div className="overview__muted">Loading {isOff ? 'off-CPU' : ''} flamegraph…</div>
       </div>
     )
   }
@@ -85,10 +115,16 @@ export function FlamegraphTab({ backendUrl, runId }: Props) {
   if (!data?.supported || !root) {
     return (
       <div className="overview" data-testid="flamegraph-tab">
-        <h3 className="overview__h">CPU flamegraph</h3>
+        <h3 className="overview__h">{isOff ? 'Off-CPU flamegraph' : 'CPU flamegraph'}{toggle}</h3>
         <div className="overview__muted">
-          No CPU profile for this run{data?.reason ? ` (${data.reason})` : ''}. Enable the{' '}
-          <b>Hardware perf</b> collector (Live Monitor) and re-run a CPU-bound program.
+          {isOff ? (
+            <>No off-CPU profile{data?.reason ? ` — ${data.reason}` : ''}. Off-CPU
+              needs the <b>eBPF</b> option at attach time and elevated privileges;
+              when present it shows where the process is <b>blocked</b> (I/O, locks, waits).</>
+          ) : (
+            <>No CPU profile for this run{data?.reason ? ` (${data.reason})` : ''}. Enable the{' '}
+              <b>Hardware perf</b> collector (Live Monitor) and re-run a CPU-bound program.</>
+          )}
         </div>
       </div>
     )
@@ -100,10 +136,13 @@ export function FlamegraphTab({ backendUrl, runId }: Props) {
   return (
     <div className="overview" data-testid="flamegraph-tab">
       <h3 className="overview__h">
-        CPU flamegraph — {data.samples.toLocaleString()} samples
+        {dataIsOff
+          ? `Off-CPU flamegraph — ${fmtDuration(data.samples)} blocked`
+          : `CPU flamegraph — ${data.samples.toLocaleString()} samples`}
         <span className="overview__muted" style={{ marginLeft: 10, fontWeight: 400 }}>
-          click a frame to zoom
+          {isOff ? 'time spent blocked, not on CPU' : 'click a frame to zoom'}
         </span>
+        {toggle}
         {focus && (
           <button type="button" className="ai-btn tl-reset" onClick={() => setFocus(null)}>
             reset zoom
@@ -125,7 +164,7 @@ export function FlamegraphTab({ backendUrl, runId }: Props) {
                 height: ROW_H - 1,
                 background: frameColor(r.node.name, r.depth),
               }}
-              title={`${r.node.name} — ${r.node.value.toLocaleString()} samples (${pct}%)`}
+              title={`${r.node.name} — ${r.node.value.toLocaleString()} ${cellUnit} (${pct}%)`}
               onClick={() => setFocus(r.node)}
             >
               <span className="flame-cell__label">{r.node.name}</span>

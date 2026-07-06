@@ -64,6 +64,10 @@ export interface Incident {
   id: string
   run_id: string
   ts: number
+  first_ts?: number
+  last_ts?: number
+  /** occurrences collapsed into this one entry (repeats of the same rule) */
+  count?: number
   rule_id: string
   severity: string
   title: string

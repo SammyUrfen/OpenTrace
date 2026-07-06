@@ -98,10 +98,12 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   `orchestrator.start_attach_run`, which watches the target with psutil
   (`descendants_only=False`) and runs the runtime's profiler for a bounded window,
   reusing `perf.py` → `flamegraph.json` (fail-open to a psutil-only timeline).
-  Phase B: a sampler registry (`_SAMPLERS` / `profiler_plan` / `sampler_argv`)
-  picks a dedicated sampler when installed — **py-spy** (Python), **rbspy** (Ruby),
-  **asprof/async-profiler** (JVM) — for real app symbols; else perf. `_finalize`
-  folds the output by format (`_fold_profile` → `fold_collapsed`/`fold_speedscope`/perf).
+  Phase B/C: a sampler registry (`_SAMPLERS` / `profiler_plan` / `sampler_argv`)
+  picks a dedicated profiler when available — **py-spy** (Python), **rbspy** (Ruby),
+  **asprof** (JVM), **dotnet-trace** (.NET), **phpspy** (PHP), and the **V8 inspector**
+  (`node_cdp.py`, SIGUSR1→CDP, no install) for **Node/Deno/Bun** — for real app
+  symbols; else perf. `_finalize`/`_capture_profile` fold by format (`_fold_profile`
+  → `fold_collapsed`/`fold_speedscope`/`fold_cpuprofile`/`fold_phpspy`/perf).
 - `tests/` — pytest: parser, rules, CRUD/storage, syscall aggregation, a live
   end-to-end pipeline, and real-workload scenario tests (leak/fd-leak/exit-code).
 

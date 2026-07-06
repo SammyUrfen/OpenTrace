@@ -2,6 +2,13 @@ import { useEffect, useMemo, useState } from 'react'
 import type { Incident } from '../state/useOpenTrace'
 import { formatTime, severityColor } from '../state/format'
 
+function ago(ms: number): string {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
+  if (s < 60) return `${s}s ago`
+  if (s < 3600) return `${Math.round(s / 60)}m ago`
+  return `${Math.round(s / 3600)}h ago`
+}
+
 interface Props {
   backendUrl: string
   runId: string
@@ -34,19 +41,23 @@ export function IncidentFeed({ backendUrl, runId, live }: Props) {
     return () => { cancelled = true }
   }, [backendUrl, runId])
 
-  // Merge live + stored by id, live wins (has the latest hot/ai patches).
+  // Merge live + stored by id, live wins (has the latest count/hot/ai patches).
+  // Newest activity first (a collapsed incident bubbles up as it recurs).
   const incidents = useMemo(() => {
     const byId = new Map<string, Incident>()
     for (const i of stored) byId.set(i.id, i)
     for (const i of live) byId.set(i.id, i)
-    return [...byId.values()].sort((a, b) => b.ts - a.ts)
+    return [...byId.values()].sort((a, b) => (b.last_ts ?? b.ts) - (a.last_ts ?? a.ts))
   }, [live, stored])
 
   if (incidents.length === 0) {
     return (
       <div className="incidents incidents--empty">
-        No incidents yet. As the process runs, anomalies (CPU spikes, memory growth,
-        fd leaks) will appear here with when · where · context.
+        <b>No incidents — looking healthy.</b> While monitoring, only anomalies (CPU
+        pegged, memory growth, fd leaks) surface here, collapsed per condition with
+        when · where · context. A mostly-idle server that only works when called will
+        stay quiet — that's the expected, healthy result. Deeper "what happened on
+        request X" attribution needs event-level tracing (a later phase).
       </div>
     )
   }
@@ -64,7 +75,10 @@ export function IncidentFeed({ backendUrl, runId, live }: Props) {
             <div className="incident__head">
               <span className="incident__dot" style={{ background: severityColor(inc.severity, 'completed') }} />
               <span className="incident__title">{inc.title}</span>
-              <span className="incident__time">{formatTime(inc.ts)}</span>
+              {(inc.count ?? 1) > 1 && <span className="incident__count">×{inc.count}</span>}
+              <span className="incident__time">
+                {(inc.count ?? 1) > 1 && inc.last_ts ? `last ${ago(inc.last_ts)}` : formatTime(inc.ts)}
+              </span>
             </div>
             <div className="incident__where">
               <span className="incident__where-label">where</span>

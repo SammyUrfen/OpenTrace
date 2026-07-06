@@ -4,6 +4,14 @@ const path = require('path')
 const http = require('http')
 const pty = require('./pty')
 
+// Testing: expose the renderer over the Chrome DevTools Protocol so a CDP client
+// (e.g. the Playwright MCP: `npx @playwright/mcp --cdp-endpoint http://127.0.0.1:PORT`)
+// can drive the live window. Off unless OPENTRACE_REMOTE_DEBUG=<port> is set.
+if (process.env.OPENTRACE_REMOTE_DEBUG) {
+  app.commandLine.appendSwitch('remote-debugging-port', String(process.env.OPENTRACE_REMOTE_DEBUG))
+  app.commandLine.appendSwitch('remote-allow-origins', '*')
+}
+
 const BACKEND_PORT = 8000
 // Point at an already-running backend (dev/testing) instead of spawning one.
 const EXTERNAL_BACKEND = process.env.OPENTRACE_BACKEND_URL || null

@@ -242,6 +242,95 @@ def perf_anomalies(flamegraph: dict) -> list[Anomaly]:
     return []
 
 
+def fold_cpuprofile(doc: dict) -> dict:
+    """Fold a V8 `.cpuprofile` (Node / Deno / Bun via the inspector, or dotnet's
+    speedscope alt). `nodes[]` carry id + callFrame + children (child ids only);
+    `samples[]` are leaf node ids; `timeDeltas[]` are per-sample µs. We build a
+    child→parent map, walk each sample leaf→root, reverse to root→leaf, weighted by
+    the time delta."""
+    nodes = doc.get("nodes") or []
+    by_id = {n.get("id"): n for n in nodes}
+    parent: dict = {}
+    for n in nodes:
+        for c in (n.get("children") or []):
+            parent[c] = n.get("id")
+
+    def _name(n: dict) -> str:
+        cf = n.get("callFrame") or {}
+        fn = cf.get("functionName") or ""
+        if not fn:
+            return "(anonymous)"
+        url = cf.get("url") or ""
+        if url and not url.startswith("node:") and "/" in url:
+            return f"{fn} ({url.rsplit('/', 1)[-1]}:{cf.get('lineNumber', 0)})"
+        return fn
+
+    def _stack(leaf_id):
+        out: list[str] = []
+        nid = leaf_id
+        seen = set()
+        while nid is not None and nid not in seen:
+            seen.add(nid)
+            n = by_id.get(nid)
+            if n is None:
+                break
+            out.append(_name(n))
+            nid = parent.get(nid)
+        out.reverse()
+        return out
+
+    samples = doc.get("samples") or []
+    deltas = doc.get("timeDeltas") or []
+
+    def _stacks():
+        for i, leaf in enumerate(samples):
+            # V8's timeDeltas[j] is the gap ENDING at sample j, so sample i ran
+            # during [t_i, t_{i+1}] → weight it by the NEXT delta (canonical).
+            weight = deltas[i + 1] if i + 1 < len(deltas) else 1
+            weight = weight if isinstance(weight, int) and weight > 0 else 1
+            frames = _stack(leaf)
+            # drop the V8 synthetic roots so the flame starts at real frames
+            frames = [f for f in frames if f not in ("(root)", "(program)")]
+            if frames:
+                yield frames, weight
+
+    fg = _fold_stacks(_stacks())
+    fg["unit"] = "usec"
+    return fg
+
+
+def fold_phpspy(text: str) -> dict:
+    """Fold phpspy's default trace output: per-sample blocks (blank-line separated),
+    each line `<depth> <function> <file>:<line>` with depth 0 = leaf. We reverse each
+    block to root->leaf and count identical stacks."""
+    def _stacks():
+        frames: list[str] = []
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                if frames:
+                    yield list(reversed(frames)), 1  # leaf-first block -> root->leaf
+                    frames = []
+                continue
+            if s.startswith("#") or s.startswith("//"):
+                continue
+            toks = s.split()
+            if len(toks) >= 2 and toks[0].isdigit():
+                frames.append(toks[1])
+            elif len(toks) >= 1:
+                frames.append(toks[0])
+        if frames:
+            yield list(reversed(frames)), 1
+
+    return fold_collapsed_from_stacks(_stacks())
+
+
+def fold_collapsed_from_stacks(weighted_stacks) -> dict:
+    """Public thin wrapper so callers with already-tokenized (root->leaf, weight)
+    stacks reuse the shared folder (perf-format samples counting semantics)."""
+    return _fold_stacks(weighted_stacks)
+
+
 def build_flamegraph(perf_data: str | Path) -> dict:
     """Run `perf script` over a capture and fold it. Fail-soft: returns an
     `unsupported` stub if perf is missing or the capture is unreadable."""

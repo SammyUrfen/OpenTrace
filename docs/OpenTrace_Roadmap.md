@@ -795,15 +795,23 @@ up. The unlock is **attach-to-a-running-PID** + **runtime auto-detection** + a
   - [x] orchestrator: attach picks the sampler; `_run_attach_profile` runs it; `_finalize` folds by format (`_fold_profile`)
   - Verified: attach a Python process with py-spy installed → flamegraph shows real Python frames (`burn` 100%), not CPython C frames. Tests: `test_perf.py` (fold_collapsed/speedscope) + `test_attach.py` (registry).
   - [ ] *(deferred)* `tools.py` detection panel for the samplers; async-profiler cpu/wall/alloc/lock event selector + unit badges
-- [ ] **Phase C — .NET / PHP / Node / BEAM + Go pprof**
-  - [ ] `dotnet-trace` (speedscope, per-thread merge); `phpspy` pool fan-out; Node V8 CDP + `fold_cpuprofile`; BEAM `+JPperf`/remsh
-  - [ ] `pprof.py` profile.proto decoder (cpu/heap/lock, no root)
-- [ ] **Phase D — eBPF on-CPU + off-CPU**
-  - [ ] `ebpf` collector (libbpf-tools `profile`/`offcputime`); `GET /system/ebpf-capabilities` + wizard gating
-  - [ ] `offcpu-flamegraph.json` via `fold_collapsed(count_is_usec=True)`; Off-CPU/Wall-clock toggle
-- [ ] **Phase E — eBPF latency histograms + USDT + containers**
-  - [ ] `runqlat`/`biolatency`/syscall-latency → `latency.json` + Latency tab + 2 new rules
-  - [ ] bundled USDT bpftrace scripts (GC/query) → timeline events; container→host PID resolution
+- [~] **Phase C — Node / .NET / PHP samplers** *(2026-07-06 — Node verified; .NET/PHP best-effort)*
+  - [x] **Node/Deno/Bun** via the V8 inspector (`app/node_cdp.py`: SIGUSR1 → CDP-over-WebSocket, hand-rolled, no dep) + `perf.fold_cpuprofile` — **verified e2e** (live node → real JS `tick` 98.7%, 6M samples). No install needed.
+  - [x] **.NET** (`dotnet-trace`→speedscope→`fold_speedscope`) + **PHP** (`phpspy`→`fold_phpspy`) registry entries + argv + parsers (unit-tested) — **UNVERIFIED** (tools not installed; need a real .NET/PHP target to confirm attach + the dotnet sibling-filename)
+  - [ ] Go `pprof.py` — DEFERRED (Go CPU already covered by the native `perf` path; pprof adds only heap/lock/goroutine + needs the app to expose `net/http/pprof`)
+  - [ ] BEAM/Erlang — DEFERRED (perf needs the `+JPperf` boot flag; no-restart path is a remote-shell/`eflambe`, high effort + can destabilize a prod node)
+- [x] **Phase D — eBPF off-CPU + latency** *(2026-07-06 — fail-open + UI verified; real capture needs root)*
+  - [x] `app/ebpf.py`: `capabilities()` probe (BTF · unpriv_bpf · caps · sudo · bcc-tools) + `GET /runs/attach/ebpf-capabilities`; AttachModal eBPF checkbox capability-gated
+  - [x] Off-CPU flamegraph — `offcputime -f -p PID N` → `fold_collapsed(count_is_usec=True)` → `offcpu-flamegraph.json`; On-CPU/Off-CPU toggle in FlamegraphTab (off-CPU total via fmtDuration)
+  - [x] Latency histograms — `runqlat -m -p PID` + `biolatency -m` → `parse_log2_hist` → `latency.json` + **Latency tab** (run-queue + block-I/O bar charts) + 2 rules (`high_runqueue_latency`, `slow_block_io`)
+  - [x] Fail-open + capability-gated everywhere (unprivileged → clear "needs root/CAP_BPF" reasons; on-CPU + timeline unaffected). Runs concurrent with the on-CPU window in single + monitor.
+  - NOTE: `biolatency` is system-wide (no per-PID filter — block I/O is host-wide); real eBPF data unverified here (host `unprivileged_bpf_disabled=2`, backend runs unprivileged)
+- [~] **Phase E — containers + per-PID I/O + USDT GC + bpftrace engine** *(2026-07-06)*
+  - [x] **Container awareness** — `app/container.py` (`parse_cgroup`/`container_info`/`nspid_map`/`resolve_host_pid`): label docker/podman/containerd/cri-o/k8s targets (cgroup v1+v2), resolve container-local→host PID via `/proc` NSpid. Wired into attach targets + `POST /runs/attach/resolve` + a 🐳 badge. **Verified** (pure /proc, no root; 6 tests).
+  - [x] **Per-PID block I/O** — `biosnoop` filtered by PID → real percentiles (`parse_biosnoop`) → `latency.json.block_io_pid` + a Latency card. *(bcc; works on ≤6.x — fails the kernel-7.0 fs.h compile wall → fail-open.)*
+  - [x] **USDT GC** — `usdt_probes(pid)` detection (readelf `.note.stapsdt`, no root — **verified** on system python3.14: gc__start/gc__done) + `pythongc` capture (`parse_ugc`) → `gc-timeline.json` + a Latency card. *(bcc pythongc fails the 7.0 wall → fail-open; needs a --enable-dtrace python.)*
+  - [x] **bpftrace engine** — on kernels where bcc's headers won't compile (7.0), the run-queue + block-I/O histograms use bpftrace/CO-RE (`BT_RUNQLAT`/`BT_BIOLAT`, `parse_bpftrace_hist`, unit-normalized rules). **Implemented, UNVERIFIED** (needs `/usr/bin/bpftrace` in sudoers). offcputime (off-CPU flame) stays bcc + is **verified real**.
+  - [ ] bpftrace USDT-GC + per-PID biosnoop equivalents (so GC/per-PID I/O work on very new kernels too); DB-query USDT → timeline; container→host cross-namespace attach when backend is privileged.
 
 ---
 

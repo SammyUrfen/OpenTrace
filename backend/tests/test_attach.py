@@ -146,3 +146,23 @@ def test_incident_storage_roundtrip(tmp_path):
 def test_read_incidents_missing_is_empty(tmp_path):
     from app import storage
     assert storage.read_incidents(tmp_path) == []
+
+
+def test_node_uses_cdp_but_deno_bun_do_not():
+    # Node handles SIGUSR1→inspector; Deno/Bun do NOT (SIGUSR1 would kill them),
+    # so they must not get the CDP path.
+    assert attach.profiler_plan("node") == {
+        "tool": "node-cdp", "format": "cpuprofile", "out_file": "node.cpuprofile"}
+    assert "no install needed" in attach.profiler_hint("node")
+    assert attach.profiler_plan("deno") is None
+    assert attach.profiler_plan("bun") is None
+
+
+def test_dotnet_php_registry(monkeypatch):
+    monkeypatch.setattr(attach.shutil, "which", lambda t: "/usr/bin/" + t)
+    assert attach.profiler_plan("dotnet")["format"] == "speedscope"
+    assert attach.profiler_plan("php")["format"] == "phpspy"
+    dn = attach.sampler_argv("dotnet-trace", 7, 90, "/o/dotnet.speedscope.json")
+    assert dn[0] == "dotnet-trace" and "/o/dotnet.nettrace" in dn and "00:00:01:30" in dn  # dd:hh:mm:ss
+    php = attach.sampler_argv("phpspy", 7, 30, "/o/php.raw")
+    assert php[0] == "phpspy" and "-p" in php and "/o/php.raw" in php

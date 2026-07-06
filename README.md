@@ -1,97 +1,157 @@
 # OpenTrace
 
-Local-first observability tool for Linux. An Electron desktop app that collects
-low-level system signals (syscalls, memory, I/O, network) and presents
-correlated findings visually, so developers can understand complex software
-behavior without juggling `strace`, `lsof`, `htop`, and friends by hand.
+**A local-first observability tool for Linux — an intelligent magnifying glass for
+running software.** OpenTrace watches what a program actually *does* at the system
+level — syscalls, memory, file & network I/O, CPU and off-CPU time, GC, scheduler and
+disk latency — and turns those low-level signals into **correlated, explained findings**,
+so you understand behaviour instead of squinting at raw tool output.
 
-## Current State
+It runs as a self-contained Electron desktop app. Everything stays on your machine.
 
-Phase 0 (Foundation) is complete and the **Phase 1 data pipeline works end to end**:
-type a normal command in the embedded terminal with OpenTrace ON and it is
-transparently traced, measured, analyzed, and saved as a *run*.
+---
 
-What works now:
+## Why
 
-- **Three-level data model** — `sessions` (projects) → `terminals` → `runs`, with
-  per-run `events`, `metrics`, `anomalies`, `artifacts`, and `run_views`
-  (`backend/app/db.py`). On-disk runs hold `meta.json`, `events.ndjson.zst`,
-  `metrics.ndjson.zst`, `strace.log`, and `artifacts/`.
-- **Transparent command interception (zsh)** — a line-editor `accept-line` widget
-  rewrites a simple foreground command to `otrace -- <cmd>` *before* the shell
-  parses it, so the wrapper runs as a native foreground job (exit codes, Ctrl-C,
-  job control, quoting all behave normally). Builtins, pipelines, TUIs, and bare
-  REPLs run untraced. Bash gets an explicit `ot <cmd>` helper.
-- **Trace engine** — `strace -f -T -ttt` parsed into normalized events; a `psutil`
-  poller samples the process tree every 250 ms (CPU, RSS/VMS, FDs, threads, I/O);
-  syscall-rate is derived; a rule engine flags anomalies (FD growth, memory
-  growth, slow syscalls, repeated opens, failed opens, CPU-bound loops).
-- **Live + persisted UI** — the sidebar groups runs under projects with severity
-  dots; a Live Monitor streams CPU/Memory/FD sparklines over SSE during a run.
-- **Analytics tabs** — clicking a run opens it as a tab (and a finished run
-  auto-opens) with **Overview** (snapshot + ranked anomaly cards + streaming AI
-  summary), **Memory** & **CPU** (time-series with leak banners + 50/90% threshold
-  lines), **I/O** (per-file reads/writes/bytes + ⊘ fd-leak markers), **Network**
-  (connections + timeouts), **Syscalls** (sortable P50/P95/P99 table), and **Logs**
-  (program stdout/stderr with stderr + anomaly-window highlighting).
-- **AI summaries** — a configurable OpenAI-compatible LLM (default Google
-  Gemini/Gemma) writes a sectioned analysis that streams into the Overview;
-  configured in Settings, API key kept in the OS-local secret store.
-- **Diff view** — right-click a run → "Compare with…" opens an A ↔ B tab:
-  Overview Δ (a ∆ table with better/worse colouring), Memory/CPU Δ (overlaid
-  charts), Syscalls Δ, Anomalies Δ (only-A / both / only-B), and a streaming
-  **AI diff summary** ("what changed, better or worse?").
-- **18 detection rules + live alerts** — covering file I/O, memory, CPU/spin
-  loops, network, locks, and more; real-time alerts (FD>200, memory spikes,
-  pegged CPU) stream into the Live Monitor *during* a run.
-- **Profiling (Phase 6)** — a collector-mode choice between **strace** and
-  **ltrace** (both ptrace, mutually exclusive), plus an independent **perf**
-  sampler. ltrace runs get a **Profiling tab** — a malloc/free ledger (bytes
-  allocated/freed, peak live, leaked blocks) + a library-call hotspot table, and
-  a `heap_leak` anomaly. perf runs get a **Flamegraph tab** — an inline,
-  click-to-zoom flame chart + self/total CPU symbol hotspots. (`test-files/alloc_demo.c`
-  is a ready leak demo for ltrace mode.)
-- **Sessions, collectors, theme, resizable panels** — create/switch sessions
-  (projects); pick which collectors run (Resource metrics / Syscall trace /
-  Library calls / Hardware perf); an **espresso (dark) / warm-paper (light)** theme
-  with a toggle (the terminal re-themes too); drag-to-resize sidebar & bottom
-  panel; a first-run wizard. Paired `test-files/workload_*_v1/v2.py` fixtures
-  demo the diff viewer on a small code change.
-- SQLite and `config.json` are created on first run under `~/.opentrace`.
+Understanding a misbehaving process on Linux normally means juggling a fistful of tools
+by hand — `strace`, `ltrace`, `lsof`, `htop`, `perf`, `py-spy`, `bpftrace` — each with
+its own invocation, output format, and mental model, none of which talk to each other.
+You end up correlating timestamps across five terminals to answer a simple question:
+*what did this thing do, and why was it slow / leaking / stuck?*
 
-What is still incomplete:
+OpenTrace collapses that into one place. It captures the signals, **correlates them on a
+shared timeline**, runs a **rule engine** that flags anomalies in plain English (fd
+leaks, memory growth, CPU-bound loops, slow syscalls, lock contention, slow disk…), and
+can hand the whole picture to an LLM for a readable summary. You get *what happened,
+when, where in the code, and a plausible why* — not just numbers.
 
-- A packaged `opentrace` CLI binary (the `app.cli` launcher works in dev).
-- **Phase 7** — `.deb`/`.AppImage` packaging, libsecret keyring, session export.
-- Smaller gaps: bash transparent auto-interception (zsh is the fully-wrapped
-  path); ltrace mode only sees calls from the main binary's PLT, so it suits
-  native (C/C++/Rust) programs rather than interpreted ones like Python.
+## When to use it
 
-## Repository layout
+- A service is **leaking memory or file descriptors** and you want to see the growth
+  and where it comes from.
+- An endpoint or job is **slow** and you need to know whether it's burning CPU, or
+  *blocked* on I/O, a lock, the DB, or the scheduler (on-CPU sampling can't tell you —
+  OpenTrace's off-CPU profiling can).
+- You want to **profile a program you already have running** (a dev server, a
+  Dockerized backend) **without restarting it**, and see real function names.
+- You changed something and want a **before/after diff** — "better or worse?".
+- You want a low-friction, GUI-driven alternative to memorising a dozen CLI tools.
 
-```
-backend/    FastAPI server and tracing engine (Python 3.11+)
-frontend/   React 19 + Vite + TypeScript renderer
-electron/   Electron main process (the desktop shell)
-docs/       Internal notes and phase checklists
-prompts/    LLM prompt templates (used from Phase 4 onward)
-```
+## What it does
 
-See `docs/layout.md` for details and `docs/phase0-checklist.md` for current
-build progress.
+OpenTrace has three ways to get signal, feeding one analysis + visualization pipeline.
 
-## Run
+**1. Trace commands you run.** Flip tracing **ON** and use the embedded terminal
+normally. A shell hook transparently rewrites a foreground command so it runs under
+`strace` (or `ltrace`) plus an optional `perf` sampler and a `psutil` resource poller —
+exit codes, Ctrl-C, and quoting all behave as usual. The finished command is saved as a
+**run** you can open, analyze, and compare.
 
-Use the root launcher from an activated `opentrace-dev` conda environment:
+**2. Attach to a running process.** Point OpenTrace at any live PID (or a port) and it
+profiles it for a bounded window — picking the best available **per-runtime profiler**
+for real application symbols:
+
+| Runtime | Profiler | Status |
+|---|---|---|
+| Python | `py-spy` → real Python frames | verified |
+| Node / Deno / Bun | built-in **V8 inspector** (SIGUSR1 → CDP, no install, no restart) | verified |
+| JVM | `async-profiler` (`asprof`) | supported |
+| Ruby | `rbspy` | supported |
+| .NET / PHP | `dotnet-trace` / `phpspy` | implemented |
+| native / Go | `perf` (real symbols via frame pointers) | verified |
+
+All of them fold into one flamegraph view. Missing a profiler? It **fails open** to a
+psutil resource timeline with a clear reason — a run is never lost.
+
+**3. Live monitor + deep kernel signals (eBPF).** Attach in **monitor** mode to keep a
+running service under continuous watch: repeating profiling snapshots + sliding-window
+rule scans produce an **Incident feed** — each anomaly captured with *when · what · where
+(hot call path) · leading metrics · optional AI note*. Opt into **eBPF** for what
+sampling fundamentally can't see:
+
+- **Off-CPU flamegraph** — where the process is *blocked* (I/O, locks, DB, sleeps).
+- **Latency histograms** — scheduler run-queue latency (CPU oversubscription) and
+  block-I/O latency (slow/contended disk).
+- **GC pauses** — Python stop-the-world times via USDT.
+
+eBPF is capability-gated and fail-open; on very new kernels it uses **bpftrace/CO-RE**
+where the bundled bcc tools won't compile. Container-aware: it labels Docker/Podman/
+containerd/k8s targets and resolves in-container PIDs to host PIDs, all from `/proc`.
+
+**Making it readable.** Every run opens as a tab with analytics views — **Overview**
+(snapshot + ranked anomaly cards + streaming **AI summary**), **Timeline / Memory / CPU**
+(with leak banners + p50/p90 lines), **I/O**, **Network**, **Processes**, **Syscalls**
+(sortable P50/P95/P99), **Logs**, **Flamegraph** (on-CPU / off-CPU), **Latency**, and
+**Incidents**. Right-click two runs → **Compare** for an A↔B diff with a streaming
+"what changed, better or worse?" summary. Runs are grouped into **sessions** (projects).
+
+## How it works
+
+Three processes: an **Electron** shell (window + terminal + shell hooks), a **FastAPI**
+backend (the tracing engine + storage + analysis), and a **React 19 / Vite** renderer.
+They talk over REST + Server-Sent Events, so the UI is live during a run. The data model
+is `sessions → terminals → runs`, with every analytical table hanging off a `run_id`;
+runs keep a complete compressed record on disk plus a curated slice in SQLite.
+
+A guiding principle is **fail-open**: a missing tool, denied privilege, or absent LLM key
+degrades gracefully with an explanation, never a broken run.
+
+See **`docs/structure.md`** for the module-by-module map, **`docs/OpenTrace_Roadmap.md`**
+for the product spec + phase status, and **`CLAUDE.md`** for a contributor orientation.
+
+## Quick start
+
+OpenTrace targets **Linux**. The backend runs in a conda env (`opentrace-dev`, Python
+3.11+); the desktop shell is Electron + Node.
 
 ```bash
+# backend deps (once), in the conda env
+conda create -n opentrace-dev python=3.11 && conda activate opentrace-dev
+pip install -e backend
+
+# build the renderer + electron deps, then launch
 conda activate opentrace-dev
 ./start.sh
 ```
 
-To force the dev frontend instead of the built `dist/` assets, set `OPENTRACE_DEV=1` before launching Electron.
+`start.sh` builds the frontend if needed and launches the app; data lives under
+`~/.opentrace/` (override with `OPENTRACE_HOME`). Set `OPENTRACE_DEV=1` to use the Vite
+dev server instead of the built assets.
 
-## Notes
+**Optional tools unlock deeper profiling** (all detected + fail-open if absent):
+`py-spy` / `rbspy` / `asprof` / `dotnet-trace` / `phpspy` for per-runtime attach, and
+`bcc-tools` + `bpftrace` (with `CAP_BPF`+`CAP_PERFMON`, root, or passwordless sudo) for
+eBPF off-CPU + latency. AI summaries need an OpenAI-compatible key (default Google
+Gemini/Gemma), stored in the OS-local secret store — never in config or git.
 
-- Backend config and data live under `~/.opentrace/` unless `OPENTRACE_HOME` is set.
-- Electron uses `OPENTRACE_PYTHON` to start the backend; the launcher sets it automatically from the active environment.
+## Repository layout
+
+```
+backend/    FastAPI server + tracing engine (Python 3.11+; strace/ltrace/perf,
+            attach + sampler registry, eBPF, rules, aggregation, LLM)
+frontend/   React 19 + Vite + TypeScript renderer (analytics tabs, diff, live monitor)
+electron/   Electron main process + node-pty terminal + transparent shell hooks
+e2e/        Playwright-Electron scenario harness (drives the real app; 165 scenarios)
+docs/       Architecture (structure.md), roadmap, profiling research, testing playbook
+test-files/ Demo workloads (leak/fd-leak/cpu; paired v1/v2 fixtures for the diff view)
+```
+
+## Testing
+
+```bash
+cd backend && python -m pytest -q          # backend unit + pipeline tests
+cd frontend && npm test && npm run build   # renderer tests + typecheck/build
+cd e2e && npm install && ./run-all.sh      # end-to-end UI scenarios (drives the app)
+```
+
+The `e2e/` harness launches the real Electron app in full isolation (its own backend +
+throwaway data) and can run ~165 scenarios in parallel; see `e2e/README.md`.
+
+## Status
+
+The full loop works end-to-end: trace or attach → analytics + flamegraphs → AI summary →
+diff, plus live monitoring with incidents and eBPF off-CPU/latency/GC. Not yet done:
+packaged installers (`.deb`/`.AppImage`) — for now run from source via `start.sh`. See
+the roadmap for what's next.
+
+Linux only. Some features need external tools and (for eBPF) elevated privileges, all
+optional and fail-open.

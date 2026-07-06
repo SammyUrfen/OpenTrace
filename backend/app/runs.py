@@ -266,6 +266,7 @@ class AttachRequest(BaseModel):
     window_s: int = 20
     session_id: str | None = None
     monitor: bool = False
+    ebpf: bool = False
 
 
 @router.post("/start", response_model=RunStartResponse)
@@ -324,10 +325,46 @@ def http_attach(data: AttachRequest) -> Run:
         raise HTTPException(status_code=400, detail="pid or port required")
     try:
         return orchestrator.start_attach_run(
-            pid, window_s=data.window_s, session_id=data.session_id, monitor=data.monitor,
+            pid, window_s=data.window_s, session_id=data.session_id,
+            monitor=data.monitor, ebpf=data.ebpf,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/attach/ebpf-capabilities")
+def http_ebpf_capabilities() -> dict:
+    """What eBPF off-CPU + latency profiling this host can do (for the picker gate)."""
+    from . import ebpf
+
+    return ebpf.capabilities()
+
+
+class ResolveRequest(BaseModel):
+    container_pid: int | None = None
+    container_id: str | None = None
+    host_pid: int | None = None
+
+
+@router.post("/attach/resolve")
+def http_attach_resolve(data: ResolveRequest) -> dict:
+    """Resolve a containerized target to an attachable HOST pid. Given a host_pid,
+    return its (container-enriched) target info; given a container-local pid (+
+    optional container id), scan /proc NSpid to find the host pid. Phase E."""
+    from . import attach, container
+
+    pid = data.host_pid
+    if pid is None:
+        if data.container_pid is None:
+            raise HTTPException(status_code=400, detail="provide host_pid or container_pid")
+        pid = container.resolve_host_pid(data.container_pid, data.container_id)
+        if pid is None:
+            raise HTTPException(status_code=404,
+                                detail=f"no host process maps to container pid {data.container_pid}")
+    try:
+        return attach.target_info(pid)
+    except Exception:  # noqa: BLE001 — psutil.NoSuchProcess etc.
+        raise HTTPException(status_code=404, detail=f"no process with pid {pid}")
 
 
 @router.post("/{rid}/stop", response_model=Run)
@@ -548,6 +585,39 @@ def http_flamegraph(rid: str) -> dict:
     if p.exists():
         return json.loads(p.read_text())
     return {"supported": False, "samples": 0, "tree": None, "hotspots": []}
+
+
+@router.get("/{rid}/offcpu-flamegraph")
+def http_offcpu_flamegraph(rid: str) -> dict:
+    """eBPF off-CPU flame tree (where the process was BLOCKED, µs) — Phase D."""
+    run = _require(rid)
+    p = Path(run.run_dir) / "offcpu-flamegraph.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"supported": False, "samples": 0, "tree": None, "hotspots": [], "unit": "usec",
+            "reason": "off-CPU profiling not enabled for this run (attach with eBPF)."}
+
+
+@router.get("/{rid}/latency")
+def http_latency(rid: str) -> dict:
+    """eBPF latency histograms (run-queue + host-wide + per-PID block-I/O) — Phase D/E."""
+    run = _require(rid)
+    p = Path(run.run_dir) / "latency.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"available": False, "reason": "latency profiling not enabled (attach with eBPF).",
+            "runqueue": None, "block_io": None, "block_io_pid": None}
+
+
+@router.get("/{rid}/gc-timeline")
+def http_gc_timeline(rid: str) -> dict:
+    """USDT GC pause timeline (Python, --enable-dtrace build) — Phase E."""
+    run = _require(rid)
+    p = Path(run.run_dir) / "gc-timeline.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"available": False, "events": [],
+            "reason": "GC timeline not captured (attach with eBPF on a USDT-enabled python)."}
 
 
 @router.get("/{rid}/ai-summary")

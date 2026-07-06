@@ -24,6 +24,8 @@ from pathlib import Path
 
 import psutil
 
+from . import container
+
 log = logging.getLogger(__name__)
 
 # Ordered runtime probes: (runtime id, substrings to look for in /proc/pid/maps).
@@ -83,12 +85,22 @@ _SAMPLERS: dict[str, tuple[str, str, str, str]] = {
     "python": ("py-spy", "collapsed", "pyspy.folded", "pip install py-spy"),
     "ruby": ("rbspy", "speedscope", "rbspy.speedscope.json", "cargo install rbspy (or download a release)"),
     "jvm": ("asprof", "collapsed", "asprof.collapsed", "install async-profiler (asprof)"),
+    "dotnet": ("dotnet-trace", "speedscope", "dotnet.speedscope.json", "dotnet tool install -g dotnet-trace"),
+    "php": ("phpspy", "phpspy", "phpspy.raw", "install phpspy (github.com/adsr/phpspy)"),
 }
+
+# Profiled via the V8 inspector (SIGUSR1 → CDP) — no external tool, the running
+# process IS the profiler. ONLY Node installs a SIGUSR1→inspector handler; Deno/Bun
+# do NOT, so sending SIGUSR1 would TERMINATE them — they're intentionally excluded
+# (they'd need to be launched with --inspect; not an attach-any story).
+_CDP_RUNTIMES = {"node"}
 
 
 def profiler_plan(runtime: str) -> dict | None:
-    """The best AVAILABLE dedicated sampler for `runtime`, else None (→ use perf).
+    """The best AVAILABLE dedicated profiler for `runtime`, else None (→ use perf).
     Returns `{tool, format, out_file}`."""
+    if runtime in _CDP_RUNTIMES:
+        return {"tool": "node-cdp", "format": "cpuprofile", "out_file": "node.cpuprofile"}
     entry = _SAMPLERS.get(runtime)
     if not entry:
         return None
@@ -110,6 +122,19 @@ def sampler_argv(tool: str, pid: int, window_s: int, out_path: str) -> list[str]
                 "--file", out_path, "--duration", n]
     if tool == "asprof":  # async-profiler
         return ["asprof", "-d", n, "-e", "cpu", "-o", "collapsed", "-f", out_path, p]
+    if tool == "dotnet-trace":
+        # -o writes the .nettrace; --format speedscope also emits <base>.speedscope.json
+        # (that sibling is what we fold — see out_file). Duration is dd:hh:mm:ss.
+        nettrace = out_path[:-len(".speedscope.json")] + ".nettrace" \
+            if out_path.endswith(".speedscope.json") else out_path + ".nettrace"
+        secs = int(window_s)
+        dur = f"00:00:{secs // 60:02d}:{secs % 60:02d}"
+        return ["dotnet-trace", "collect", "-p", p, "--duration", dur,
+                "--format", "speedscope", "-o", nettrace]
+    if tool == "phpspy":
+        # -H = sample rate (Hz); streams traces to -o. No portable duration flag
+        # across versions → the orchestrator's window loop SIGINTs it at window_s.
+        return ["phpspy", "-H", "99", "-p", p, "-o", out_path]
     raise ValueError(f"unknown sampler: {tool}")
 
 
@@ -154,6 +179,8 @@ def detect_runtime(pid: int) -> str:
 
 def profiler_hint(runtime: str) -> str:
     """A one-line note for the picker about what a capture will show."""
+    if runtime in _CDP_RUNTIMES:
+        return "V8 inspector (SIGUSR1 → CDP) → real JS symbols, no install needed."
     plan = profiler_plan(runtime)
     if plan:
         return f"{plan['tool']} → real {RUNTIME_LABELS.get(runtime, runtime)} symbols."
@@ -197,6 +224,7 @@ def target_info(pid: int) -> dict:
         "hint": profiler_hint(runtime),
         "sampler": plan["tool"] if plan else None,
         "rss_mb": round(rss / (1024 * 1024), 1),
+        "container": container.container_info(pid),
     }
 
 
@@ -238,5 +266,6 @@ def list_targets(limit: int = 60) -> list[dict]:
             "hint": profiler_hint(runtime),
             "sampler": plan["tool"] if plan else None,
             "rss_mb": round(rss / (1024 * 1024), 1),
+            "container": container.container_info(pid),
         })
     return out

@@ -15,6 +15,7 @@ import { TimelineTab } from './TimelineTab'
 import { ProcessesTab } from './ProcessesTab'
 import { ProfilingTab } from './ProfilingTab'
 import { FlamegraphTab } from './FlamegraphTab'
+import { LatencyTab } from './LatencyTab'
 import { FilesTab } from './FilesTab'
 
 /** The set of analytics views available for a run. Extended as tabs land. */
@@ -60,6 +61,7 @@ export function runViews(run: Run | null): ViewDef[] {
   if (hasStrace) views.push({ key: 'logs', label: 'Logs' })
   if (c.ltrace) views.push({ key: 'profiling', label: 'Profiling' })
   if (c.perf) views.push({ key: 'flamegraph', label: 'Flamegraph' })
+  if (c.ebpf) views.push({ key: 'latency', label: 'Latency' })
   views.push({ key: 'files', label: 'Files' })
   return views
 }
@@ -120,7 +122,10 @@ export function RunView({
         <LogsTab backendUrl={backendUrl} runId={run.id} anomalies={detail.anomalies} />
       )}
       {activeView === 'profiling' && <ProfilingTab backendUrl={backendUrl} runId={run.id} />}
-      {activeView === 'flamegraph' && <FlamegraphTab backendUrl={backendUrl} runId={run.id} />}
+      {activeView === 'flamegraph' && (
+        <FlamegraphTab backendUrl={backendUrl} runId={run.id} offCpu={!!run.collector_config?.ebpf} />
+      )}
+      {activeView === 'latency' && <LatencyTab backendUrl={backendUrl} runId={run.id} />}
       {activeView === 'files' && <FilesTab backendUrl={backendUrl} runId={run.id} />}
       <TabGuide view={activeView} />
     </div>

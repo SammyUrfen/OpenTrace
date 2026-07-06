@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { Project, Run } from '../state/useOpenTrace'
 import {
   formatDuration,
@@ -93,9 +93,20 @@ export function RunSidebar({
 
   const openMenu = (e: React.MouseEvent, run: Run) => {
     e.preventDefault()
-    setMenu({ run, x: e.clientX, y: e.clientY, mode: 'main' })
+    // clamp into the viewport so the menu (esp. the last item, Delete) can't render
+    // off the bottom/right edge when right-clicking a row near an edge
+    const MW = 190, MH = 176
+    const x = Math.max(8, Math.min(e.clientX, window.innerWidth - MW))
+    const y = Math.max(8, Math.min(e.clientY, window.innerHeight - MH))
+    setMenu({ run, x, y, mode: 'main' })
   }
   const closeMenu = () => setMenu(null)
+  useEffect(() => {
+    if (!menu) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeMenu() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [menu])
   const doDelete = (run: Run) => {
     closeMenu()
     if (

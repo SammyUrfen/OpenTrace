@@ -155,7 +155,10 @@ function App() {
   const focusedTab = tabs.find((t) => tabKey(t) === activeKey) ?? null
   const focusedRunId = focusedTab?.kind === 'run' ? focusedTab.runId : null
   const focusedRun = focusedRunId ? ot.runs.find((r) => r.id === focusedRunId) ?? null : null
-  const detail = useRunDetail(BACKEND_URL, focusedRunId, focusedRun?.status)
+  // Gate on focusedRun (not focusedRunId): when a run is deleted it leaves ot.runs
+  // a render before its tab is pruned — fetching the stale id would 404 (3 console
+  // errors). Passing the id only while the run still exists avoids the doomed fetch.
+  const detail = useRunDetail(BACKEND_URL, focusedRun?.id ?? null, focusedRun?.status)
   const focusedLive = focusedRunId ? ot.live[focusedRunId] ?? null : null
 
   // Finished runs auto-open as the focused tab (roadmap behaviour), and — unless

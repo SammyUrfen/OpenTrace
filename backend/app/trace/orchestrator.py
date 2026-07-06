@@ -46,7 +46,7 @@ from ..streaming import broker
 from ..util import new_id, now_ms
 from . import metrics as metrics_mod
 from . import ltrace_parser, strace_parser
-from .events import EXIT, LIBCALL, SIGNAL, MetricSample, TraceEvent
+from .events import EXIT, LIBCALL, SIGNAL, Anomaly, MetricSample, TraceEvent
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +69,9 @@ class _RunContext:
     # monitor mode: keep the run live, capture rolling snapshots, emit incidents.
     monitor: bool = False
     latest_hot: dict | None = None   # {functions, stack} from the current snapshot
-    incident_cooldown: dict = field(default_factory=dict)  # rule_id -> last-fired ts (dedup)
+    # collapse repeats: rule_id -> {id, count, last_pub}. One feed row per rule,
+    # with an occurrence count, instead of a new row every re-fire.
+    rule_incidents: dict = field(default_factory=dict)
     pending_hot: list = field(default_factory=list)  # incident dicts awaiting a hot path
     # live-alert state
     last_rss: float | None = None
@@ -182,6 +184,7 @@ def _proc_cwd(pid: int) -> str:
 
 def start_attach_run(
     pid: int, window_s: int = 20, session_id: str | None = None, monitor: bool = False,
+    ebpf: bool = False,
 ) -> runs.Run:
     """Attach to an already-running process and profile it.
 
@@ -218,7 +221,7 @@ def start_attach_run(
         session_id=session_id,
         collector_config={
             "psutil": True, "perf": True, "attach": True, "monitor": monitor,
-            "runtime": info["runtime"], "profiler": profiler,
+            "ebpf": ebpf, "runtime": info["runtime"], "profiler": profiler,
             "profile_format": prof_fmt, "profile_file": prof_file,
         },
         label=f"{'monitor' if monitor else 'attach'}: {info['name']} (pid {pid})",
@@ -268,8 +271,14 @@ def _perf_fail_reason(stderr: str, profiler: str = "perf") -> str:
 
 def _fold_profile(fmt: str, raw: Path) -> dict | None:
     """Fold a profiler's raw output into a flamegraph dict, dispatching on format
-    (perf.data / collapsed / speedscope). Returns None when the capture is
-    missing/empty/unparseable so the run keeps just its psutil timeline."""
+    (perf.data / collapsed / speedscope / cpuprofile / phpspy). Returns None when
+    the capture is missing/empty/unparseable so the run keeps its psutil timeline."""
+    # dotnet-trace writes the speedscope alongside the .nettrace; be robust to the
+    # exact filename by falling back to the newest *.speedscope.json in the dir.
+    if fmt == "speedscope" and (not raw.exists() or raw.stat().st_size == 0):
+        cands = sorted(raw.parent.glob("*.speedscope.json"), key=lambda p: p.stat().st_mtime)
+        if cands:
+            raw = cands[-1]
     if not raw.exists() or raw.stat().st_size == 0:
         return None
     try:
@@ -277,6 +286,10 @@ def _fold_profile(fmt: str, raw: Path) -> dict | None:
             return perf_mod.fold_collapsed(raw.read_text(errors="replace"))
         if fmt == "speedscope":
             return perf_mod.fold_speedscope(json.loads(raw.read_text()))
+        if fmt == "cpuprofile":
+            return perf_mod.fold_cpuprofile(json.loads(raw.read_text()))
+        if fmt == "phpspy":
+            return perf_mod.fold_phpspy(raw.read_text(errors="replace"))
         return perf_mod.build_flamegraph(raw)  # perf.data
     except Exception:  # noqa: BLE001
         log.exception("folding profile %s (format=%s) failed", raw, fmt)
@@ -293,6 +306,13 @@ def _capture_profile(run: runs.Run, pid: int, window_s: int, stop: threading.Eve
     collectors = run.collector_config or {}
     profiler = collectors.get("profiler", "perf")
     out_path = Path(run.run_dir) / collectors.get("profile_file", "perf.data")
+
+    # Node/Deno/Bun profile via the V8 inspector (CDP over WebSocket), not a Popen'd
+    # CLI sampler — a different capture model, so it gets its own branch.
+    if profiler == "node-cdp":
+        from .. import node_cdp
+        return node_cdp.capture(pid, window_s, str(out_path), stop=stop)
+
     if profiler == "perf":
         cmd = ["perf", "record", "-p", str(pid), "-g", "-F", str(_PERF_HZ),
                "-o", str(out_path), "--", "sleep", str(window_s)]
@@ -402,6 +422,140 @@ def _ensure_flamegraph_reason(run_dir: Path, reason: str | None) -> None:
             log.debug("could not write flamegraph reason", exc_info=True)
 
 
+def _start_ebpf(run: runs.Run, pid: int, window_s: int, stop: threading.Event) -> threading.Thread | None:
+    """Spawn the eBPF off-CPU + latency capture concurrently with the on-CPU
+    profiler (both cover the same window). None unless the run opted into eBPF."""
+    if not (run.collector_config or {}).get("ebpf"):
+        return None
+    t = threading.Thread(target=_capture_ebpf, args=(run, pid, window_s, stop), daemon=True)
+    t.start()
+    return t
+
+
+def _capture_ebpf(run: runs.Run, pid: int, window_s: int, stop: threading.Event) -> None:
+    """Off-CPU flamegraph (offcputime) + run-queue/block-I/O latency histograms
+    (runqlat/biolatency), for the window. The three tools run CONCURRENTLY (they
+    each cover the same window; sequential would triple the wall-clock and overrun
+    the caller's join). Reuses fold_collapsed for the off-CPU flame. Fail-open: a
+    denied/missing tool just writes a reason stub. `stop` cuts every tool short."""
+    from .. import ebpf as ebpf_mod
+
+    caps = ebpf_mod.capabilities()
+    use_sudo = caps.get("use_sudo", False)
+    run_dir = Path(run.run_dir)
+    n = str(max(2, int(window_s)))
+    tmo = window_s + 30
+
+    results: dict = {}
+    # bpftrace (CO-RE) for the histograms where available — bcc's runqlat/biolatency
+    # won't compile on very new kernels; offcputime (folded stacks) stays on bcc.
+    use_bt = ebpf_mod.bpftrace_available()
+
+    def _run_bcc(key: str, name: str, args: list[str], kwargs: dict | None = None) -> None:
+        results[key] = ebpf_mod.run_tool(name, args, use_sudo=use_sudo, timeout=tmo,
+                                         stop=stop, **(kwargs or {}))
+
+    def _run_bt(key: str, script: str) -> None:
+        results[key] = ebpf_mod.run_bpftrace(script, timeout=tmo, stop=stop)
+
+    threads: list[threading.Thread] = []
+
+    def _spawn(fn, *a):
+        t = threading.Thread(target=fn, args=a, daemon=True)
+        t.start()
+        threads.append(t)
+
+    # USDT GC (Python only, and only if the interpreter exposes gc__start) — gate
+    # cheaply (readelf, no root) before spending a capture slot.
+    runtime = (run.collector_config or {}).get("runtime")
+    gc_gated = caps["available"] and runtime == "python" and "gc__start" in ebpf_mod.usdt_probes(pid)
+    gc_lib = ebpf_mod.libpython_path(pid) if gc_gated else None
+
+    _spawn(_run_bcc, "off", "offcputime", ["-f", "-p", str(pid), n], {})
+    _spawn(_run_bcc, "bsnoop", "biosnoop", [], {"duration": window_s, "line_buffered": True})
+    if use_bt:
+        # ONE combined bpftrace (run-queue + block-I/O + optional GC) — avoids
+        # multiple concurrent CO-RE compiles wedging each other. Run WITHOUT -p
+        # (GC is scoped by an in-script /pid==PID/ filter; -p would break the
+        # system-wide sched/block tracepoints).
+        combined = ebpf_mod.build_combined_bt(pid, n, gc_lib if gc_gated else None)
+        _spawn(_run_bt, "bt", combined)
+    else:
+        _spawn(_run_bcc, "rq", "runqlat", ["-m", "-p", str(pid), n, "1"], {})
+        _spawn(_run_bcc, "bio", "biolatency", ["-m", n, "1"], {})
+        if gc_gated:
+            _spawn(_run_bcc, "gc", "pythongc", ["-m", str(pid)],
+                   {"duration": window_s, "line_buffered": True})
+
+    for t in threads:
+        t.join(timeout=tmo + 5)
+
+    ok, out, reason = results.get("off", (False, "", "off-CPU capture didn't run."))
+    if ok and out.strip():
+        fg = perf_mod.fold_collapsed(out, count_is_usec=True)
+    else:
+        fg = {"supported": False, "samples": 0, "tree": None, "hotspots": [],
+              "unit": "usec", "reason": reason or caps.get("reason") or "no off-CPU samples."}
+    storage.write_json(run_dir / "offcpu-flamegraph.json", fg)
+    storage.record_artifact(run.id, "offcpu-flamegraph", run_dir / "offcpu-flamegraph.json")
+
+    bs_ok, bs_out, bs_reason = results.get("bsnoop", (False, "", "biosnoop didn't run."))
+    if use_bt:
+        bt_ok, bt_out, bt_reason = results.get("bt", (False, "", "bpftrace didn't run."))
+        if bt_ok:
+            runqueue = ebpf_mod.parse_bpftrace_hist(ebpf_mod.extract_bt_map(bt_out, "runq_us"), "usecs")
+            block_io = ebpf_mod.parse_bpftrace_hist(ebpf_mod.extract_bt_map(bt_out, "bio_ms"), "msecs")
+        else:
+            runqueue = block_io = {"error": bt_reason}
+    else:
+        rq_ok, rq_out, rq_reason = results.get("rq", (False, "", "run-queue capture didn't run."))
+        bio_ok, bio_out, bio_reason = results.get("bio", (False, "", "block-I/O capture didn't run."))
+        runqueue = ebpf_mod.parse_log2_hist(rq_out) if rq_ok else {"error": rq_reason}
+        block_io = ebpf_mod.parse_log2_hist(bio_out) if bio_ok else {"error": bio_reason}
+    latency = {
+        "available": caps["available"],
+        "reason": caps["reason"],
+        "engine": "bpftrace" if use_bt else "bcc",
+        "runqueue": runqueue,
+        "block_io": block_io,
+        "block_io_pid": ebpf_mod.parse_biosnoop(bs_out, {pid}) if bs_ok else {"error": bs_reason},
+    }
+    storage.write_json(run_dir / "latency.json", latency)
+    storage.record_artifact(run.id, "latency", run_dir / "latency.json")
+
+    # USDT GC timeline (Python only) — gc-timeline.json artifact
+    if gc_gated:
+        if use_bt:  # GC events are inline in the combined bpftrace output
+            bt_ok, bt_out, bt_reason = results.get("bt", (False, "", "GC capture didn't run."))
+            gc = ({"available": True, "reason": None, "events": ebpf_mod.parse_bpftrace_gc(bt_out)}
+                  if bt_ok else {"available": False, "reason": bt_reason, "events": []})
+        else:
+            gc_ok, gc_out, gc_reason = results.get("gc", (False, "", "GC capture didn't run."))
+            gc = ({"available": True, "reason": None, "events": ebpf_mod.parse_ugc(gc_out)}
+                  if gc_ok else {"available": False, "reason": gc_reason, "events": []})
+    elif runtime == "python":
+        gc = {"available": False, "events": [], "reason": (
+            "no USDT probes on this interpreter — conda/statically-linked python and "
+            "Node don't ship them; use a --enable-dtrace python build."
+            if caps["available"] else caps["reason"])}
+    else:
+        gc = {"available": False, "events": [], "reason": "GC tracing is Python-only."}
+    storage.write_json(run_dir / "gc-timeline.json", gc)
+    storage.record_artifact(run.id, "gc-timeline", run_dir / "gc-timeline.json")
+
+    # Monitor: surface latency findings as LIVE incidents too, so the Incidents feed
+    # matches the Overview (the A.1 guarantee) — otherwise they'd only appear at
+    # finalize. Collapse-by-rule dedups repeats across snapshots.
+    lat_anoms = ebpf_mod.latency_anomalies(latency)
+    if lat_anoms:
+        with _lock:
+            ctx = _active.get(run.id)
+        if ctx is not None and ctx.monitor:
+            ts = ctx.samples[-1].timestamp_ms if ctx.samples else time.time() * 1000
+            for a in lat_anoms:
+                _make_incident(ctx, a.rule_id, a.severity, a.title, ts)
+
+
 def _run_attach_profile(run_id: str, pid: int, window_s: int) -> None:
     """Single-shot attach: one profiling window, then finalize (sole finalizer)."""
     run = runs.get(run_id)
@@ -410,7 +564,10 @@ def _run_attach_profile(run_id: str, pid: int, window_s: int) -> None:
     with _lock:
         ctx = _active.get(run_id)
     stop = ctx.stop_event if ctx else threading.Event()
+    ebpf_t = _start_ebpf(run, pid, window_s, stop)
     ok, reason = _capture_profile(run, pid, window_s, stop)
+    if ebpf_t is not None:
+        ebpf_t.join(timeout=window_s + 40)
     end_run(run_id, exit_code=0 if ok else None, exit_signal=None, ended_at=None)
     _ensure_flamegraph_reason(Path(run.run_dir), reason)
 
@@ -429,7 +586,10 @@ def _run_attach_monitor(run_id: str, pid: int, window_s: int) -> None:
     stop = ctx.stop_event
     reason = None
     while not stop.is_set() and psutil.pid_exists(pid):
+        ebpf_t = _start_ebpf(run, pid, window_s, stop)  # concurrent off-CPU + latency
         ok, reason = _capture_profile(run, pid, window_s, stop)
+        if ebpf_t is not None:
+            ebpf_t.join(timeout=window_s + 40)
         if ok:
             _refresh_flamegraph(run)
         _eval_sliding_rules(ctx)
@@ -442,38 +602,58 @@ def _run_attach_monitor(run_id: str, pid: int, window_s: int) -> None:
 _INCIDENT_WINDOW_MS = 30_000   # leading metric context stored per incident
 _SLIDING_N = 360               # trailing samples (~90s at 250ms) for rule scans
 _MAX_LIVE_SAMPLES = 2400       # ring-buffer cap on in-memory samples (~10min)
-_INCIDENT_COOLDOWN_MS = 20_000  # per-rule dedup: re-fire only after this quiet gap
+_INCIDENT_UPDATE_MS = 10_000   # throttle re-publish of a collapsed incident's count
 
 
 def _make_incident(ctx: _RunContext, rule_id: str, severity: str, title: str, ts: float) -> None:
-    """Record + stream an incident: anomaly + when + where (hot path) + leading
-    metric context. Monitor runs only. De-duped per rule by a cooldown (so a fast-
-    growing metric can't spam an incident every sample, yet a recovered-then-
-    recurring condition still re-fires)."""
+    """Record + stream an incident (monitor runs only). Repeats of the SAME rule
+    COLLAPSE into one feed entry that accrues an occurrence `count` + `last_ts`
+    (re-published at most every _INCIDENT_UPDATE_MS), instead of a new row per
+    re-fire — so a request-driven server that spikes on every request shows one
+    'CPU pegged ×N' row, not hundreds."""
     if not ctx.monitor:
         return
-    with _lock:  # cooldown check + snapshot shared state atomically
-        last = ctx.incident_cooldown.get(rule_id)
-        if last is not None and ts - last < _INCIDENT_COOLDOWN_MS:
-            return
-        ctx.incident_cooldown[rule_id] = ts
+    with _lock:  # decide new-vs-collapse + snapshot shared state atomically
         hot = ctx.latest_hot
         samples = list(ctx.samples)
+        rec = ctx.rule_incidents.get(rule_id)
+        if rec is None:
+            inc_id = new_id()
+            ctx.rule_incidents[rule_id] = {"id": inc_id, "count": 1, "last_pub": ts}
+            is_new = True
+        else:
+            rec["count"] += 1
+            if ts - rec["last_pub"] < _INCIDENT_UPDATE_MS:
+                return  # counted in-memory; throttle disk + SSE churn
+            rec["last_pub"] = ts
+            inc_id, count, is_new = rec["id"], rec["count"], False
     metrics = [s.to_ndjson() for s in samples if abs(s.timestamp_ms - ts) <= _INCIDENT_WINDOW_MS]
-    incident = {
-        "id": new_id(), "run_id": ctx.run.id, "ts": ts, "rule_id": rule_id,
-        "severity": severity, "title": title, "hot": hot, "metrics": metrics, "ai": None,
-    }
-    if hot is None:  # no profile yet — queue for the "where" backfill on the next snapshot
-        with _lock:
-            ctx.pending_hot.append(incident)
-    try:
-        storage.append_incident(ctx.run.run_dir, incident)
-    except Exception:  # noqa: BLE001
-        log.debug("append_incident failed for %s", ctx.run.id, exc_info=True)
-    broker.publish(ctx.run.id, "incident", incident)
-    if hot is not None:  # AI now if we know the "where"; else after the backfill
-        _maybe_incident_ai(ctx.run, incident)
+
+    if is_new:
+        incident = {
+            "id": inc_id, "run_id": ctx.run.id, "ts": ts, "first_ts": ts, "last_ts": ts,
+            "count": 1, "rule_id": rule_id, "severity": severity, "title": title,
+            "hot": hot, "metrics": metrics, "ai": None,
+        }
+        if hot is None:  # queue for the "where" backfill on the next snapshot
+            with _lock:
+                ctx.pending_hot.append(incident)
+        try:
+            storage.append_incident(ctx.run.run_dir, incident)
+        except Exception:  # noqa: BLE001
+            log.debug("append_incident failed for %s", ctx.run.id, exc_info=True)
+        broker.publish(ctx.run.id, "incident", incident)
+        if hot is not None:
+            _maybe_incident_ai(ctx.run, incident)
+    else:
+        patch: dict = {"count": count, "last_ts": ts, "metrics": metrics}
+        if hot is not None:
+            patch["hot"] = hot
+        try:
+            storage.update_incident(ctx.run.run_dir, inc_id, **patch)
+        except Exception:  # noqa: BLE001
+            log.debug("update_incident failed for %s", ctx.run.id, exc_info=True)
+        broker.publish(ctx.run.id, "incident_update", {"id": inc_id, **patch})
 
 
 def _maybe_incident_ai(run: runs.Run, incident: dict) -> None:
@@ -515,6 +695,36 @@ def _incident_ai_worker(run_id: str, run_dir: str, incident: dict) -> None:
     except Exception:  # noqa: BLE001
         log.debug("persist incident AI failed for %s", run_id, exc_info=True)
     broker.publish(run_id, "incident_ai", {"id": incident["id"], "ai": text})
+
+
+_SEV_RANK = {"low": 1, "medium": 2, "high": 3}
+
+
+def _incidents_to_anomalies(incidents: list[dict]) -> list[Anomaly]:
+    """Collapse a monitor run's incidents into its anomaly record (one per rule,
+    highest severity, with the occurrence count + where), so the Overview 'Top
+    Findings' match the Incidents feed exactly."""
+    by_rule: dict[str, dict] = {}
+    for inc in incidents:
+        rid = inc.get("rule_id", "incident")
+        cur = by_rule.get(rid)
+        if cur is None or _SEV_RANK.get(inc.get("severity"), 0) >= _SEV_RANK.get(cur.get("severity"), 0):
+            by_rule[rid] = inc
+    out: list[Anomaly] = []
+    for rid, inc in by_rule.items():
+        stack = (inc.get("hot") or {}).get("stack") or []
+        where = " → ".join(stack[-4:]) if stack else "off-CPU (not attributable to a CPU hot path)"
+        count = inc.get("count", 1)
+        sev = inc.get("severity", "medium")
+        out.append(Anomaly(
+            rule_id=rid,
+            severity=sev,
+            severity_score=0.4 + 0.1 * _SEV_RANK.get(sev, 1),
+            title=inc.get("title", "incident") + (f" (×{count})" if count > 1 else ""),
+            description=(f"Live monitor incident{f', seen {count}×' if count > 1 else ''}. "
+                        f"Where: {where}."),
+        ))
+    return out
 
 
 def _eval_sliding_rules(ctx: _RunContext) -> None:
@@ -703,14 +913,20 @@ def _finalize(
             m["syscall_rate"] = rate_by_ts[m["timestamp_ms"]]
     storage.write_ndjson_zst(run_dir / "metrics.ndjson.zst", iter(metrics_rows))
 
-    # Detect anomalies (on syscalls/signals/exits only).
-    rctx = RuleContext(
-        events=syscall_events,
-        metrics=metrics_rows,
-        duration_ms=run.duration_ms,
-        cpu_cores=metrics_mod.cpu_count(),
-    )
-    anomalies = run_rules(rctx)
+    # Detect anomalies. For a MONITOR run the findings ARE its live incidents —
+    # a whole-session rule pass over a long-lived process is misleading (baseline
+    # drift flags spurious "growth"), and it would diverge from the Incidents tab.
+    monitor = collectors.get("monitor", False)
+    if monitor:
+        anomalies = _incidents_to_anomalies(storage.read_incidents(run_dir))
+    else:
+        rctx = RuleContext(
+            events=syscall_events,
+            metrics=metrics_rows,
+            duration_ms=run.duration_ms,
+            cpu_cores=metrics_mod.cpu_count(),
+        )
+        anomalies = run_rules(rctx)
 
     # Phase-6 profiling artifacts (only for the collectors that ran).
     if use_ltrace and events:
@@ -731,7 +947,21 @@ def _finalize(
             storage.write_json(run_dir / "flamegraph.json", flamegraph)
             storage.record_artifact(run.id, "flamegraph", run_dir / "flamegraph.json")
             storage.record_artifact(run.id, "perf-data" if fmt == "perf" else "profile", raw)
-            anomalies.extend(perf_mod.perf_anomalies(flamegraph))
+            if not monitor:  # monitor findings come from incidents (above)
+                anomalies.extend(perf_mod.perf_anomalies(flamegraph))
+
+    # eBPF latency findings (run-queue / block-I/O tails). For MONITOR runs these
+    # are already emitted as live incidents (→ picked up by _incidents_to_anomalies
+    # above), so adding them here too would duplicate them and put a finding in
+    # Overview that isn't in the feed. Only single-shot runs need this pass.
+    if collectors.get("ebpf", False) and not monitor:
+        lat_path = run_dir / "latency.json"
+        if lat_path.exists():
+            from .. import ebpf as ebpf_mod
+            try:
+                anomalies.extend(ebpf_mod.latency_anomalies(json.loads(lat_path.read_text())))
+            except Exception:  # noqa: BLE001
+                log.debug("latency anomalies failed for %s", run.id, exc_info=True)
 
     # Persist a curated subset of events (+ anomaly evidence), then link ids.
     curated = _curate_events(events, anomalies)

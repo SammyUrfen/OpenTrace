@@ -10,6 +10,7 @@ interface Target {
   /** dedicated sampler available for this runtime (py-spy/rbspy/asprof), or null */
   sampler: string | null
   rss_mb: number
+  container?: { container: boolean; runtime: string | null; id: string | null }
 }
 
 interface Props {
@@ -35,6 +36,8 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
   const [filter, setFilter] = useState('')
   const [windowS, setWindowS] = useState(20)
   const [monitor, setMonitor] = useState(false)
+  const [ebpf, setEbpf] = useState(false)
+  const [ebpfCaps, setEbpfCaps] = useState<{ available: boolean; reason: string | null } | null>(null)
   const [busy, setBusy] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -53,6 +56,12 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
       })
   }
   useEffect(load, [backendUrl])
+  useEffect(() => {
+    fetch(`${backendUrl}/runs/attach/ebpf-capabilities`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => setEbpfCaps(d))
+      .catch(() => setEbpfCaps(null))
+  }, [backendUrl])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
@@ -75,7 +84,10 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
       const r = await fetch(`${backendUrl}/runs/attach`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pid: t.pid, window_s: windowS, monitor, session_id: sessionId ?? null }),
+        body: JSON.stringify({
+          pid: t.pid, window_s: windowS, monitor,
+          ebpf: ebpf && !!ebpfCaps?.available, session_id: sessionId ?? null,
+        }),
       })
       if (!r.ok) {
         const d = await r.json().catch(() => ({}))
@@ -128,6 +140,25 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
           </span>
         </label>
 
+        <label className={`attach__monitor${ebpfCaps && !ebpfCaps.available ? ' attach__monitor--off' : ''}`}>
+          <input
+            type="checkbox" checked={ebpf && !!ebpfCaps?.available}
+            disabled={!ebpfCaps?.available}
+            onChange={(e) => setEbpf(e.target.checked)}
+          />
+          <span>
+            <span className="attach__monitor-label">
+              Off-CPU + latency (eBPF)
+              {ebpfCaps && !ebpfCaps.available && <span className="attach__ebpf-tag"> unavailable</span>}
+            </span>
+            <span className="attach__monitor-sub">
+              {ebpfCaps?.available
+                ? 'Adds an off-CPU flamegraph (where it BLOCKS — I/O, locks, DB waits) and scheduler + block-I/O latency histograms. This is what on-CPU sampling cannot see.'
+                : (ebpfCaps?.reason ?? 'Checking eBPF capabilities…')}
+            </span>
+          </span>
+        </label>
+
         {error && <div className="attach__error">✗ {error}</div>}
 
         <div className="attach__list">
@@ -145,7 +176,14 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
               <span className={`attach__rt ${PERF_NATIVE.has(t.runtime) || t.sampler ? 'attach__rt--native' : 'attach__rt--vm'}`}>
                 {t.runtime_label}
               </span>
-              <span className="attach__cmd">{t.cmdline}</span>
+              <span className="attach__cmd">
+                {t.cmdline}
+                {t.container?.container && (
+                  <span className="attach__container" title={`${t.container.runtime} container ${t.container.id}`}>
+                    🐳 {t.container.runtime}:{t.container.id}
+                  </span>
+                )}
+              </span>
               <span className="attach__meta">pid {t.pid} · {t.rss_mb} MB</span>
               <span className="attach__hint">{busy === t.pid ? 'attaching…' : t.hint}</span>
             </button>

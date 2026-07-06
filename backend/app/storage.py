@@ -275,10 +275,14 @@ def write_meta(run_dir: str | Path, meta: dict) -> None:
 
 
 def write_json(path: str | Path, doc: dict) -> None:
-    """Write a derived JSON artifact (e.g. profile.json, flamegraph.json)."""
+    """Write a derived JSON artifact (e.g. profile.json, flamegraph.json) atomically
+    (temp + os.replace) so a concurrent reader (a GET, or a monitor re-write) never
+    sees a truncated/torn file."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(doc, default=str), encoding="utf-8")
+    tmp = p.with_suffix(p.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(doc, default=str), encoding="utf-8")
+    os.replace(tmp, p)
 
 
 # --- monitor-mode incidents (ndjson in the run dir) -------------------------

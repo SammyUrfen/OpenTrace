@@ -140,3 +140,41 @@ def test_fold_empty_capture_is_unsupported():
     assert ss["supported"] is False and ss["samples"] == 0 and "reason" in ss
     # a real capture stays supported
     assert perf.fold_collapsed("a;b 3\n")["supported"] is True
+
+
+def test_fold_cpuprofile_walks_parents_and_drops_synthetic():
+    doc = {
+        "nodes": [
+            {"id": 1, "callFrame": {"functionName": "(root)"}, "children": [2]},
+            {"id": 2, "callFrame": {"functionName": "main", "url": "file:///a.js", "lineNumber": 3}, "children": [3]},
+            {"id": 3, "callFrame": {"functionName": "hot", "url": "file:///a.js", "lineNumber": 9}, "children": []},
+        ],
+        "samples": [3, 3, 2],
+        "timeDeltas": [100, 100, 100],
+    }
+    fg = perf.fold_cpuprofile(doc)
+    assert fg["supported"] and fg["unit"] == "usec"
+    top = fg["hotspots"][0]
+    assert top["function"] == "hot (a.js:9)" and top["self"] == 200  # 2 samples × 100µs
+    total_by = {h["function"]: h["total"] for h in fg["hotspots"]}
+    assert total_by["main (a.js:3)"] >= 200  # main is hot's ancestor
+    assert not any("(root)" in h["function"] for h in fg["hotspots"])  # synthetic dropped
+
+
+def test_fold_cpuprofile_anonymous_and_bad_weights():
+    doc = {
+        "nodes": [{"id": 1, "callFrame": {"functionName": ""}, "children": []}],
+        "samples": [1, 1], "timeDeltas": [-5, 0],  # non-positive → clamped to 1
+    }
+    fg = perf.fold_cpuprofile(doc)
+    assert fg["supported"] and fg["samples"] == 2
+    assert fg["hotspots"][0]["function"] == "(anonymous)"
+
+
+def test_fold_phpspy_reverses_leaf_first_blocks():
+    txt = "0 leaf /a.php:1\n1 mid /a.php:2\n2 root /a.php:3\n\n0 leaf /a.php:1\n1 mid /a.php:2\n2 root /a.php:3\n"
+    fg = perf.fold_phpspy(txt)
+    assert fg["supported"] and fg["samples"] == 2
+    self_by = {h["function"]: h["self"] for h in fg["hotspots"]}
+    total_by = {h["function"]: h["total"] for h in fg["hotspots"]}
+    assert self_by["leaf"] == 2 and total_by["root"] == 2  # root->leaf after reversing
