@@ -1,7 +1,9 @@
-import type { LiveState, Run } from '../state/useOpenTrace'
-import type { Anomaly, RunDetail } from '../state/useRunDetail'
-import { SEVERITY_COLOR, formatDuration, formatTime, statusLabel } from '../state/format'
+import type { Incident, LiveState, Run } from '../state/useOpenTrace'
+import type { RunDetail } from '../state/useRunDetail'
+import { SEVERITY_COLOR, formatDuration, formatTime, statusClass, statusLabel } from '../state/format'
+import { maxOf } from './seriesUtils'
 import { Sparkline } from './Sparkline'
+import { StatCell } from './StatCell'
 import { AiSummary } from './AiSummary'
 
 interface Props {
@@ -10,22 +12,26 @@ interface Props {
   live: LiveState | null
   backendUrl: string
   onOpenSettings: () => void
+  /** Live monitor incidents (SSE) — for a running monitor run, Top findings are
+   *  derived from these so Overview agrees with the Incidents tab. */
+  incidents?: Incident[]
+}
+
+/** The minimal shape the Top-findings card renders — satisfied by both a
+ *  finalized `Anomaly` and a live `Incident` mapped into it. */
+interface Finding {
+  id: string
+  severity: string
+  title: string
+  description: string
+  occurrence_count: number
 }
 
 function num(v: number | null | undefined, suffix = '', digits = 0): string {
   return v == null ? '—' : `${v.toFixed(digits)}${suffix}`
 }
 
-function StatCell({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="stat-cell">
-      <div className="stat-cell__value">{value}</div>
-      <div className="stat-cell__label">{label}</div>
-    </div>
-  )
-}
-
-function AnomalyCard({ a }: { a: Anomaly }) {
+function AnomalyCard({ a }: { a: Finding }) {
   const color = SEVERITY_COLOR[a.severity] ?? '#60a5fa'
   return (
     <div className="anomaly-card" style={{ borderLeftColor: color }}>
@@ -43,8 +49,11 @@ function AnomalyCard({ a }: { a: Anomaly }) {
   )
 }
 
-export function OverviewTab({ run, detail, live, backendUrl, onOpenSettings }: Props) {
+export function OverviewTab({ run, detail, live, backendUrl, onOpenSettings, incidents }: Props) {
   const { summary, metrics, anomalies, loading } = detail
+  // A running monitor run finalizes no anomalies yet, but streams incidents — so
+  // derive Top findings from the live incident store to match the Incidents tab.
+  const liveMonitor = !!run.collector_config?.monitor && run.status === 'running'
 
   const cpuSeries = metrics.length
     ? metrics.map((m) => m.cpu_pct ?? 0)
@@ -53,16 +62,31 @@ export function OverviewTab({ run, detail, live, backendUrl, onOpenSettings }: P
     ? metrics.map((m) => m.rss_mb ?? 0)
     : (live?.rss ?? [])
 
-  const peakCpu = summary?.peaks?.cpu_pct ?? (cpuSeries.length ? Math.max(...cpuSeries) : null)
-  const peakRss = summary?.peaks?.rss_mb ?? (rssSeries.length ? Math.max(...rssSeries) : null)
-  const peakFds =
-    summary?.peaks?.open_fds ??
-    (metrics.length ? Math.max(...metrics.map((m) => m.open_fds ?? 0)) : null)
+  // Loop-based peaks: these series are unbounded for monitor runs, so a spread
+  // (Math.max(...arr)) would overflow the argument limit and crash the render.
+  const peakCpu = summary?.peaks?.cpu_pct ?? maxOf(cpuSeries, (v) => v)
+  const peakRss = summary?.peaks?.rss_mb ?? maxOf(rssSeries, (v) => v)
+  const peakFds = summary?.peaks?.open_fds ?? maxOf(metrics, (m) => m.open_fds ?? 0)
   const threads = summary?.peaks?.threads ?? null
   const syscalls = summary?.totals?.syscall_events ?? null
   const errors = summary?.totals?.errors ?? null
   const samples = summary?.totals?.metric_samples ?? metrics.length
-  const sorted = [...anomalies].sort((a, b) => b.severity_score - a.severity_score)
+  const findings: Finding[] = liveMonitor
+    ? (incidents ?? []).map((inc) => ({
+        id: inc.id,
+        severity: inc.severity,
+        title: inc.title,
+        description:
+          inc.ai ??
+          (inc.hot?.functions?.length
+            ? `Hot path: ${inc.hot.functions.slice(0, 3).join(' → ')}`
+            : 'Live incident captured during monitoring.'),
+        occurrence_count: inc.count ?? 1,
+      }))
+    : [...anomalies].sort((a, b) => b.severity_score - a.severity_score)
+  // On a finalized run "Analyzing…" bridges the gap before anomalies land; a live
+  // monitor run has no such analyzing phase (incidents stream in), so skip it there.
+  const findingsLoading = !liveMonitor && loading && anomalies.length === 0
 
   return (
     <div className="overview" data-testid="overview-tab">
@@ -70,7 +94,7 @@ export function OverviewTab({ run, detail, live, backendUrl, onOpenSettings }: P
         <span className="overview__command" title={run.command}>
           {run.command}
         </span>
-        <span className={`run-row__status run-row__status--${run.status === 'completed' && run.exit_code === 0 ? 'ok' : run.status === 'running' ? 'running' : 'fail'}`}>
+        <span className={`run-row__status run-row__status--${statusClass(run)}`}>
           {statusLabel(run)}
         </span>
       </div>
@@ -87,13 +111,17 @@ export function OverviewTab({ run, detail, live, backendUrl, onOpenSettings }: P
 
       {/* Anomalies */}
       <h3 className="overview__h">Top findings</h3>
-      {loading && anomalies.length === 0 ? (
+      {findingsLoading ? (
         <div className="overview__muted">Analyzing…</div>
-      ) : sorted.length === 0 ? (
-        <div className="overview__clean">✓ No anomalies detected — this run looks clean.</div>
+      ) : findings.length === 0 ? (
+        liveMonitor ? (
+          <div className="overview__muted">Monitoring — no incidents yet.</div>
+        ) : (
+          <div className="overview__clean">✓ No anomalies detected — this run looks clean.</div>
+        )
       ) : (
         <div className="overview__anomalies">
-          {sorted.map((a) => (
+          {findings.map((a) => (
             <AnomalyCard key={a.id} a={a} />
           ))}
         </div>

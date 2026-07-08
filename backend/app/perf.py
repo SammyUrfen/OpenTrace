@@ -322,13 +322,7 @@ def fold_phpspy(text: str) -> dict:
         if frames:
             yield list(reversed(frames)), 1
 
-    return fold_collapsed_from_stacks(_stacks())
-
-
-def fold_collapsed_from_stacks(weighted_stacks) -> dict:
-    """Public thin wrapper so callers with already-tokenized (root->leaf, weight)
-    stacks reuse the shared folder (perf-format samples counting semantics)."""
-    return _fold_stacks(weighted_stacks)
+    return _fold_stacks(_stacks())
 
 
 def build_flamegraph(perf_data: str | Path) -> dict:

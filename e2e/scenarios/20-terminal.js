@@ -33,13 +33,13 @@ module.exports = [
       await ctx.dismissOnboarding()
       await ensureTracingOff(ctx)
       await ctx.waitFor('.tracing-toggle--off', 5000)
-      await ctx.assertText(/OpenTrace OFF/i, 'expected OpenTrace OFF text')
+      await ctx.assertText(/Terminal Tracing OFF/i, 'expected Terminal Tracing OFF text')
       await H.toggleTracing(ctx)
       await ctx.waitFor('.tracing-toggle--on', 5000)
-      await ctx.assertText(/OpenTrace ON/i, 'expected OpenTrace ON text after toggle')
+      await ctx.assertText(/Terminal Tracing ON/i, 'expected Terminal Tracing ON text after toggle')
       await H.toggleTracing(ctx)
       await ctx.waitFor('.tracing-toggle--off', 5000)
-      await ctx.assertText(/OpenTrace OFF/i, 'expected OpenTrace OFF text after second toggle')
+      await ctx.assertText(/Terminal Tracing OFF/i, 'expected Terminal Tracing OFF text after second toggle')
     },
   },
   {
@@ -169,7 +169,7 @@ module.exports = [
       await ctx.press('Escape')
       await ctx.gone('.palette', 4000)
       ctx.assert(await ctx.exists('.tracing-toggle--on'), 'tracing flipped OFF unexpectedly')
-      await ctx.assertText(/OpenTrace ON/i, 'expected OpenTrace ON to persist')
+      await ctx.assertText(/Terminal Tracing ON/i, 'expected Terminal Tracing ON to persist')
       await H.toggleTracing(ctx) // restore OFF
       await ctx.waitFor('.tracing-toggle--off', 5000).catch(() => {})
     },

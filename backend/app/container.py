@@ -77,6 +77,122 @@ def nspid_map(pid: int) -> list[int]:
     return []
 
 
+# --- cgroup resource limits (R7: container-limit-aware rules) ----------------
+#
+# A container's cgroup caps CPU (a fractional-core quota) and memory (a hard byte
+# limit). Without knowing those, the rule engine's "90% of a core" / RSS-growth
+# gates never fire for a 0.5-core-quota'd or memory-boxed container. We read the
+# quota + limit from /proc + /sys/fs/cgroup alone (no root, no runtime socket) and
+# hand them to the rules. Handles cgroup v2 (unified) and v1 (per-controller).
+
+# memory.limit_in_bytes (v1) uses a near-2^63 sentinel to mean "unlimited"; treat
+# anything at/above this as no limit.
+_MEM_UNLIMITED = 1 << 62
+
+
+def parse_cpu_max_v2(text: str) -> float | None:
+    """cgroup v2 `cpu.max` ('<quota_us> <period_us>' | 'max <period>') → the allowed
+    CPU as a core count (quota/period), or None when unlimited/unparseable."""
+    parts = text.split()
+    if not parts or parts[0] == "max":
+        return None
+    try:
+        quota = int(parts[0])
+        period = int(parts[1]) if len(parts) > 1 else 100_000
+    except (ValueError, IndexError):
+        return None
+    return quota / period if quota > 0 and period > 0 else None
+
+
+def parse_cpu_quota_v1(quota_text: str, period_text: str) -> float | None:
+    """cgroup v1 `cpu.cfs_quota_us` / `cpu.cfs_period_us` → core count, or None when
+    unlimited (quota == -1) or unparseable."""
+    try:
+        quota = int(quota_text.strip())
+        period = int(period_text.strip())
+    except (ValueError, AttributeError):
+        return None
+    return quota / period if quota > 0 and period > 0 else None
+
+
+def parse_mem_limit(text: str) -> int | None:
+    """cgroup memory limit (`memory.max` v2 | `memory.limit_in_bytes` v1) → bytes,
+    or None when unlimited ('max', ≤0, or the v1 near-2^63 sentinel)."""
+    t = (text or "").strip()
+    if not t or t == "max":
+        return None
+    try:
+        val = int(t)
+    except ValueError:
+        return None
+    return val if 0 < val < _MEM_UNLIMITED else None
+
+
+def _cgroup_paths(text: str) -> dict[str, str]:
+    """Map controller → relative cgroup path from /proc/<pid>/cgroup content. A v2
+    unified line ('0::/path') has no controllers, so it's stored under key ''."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _hid, controllers, path = parts
+        for ctrl in (controllers.split(",") if controllers else [""]):
+            out[ctrl] = path
+    return out
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except OSError:
+        return None
+
+
+def cgroup_limits(pid: int, *, cgroup_text: str | None = None,
+                  fs_root: str = "/sys/fs/cgroup") -> dict:
+    """The CPU quota (cores) + memory limit (bytes) the target's cgroup enforces,
+    read from /proc + /sys/fs/cgroup (no root). Returns
+    {cpu_quota_cores, mem_limit_bytes}, each None when unlimited/unavailable.
+    Handles cgroup v2 (unified) and v1 (per-controller mounts). Fail-open: all-None
+    on any error, so a bare-metal target reads as unconstrained (rules behave as
+    they always have). `cgroup_text`/`fs_root` are injectable for tests."""
+    if cgroup_text is None:
+        cgroup_text = _read_text(Path(f"/proc/{pid}/cgroup")) or ""
+    paths = _cgroup_paths(cgroup_text)
+    fs = Path(fs_root)
+    cpu_cores: float | None = None
+    mem_bytes: int | None = None
+
+    # cgroup v2 unified: both files live under fs_root + the unified path.
+    unified = paths.get("")
+    if unified is not None:
+        base = fs / unified.lstrip("/")
+        t = _read_text(base / "cpu.max")
+        if t is not None:
+            cpu_cores = parse_cpu_max_v2(t)
+        t = _read_text(base / "memory.max")
+        if t is not None:
+            mem_bytes = parse_mem_limit(t)
+
+    # cgroup v1 fallback: per-controller mounts (cpu,cpuacct / memory).
+    if cpu_cores is None and "cpu" in paths:
+        rel = paths["cpu"].lstrip("/")
+        for mount in ("cpu,cpuacct", "cpu"):
+            q = _read_text(fs / mount / rel / "cpu.cfs_quota_us")
+            p = _read_text(fs / mount / rel / "cpu.cfs_period_us")
+            if q is not None and p is not None:
+                cpu_cores = parse_cpu_quota_v1(q, p)
+                break
+    if mem_bytes is None and "memory" in paths:
+        rel = paths["memory"].lstrip("/")
+        t = _read_text(fs / "memory" / rel / "memory.limit_in_bytes")
+        if t is not None:
+            mem_bytes = parse_mem_limit(t)
+
+    return {"cpu_quota_cores": cpu_cores, "mem_limit_bytes": mem_bytes}
+
+
 def resolve_host_pid(local_pid: int, container_id: str | None = None) -> int | None:
     """Given a container-LOCAL pid (as seen inside the container), find the matching
     HOST pid by scanning /proc/*/status for an NSpid whose innermost value ==

@@ -25,6 +25,10 @@ declare global {
       menu?: {
         onAction: (cb: (action: string) => void) => () => void
       }
+      backend?: {
+        /** Backend-process lifecycle from the Electron main process (crash/restart/give-up). */
+        onStatus: (cb: (payload: { state: 'restarting' | 'ok' | 'failed'; attempt?: number; max?: number }) => void) => () => void
+      }
     }
   }
 }

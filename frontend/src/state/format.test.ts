@@ -26,6 +26,19 @@ describe('format helpers', () => {
     expect(statusClass({ status: 'running', exit_code: null })).toBe('running')
   })
 
+  it('attach runs use profiling wording + a neutral class, not exit-code failure', () => {
+    const attach = { attach: true }
+    // fail-open attach: the target outlived us, so a null exit code is not a failure
+    expect(statusLabel({ status: 'completed', exit_code: null, exit_signal: null, collector_config: attach })).toBe('profiled')
+    expect(statusClass({ status: 'completed', exit_code: null, collector_config: attach })).toBe('ok')
+    // target exited during the window — still non-red wording
+    expect(statusLabel({ status: 'completed', exit_code: 0, exit_signal: null, collector_config: attach })).toBe('target exited')
+    expect(statusClass({ status: 'completed', exit_code: 3, collector_config: attach })).toBe('ok')
+    // launch runs are unaffected
+    expect(statusLabel({ status: 'completed', exit_code: null, exit_signal: null })).toBe('exit ?')
+    expect(statusClass({ status: 'completed', exit_code: 2 })).toBe('fail')
+  })
+
   it('formatDuration is human readable', () => {
     expect(formatDuration(null)).toBe('—')
     expect(formatDuration(450)).toBe('450ms')

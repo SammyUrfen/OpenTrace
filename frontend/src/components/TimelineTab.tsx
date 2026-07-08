@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import type { RunDetail } from '../state/useRunDetail'
 import { useRunResource } from '../state/useRunResource'
 import { SEVERITY_COLOR } from '../state/format'
+import { downsamplePoints, pts } from './seriesUtils'
 import { TimelineChart, type TlAnomaly, type TlEvent } from './TimelineChart'
 
 interface EventRow {
@@ -34,18 +35,11 @@ export function TimelineTab({ backendUrl, runId, detail }: Props) {
   const { rows: rawEvents } = useRunResource<EventRow>(backendUrl, runId, 'events')
   const { metrics, anomalies } = detail
 
-  const rss = useMemo(
-    () => metrics.filter((m) => m.rss_mb != null).map((m) => [m.timestamp_ms, m.rss_mb!] as [number, number]),
-    [metrics],
-  )
-  const cpu = useMemo(
-    () => metrics.filter((m) => m.cpu_pct != null).map((m) => [m.timestamp_ms, m.cpu_pct!] as [number, number]),
-    [metrics],
-  )
-  const sys = useMemo(
-    () => metrics.filter((m) => m.syscall_rate != null).map((m) => [m.timestamp_ms, m.syscall_rate!] as [number, number]),
-    [metrics],
-  )
+  // Decimated in these memos so a multi-hour monitor run's 100k+-sample series
+  // never reaches the SVG path builders (spikes survive via min/max buckets).
+  const rss = useMemo(() => downsamplePoints(pts(metrics, 'rss_mb')), [metrics])
+  const cpu = useMemo(() => downsamplePoints(pts(metrics, 'cpu_pct')), [metrics])
+  const sys = useMemo(() => downsamplePoints(pts(metrics, 'syscall_rate')), [metrics])
   const events = useMemo(
     () => rawEvents.map(classify).filter((e): e is TlEvent => e !== null).slice(0, 800),
     [rawEvents],
@@ -64,15 +58,22 @@ export function TimelineTab({ backendUrl, runId, detail }: Props) {
   )
 
   const [t0, t1] = useMemo(() => {
-    const ts = [
-      ...rss.map((p) => p[0]),
-      ...events.map((e) => e.t),
-      ...tlAnoms.flatMap((a) => [a.t0, a.t1]),
-    ]
-    if (!ts.length) return [0, 1]
-    const lo = Math.min(...ts)
-    const hi = Math.max(...ts)
-    return [lo, hi > lo ? hi : lo + 1]
+    let lo = Infinity
+    let hi = -Infinity
+    for (const p of rss) {
+      if (p[0] < lo) lo = p[0]
+      if (p[0] > hi) hi = p[0]
+    }
+    for (const e of events) {
+      if (e.t < lo) lo = e.t
+      if (e.t > hi) hi = e.t
+    }
+    for (const a of tlAnoms) {
+      if (a.t0 < lo) lo = a.t0
+      if (a.t1 > hi) hi = a.t1
+    }
+    if (!Number.isFinite(lo)) return [0, 1] as [number, number]
+    return [lo, hi > lo ? hi : lo + 1] as [number, number]
   }, [rss, events, tlAnoms])
 
   const [domain, setDomain] = useState<[number, number] | null>(null)

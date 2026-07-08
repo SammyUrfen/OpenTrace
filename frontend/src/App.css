@@ -286,26 +286,6 @@
   color: var(--text-dim);
   background: var(--hover);
 }
-.session-new {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  font-family: var(--mono);
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-.session-new:hover {
-  color: var(--accent);
-  border-color: var(--accent-line);
-}
-.session-create {
-  display: flex;
-  gap: 6px;
-  padding: 6px 10px 8px;
-  border-bottom: 1px solid var(--border);
-}
 .session-create__input {
   flex: 1;
   background: var(--bg-elevated);
@@ -316,16 +296,6 @@
   padding: 4px 8px;
   border-radius: 6px;
   outline: none;
-}
-.session-create__go {
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-line);
-  color: var(--accent);
-  font-family: var(--mono);
-  font-size: 11px;
-  padding: 2px 10px;
-  border-radius: 6px;
-  cursor: pointer;
 }
 .project-group__header {
   width: 100%;
@@ -566,12 +536,6 @@
   border-color: rgba(248, 113, 113, 0.45);
 }
 
-.region__right-slot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
 /* --- main tab bar (open runs) --- */
 .main-tabs {
   display: flex;
@@ -695,24 +659,6 @@
   font-size: 12px;
   color: var(--text-dim);
   margin-top: 4px;
-}
-.overview__ai {
-  margin-top: 16px;
-  padding: 12px 14px;
-  border: 1px dashed var(--border);
-  border-radius: 8px;
-  font-size: 13px;
-  color: var(--text-dim);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.overview__ai-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
-  opacity: 0.6;
 }
 .overview__h {
   font-size: 12px;
@@ -1357,17 +1303,6 @@
   font-size: 18px;
   color: var(--accent);
 }
-.diff-ai {
-  margin: 10px 0;
-  padding: 12px 14px;
-  border: 1px dashed var(--border);
-  border-radius: 8px;
-  font-size: 13px;
-  color: var(--text-dim);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
 .diff-grid {
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -1472,14 +1407,60 @@
 }
 
 .terminal-pane {
+  position: relative;
   width: 100%;
   height: 100%;
+}
+.terminal-pane__host {
+  width: 100%;
+  height: 100%;
+}
+.terminal-pane__exit-overlay {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  z-index: 3;
 }
 .terminal-pane--unavailable {
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--text-dim);
+}
+
+/* inline render-failure fallback (ErrorBoundary) */
+.error-boundary {
+  margin: 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-left: 3px solid #f87171;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+.error-boundary__title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.error-boundary__detail {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
 }
 
 .tracing-toggle {
@@ -1524,6 +1505,22 @@
   text-transform: lowercase;
 }
 
+.main-content__welcome {
+  text-align: center;
+  max-width: 420px;
+}
+.main-content__title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.main-content__hint {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
 .backend-badge {
   font-family: var(--mono);
   font-size: 12px;
@@ -1559,10 +1556,6 @@
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
 }
-.session-list__count {
-  font-size: 11px;
-  color: var(--text-dim);
-}
 .session-list__body {
   flex: 1;
   overflow-y: auto;
@@ -1576,62 +1569,6 @@
 .session-list__empty--error {
   color: #f87171;
 }
-.session-row {
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.session-row__top {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 8px;
-}
-.session-row__command {
-  font-size: 12px;
-  font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.session-row__status {
-  font-size: 10px;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-  padding: 1px 6px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.session-row__status--running {
-  color: #a7f3d0;
-  border-color: rgba(74, 222, 128, 0.45);
-}
-.session-row__status--ok {
-  color: var(--text-dim);
-}
-.session-row__status--fail {
-  color: #fca5a5;
-  border-color: rgba(248, 113, 113, 0.45);
-}
-.session-row__meta {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--text-dim);
-  gap: 8px;
-}
-.session-row__cwd {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.session-row__time {
-  flex-shrink: 0;
-}
-
 /* ===== Batch 3 chrome: command palette, settings page, files, guide ===== */
 
 /* hide collapsed regions (View ▸ toggle sidebar / terminal) */
@@ -1986,4 +1923,16 @@
 .incident__ai {
   font-size: 12px; line-height: 1.5; color: var(--text); border-left: 2px solid var(--accent-line);
   padding: 4px 0 4px 10px; margin-top: 2px;
+}
+
+/* Fixed backend-health strip (App.tsx): visible over any focused tab when the
+   backend crashes/restarts; position:fixed keeps it out of the app-shell grid. */
+.backend-banner {
+  position: fixed; top: 40px; left: 50%; transform: translateX(-50%);
+  z-index: 60; padding: 6px 14px; border-radius: 8px;
+  font-size: 12px; font-weight: 500;
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  color: #fca5a5;
+  backdrop-filter: blur(6px);
 }

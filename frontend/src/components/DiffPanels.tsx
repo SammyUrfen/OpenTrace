@@ -1,7 +1,9 @@
+import { useMemo } from 'react'
 import type { MetricSample } from '../state/useOpenTrace'
 import type { RunBundle } from '../state/useDiff'
 import type { SyscallStat } from '../state/useSyscalls'
 import { SEVERITY_COLOR } from '../state/format'
+import { maxOf, type Point } from './seriesUtils'
 import { TimeSeriesChart } from './TimeSeriesChart'
 
 const COLOR_A = '#ff8c42'
@@ -9,7 +11,7 @@ const COLOR_B = '#5fb3d5'
 
 /** Normalize a metric series to elapsed-ms from the run's first sample so two
  *  runs with different absolute timestamps overlay from a shared zero. */
-function elapsed(metrics: MetricSample[], key: keyof MetricSample): [number, number][] {
+function elapsed(metrics: MetricSample[], key: keyof MetricSample): Point[] {
   if (!metrics.length) return []
   const t0 = metrics[0].timestamp_ms
   return metrics
@@ -17,8 +19,9 @@ function elapsed(metrics: MetricSample[], key: keyof MetricSample): [number, num
     .map((m) => [m.timestamp_ms - t0, m[key] as number])
 }
 
-function peak(pts: [number, number][]): number | null {
-  return pts.length ? Math.max(...pts.map((p) => p[1])) : null
+// Loop-based peak: monitor-run series are unbounded, a spread would overflow.
+function peak(pts: Point[]): number | null {
+  return maxOf(pts, (p) => p[1])
 }
 
 function Legend() {
@@ -30,13 +33,13 @@ function Legend() {
   )
 }
 
-function metricDiff(a: RunBundle, b: RunBundle, key: keyof MetricSample, unit: string, label: string) {
-  const pa = elapsed(a.metrics, key)
-  const pb = elapsed(b.metrics, key)
+function metricDiff(aMetrics: MetricSample[], bMetrics: MetricSample[], key: keyof MetricSample) {
+  const pa = elapsed(aMetrics, key)
+  const pb = elapsed(bMetrics, key)
   const peakA = peak(pa)
   const peakB = peak(pb)
   const delta = peakA != null && peakB != null ? peakB - peakA : null
-  return { pa, pb, peakA, peakB, delta, unit, label }
+  return { pa, pb, peakA, peakB, delta }
 }
 
 function MetricDiffPanel({
@@ -44,7 +47,9 @@ function MetricDiffPanel({
 }: {
   a: RunBundle; b: RunBundle; mkey: keyof MetricSample; unit: string; label: string; testid: string
 }) {
-  const d = metricDiff(a, b, mkey, unit, label)
+  // Memoized on the (referentially stable) metrics arrays so SSE-driven parent
+  // re-renders don't rebuild the derived series every time.
+  const d = useMemo(() => metricDiff(a.metrics, b.metrics, mkey), [a.metrics, b.metrics, mkey])
   return (
     <div className="overview" data-testid={testid}>
       <h3 className="overview__h">{label} over time — A vs B (aligned at t=0)</h3>

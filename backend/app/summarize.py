@@ -366,10 +366,11 @@ def _gather_context(run: runs.Run) -> dict:
         pass
     events_path = run_dir / "events.ndjson.zst"
     if events_path.exists():
+        # Stream one pass per aggregate — materializing the full event list can
+        # OOM the backend on syscall-heavy runs.
         try:
-            events = list(storage.read_ndjson_zst(events_path))
-            ctx["io"] = aggregate.io_stats(events)
-            ctx["network"] = aggregate.network_stats(events)
+            ctx["io"] = aggregate.io_stats(storage.read_ndjson_zst(events_path))
+            ctx["network"] = aggregate.network_stats(storage.read_ndjson_zst(events_path))
         except Exception:  # noqa: BLE001
             pass
     for key, fname in (("profile", "profile.json"), ("flamegraph", "flamegraph.json")):

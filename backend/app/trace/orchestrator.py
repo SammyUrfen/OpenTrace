@@ -30,6 +30,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -42,6 +43,7 @@ from .. import db, runs, storage
 from .. import perf as perf_mod
 from .. import profile as profile_mod
 from ..rules import RuleContext, run_rules
+from ..rules.engine import RuleThresholds
 from ..streaming import broker
 from ..util import new_id, now_ms
 from . import metrics as metrics_mod
@@ -77,10 +79,28 @@ class _RunContext:
     last_rss: float | None = None
     cpu_streak: int = 0
     alerts_fired: set = field(default_factory=set)
+    # per-alert-key count of consecutive below-threshold samples; a key is cleared
+    # from `alerts_fired` (re-armed) once it stays quiet long enough (R10).
+    alert_cooldown: dict = field(default_factory=dict)
+    # slow-leak long-horizon check (R8): scan counter + baseline RSS captured at
+    # monitor start, so a leak too slow for the 90s sliding window still surfaces.
+    scan_count: int = 0
+    baseline_rss: float | None = None
 
 
 _active: dict[str, _RunContext] = {}
 _lock = threading.Lock()
+
+
+def _rule_thresholds() -> RuleThresholds:
+    """Rule thresholds from config (config.tracing.rule_thresholds over the
+    engine defaults). Fail-open to plain defaults — a bad/absent config must
+    never break analysis."""
+    try:
+        from .. import config
+        return RuleThresholds.from_overrides(config.load().tracing.rule_thresholds)
+    except Exception:  # noqa: BLE001
+        return RuleThresholds()
 
 
 def _sweep_stale() -> None:
@@ -90,6 +110,10 @@ def _sweep_stale() -> None:
     with _lock:
         for rid, ctx in list(_active.items()):
             if ctx.poller is None and ctx.created_ms and ctx.created_ms < cutoff:
+                # A psutil-off run has no poller by design; while its reported
+                # pid is alive it's a legitimate long run, not a dead otrace.
+                if ctx.root_pid is not None and psutil.pid_exists(ctx.root_pid):
+                    continue
                 _active.pop(rid, None)
                 stale.append(rid)
     for rid in stale:
@@ -153,8 +177,13 @@ def report_pid(run_id: str, pid: int) -> bool:
     if run is None:
         return False
     collectors = run.collector_config or {}
-    # No psutil collector -> acknowledge but don't poll metrics.
+    # No psutil collector -> acknowledge but don't poll metrics. Still record the
+    # pid so _sweep_stale can tell this live run apart from a dead otrace.
     if not collectors.get("psutil", True):
+        with _lock:
+            ctx = _active.get(run_id)
+            if ctx is not None:
+                ctx.root_pid = pid
         return True
     # A wrapper (strace/ltrace/perf) is `pid`; the workload is its descendant, so
     # watch descendants only. Running bare, `pid` IS the workload — include root.
@@ -173,6 +202,9 @@ def report_pid(run_id: str, pid: int) -> bool:
 _ATTACH_MIN_S = 3
 _ATTACH_MAX_S = 120
 _PERF_HZ = 99
+# Ceiling on concurrent attach/monitor runs — each spawns profiler (+ eBPF)
+# threads, so an unbounded burst is a CPU-exhaustion hazard.
+_MAX_ATTACH_ACTIVE = 16
 
 
 def _proc_cwd(pid: int) -> str:
@@ -180,6 +212,21 @@ def _proc_cwd(pid: int) -> str:
         return os.readlink(f"/proc/{pid}/cwd")
     except OSError:
         return ""
+
+
+def _descendant_pids(root: int, *, include_root: bool = True) -> list[int]:
+    """Root + its live descendant PIDs at call time (deduped, root first). Attaching
+    to a master (gunicorn/nginx/postgres) profiles an idle master unless the WORKERS
+    are captured too — this feeds the multi-target profilers (perf `-p a,b,c`, the
+    biosnoop pid filter). Fail-open: just [root] when the tree can't be walked."""
+    pids: list[int] = [root] if include_root else []
+    try:
+        for child in psutil.Process(root).children(recursive=True):
+            if child.pid not in pids:
+                pids.append(child.pid)
+    except (psutil.Error, OSError):
+        pass
+    return pids
 
 
 def start_attach_run(
@@ -204,9 +251,21 @@ def start_attach_run(
     if pid <= 0 or not psutil.pid_exists(pid):
         raise ValueError(f"no such process: {pid}")
     try:
+        target_uid = psutil.Process(pid).uids().real
         info = attach_mod.target_info(pid)
     except psutil.Error as e:
         raise ValueError(f"cannot inspect pid {pid}: {e}") from e
+    # Ownership: only profile the caller's own processes (root can profile any).
+    if os.getuid() != 0 and target_uid != os.getuid():
+        raise ValueError(f"pid {pid} belongs to another user — attach requires a same-user process")
+    with _lock:
+        attach_active = sum(
+            1 for c in _active.values() if (c.run.collector_config or {}).get("attach")
+        )
+    if attach_active >= _MAX_ATTACH_ACTIVE:
+        raise ValueError(
+            f"too many concurrent attach/monitor runs ({attach_active}) — stop one first"
+        )
 
     window = max(_ATTACH_MIN_S, min(int(window_s), _ATTACH_MAX_S))
     # Pick the runtime's dedicated sampler if installed (Phase B), else perf.
@@ -215,6 +274,11 @@ def start_attach_run(
         profiler, prof_fmt, prof_file = plan["tool"], plan["format"], plan["out_file"]
     else:
         profiler, prof_fmt, prof_file = "perf", "perf", "perf.data"
+    # cgroup limits (R7): if the target is containerized, the CPU quota + memory
+    # limit that box it. Stored on the run so the rules can flag a quota-saturated /
+    # near-OOM container (fail-open: None on a bare-metal target).
+    from .. import container  # local import: keep module import graph flat
+    climits = container.cgroup_limits(pid)
     data = runs.RunCreate(
         command=info["cmdline"],
         cwd=_proc_cwd(pid),
@@ -223,6 +287,9 @@ def start_attach_run(
             "psutil": True, "perf": True, "attach": True, "monitor": monitor,
             "ebpf": ebpf, "runtime": info["runtime"], "profiler": profiler,
             "profile_format": prof_fmt, "profile_file": prof_file,
+            "container": info.get("container"),
+            "cgroup_cpu_quota_cores": climits["cpu_quota_cores"],
+            "cgroup_mem_limit_bytes": climits["mem_limit_bytes"],
         },
         label=f"{'monitor' if monitor else 'attach'}: {info['name']} (pid {pid})",
     )
@@ -252,6 +319,42 @@ def stop_monitor(run_id: str) -> bool:
     return True
 
 
+def abort_run(run_id: str) -> None:
+    """Tear down a live run's in-memory machinery WITHOUT finalizing — for when
+    the run row/dir is being deleted out from under it. No finalize pass (its
+    data is being rmtree'd) and no lifecycle SSE (the UI already dropped it)."""
+    with _lock:
+        ctx = _active.pop(run_id, None)
+    if ctx is None:
+        return
+    ctx.stop_event.set()
+    if ctx.poller is not None:
+        ctx.poller.stop(join=False)  # don't block the HTTP thread on the join
+    log.info("run %s aborted (deleted while active)", run_id)
+
+
+def _fail_run(run_id: str) -> None:
+    """Last-resort teardown when an attach/monitor thread dies unexpectedly:
+    stop the run's machinery and unstick its status. Never raises."""
+    with _lock:
+        ctx = _active.pop(run_id, None)
+    if ctx is not None:
+        ctx.stop_event.set()
+        if ctx.poller is not None:
+            try:
+                ctx.poller.stop(join=False)
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        run = runs.get(run_id)
+        if run is not None and run.status in (runs.RUNNING, runs.ANALYZING):
+            if runs.finalize(run_id, status=runs.ERROR) is None:
+                runs.set_status(run_id, runs.ERROR)
+    except Exception:  # noqa: BLE001
+        log.debug("could not stamp run %s as error", run_id, exc_info=True)
+    broker.publish(run_id, "run_ended", {"id": run_id})
+
+
 def _perf_fail_reason(stderr: str, profiler: str = "perf") -> str:
     """A user-facing reason a profiler attach produced no flamegraph."""
     s = (stderr or "").lower()
@@ -273,15 +376,17 @@ def _fold_profile(fmt: str, raw: Path) -> dict | None:
     """Fold a profiler's raw output into a flamegraph dict, dispatching on format
     (perf.data / collapsed / speedscope / cpuprofile / phpspy). Returns None when
     the capture is missing/empty/unparseable so the run keeps its psutil timeline."""
-    # dotnet-trace writes the speedscope alongside the .nettrace; be robust to the
-    # exact filename by falling back to the newest *.speedscope.json in the dir.
-    if fmt == "speedscope" and (not raw.exists() or raw.stat().st_size == 0):
-        cands = sorted(raw.parent.glob("*.speedscope.json"), key=lambda p: p.stat().st_mtime)
-        if cands:
-            raw = cands[-1]
-    if not raw.exists() or raw.stat().st_size == 0:
-        return None
     try:
+        # dotnet-trace writes the speedscope alongside the .nettrace; be robust to
+        # the exact filename by falling back to the newest *.speedscope.json in the
+        # dir. The stat/glob is inside the try so a concurrent run deletion
+        # degrades to None (psutil-timeline-only run), not a crashed thread.
+        if fmt == "speedscope" and (not raw.exists() or raw.stat().st_size == 0):
+            cands = sorted(raw.parent.glob("*.speedscope.json"), key=lambda p: p.stat().st_mtime)
+            if cands:
+                raw = cands[-1]
+        if not raw.exists() or raw.stat().st_size == 0:
+            return None
         if fmt == "collapsed":
             return perf_mod.fold_collapsed(raw.read_text(errors="replace"))
         if fmt == "speedscope":
@@ -314,19 +419,33 @@ def _capture_profile(run: runs.Run, pid: int, window_s: int, stop: threading.Eve
         return node_cdp.capture(pid, window_s, str(out_path), stop=stop)
 
     if profiler == "perf":
-        cmd = ["perf", "record", "-p", str(pid), "-g", "-F", str(_PERF_HZ),
+        # perf `-p` takes a comma-separated pid list — include the target's current
+        # children so a master's worker frames are attributed, not just the (often
+        # idle) master. Snapshot at capture start; late-forked workers are missed
+        # but the common pre-forked pool (gunicorn/nginx) is covered.
+        targets = ",".join(str(p) for p in _descendant_pids(pid))
+        cmd = ["perf", "record", "-p", targets, "-g", "-F", str(_PERF_HZ),
                "-o", str(out_path), "--", "sleep", str(window_s)]
     else:
         cmd = attach_mod.sampler_argv(profiler, pid, window_s, str(out_path))
 
     proc: subprocess.Popen | None = None
     reason: str | None = None
+    outf = errf = None
     if shutil.which(profiler):
+        # Temp files, never PIPEs: an undrained pipe fills its 64KB buffer
+        # mid-window and stalls a chatty sampler (same hazard ebpf._run_proc
+        # documents and avoids).
+        outf = tempfile.TemporaryFile()
+        errf = tempfile.TemporaryFile()
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, stdout=outf, stderr=errf)
         except Exception:  # noqa: BLE001
             log.exception("attach %s failed to start for run %s", profiler, run.id)
             proc, reason = None, f"could not start {profiler}."
+            outf.close()
+            errf.close()
+            outf = errf = None
     else:
         reason = f"{profiler} is not installed — captured the resource timeline only."
 
@@ -337,18 +456,25 @@ def _capture_profile(run: runs.Run, pid: int, window_s: int, stop: threading.Eve
         time.sleep(0.2)
 
     ok = False
-    if proc is not None:
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGINT)  # graceful: flush the profiler output
-        try:
-            _out, err = proc.communicate(timeout=20)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            _out, err = proc.communicate()
-        ok = out_path.exists() and out_path.stat().st_size > 0
-        if not ok:
-            reason = _perf_fail_reason((err or b"").decode(errors="replace"), profiler)
-            log.warning("attach run %s: no %s capture", run.id, profiler)
+    try:
+        if proc is not None:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)  # graceful: flush the profiler output
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            ok = out_path.exists() and out_path.stat().st_size > 0
+            if not ok:
+                errf.seek(0)
+                err = errf.read().decode(errors="replace")
+                reason = _perf_fail_reason(err, profiler)
+                log.warning("attach run %s: no %s capture", run.id, profiler)
+    finally:
+        if outf is not None:
+            outf.close()
+            errf.close()
     return ok, reason
 
 
@@ -490,6 +616,9 @@ def _capture_ebpf(run: runs.Run, pid: int, window_s: int, stop: threading.Event)
     for t in threads:
         t.join(timeout=tmo + 5)
 
+    if runs.get(run.id) is None:
+        return  # run deleted mid-capture — don't recreate its dir
+
     ok, out, reason = results.get("off", (False, "", "off-CPU capture didn't run."))
     if ok and out.strip():
         fg = perf_mod.fold_collapsed(out, count_is_usec=True)
@@ -518,7 +647,7 @@ def _capture_ebpf(run: runs.Run, pid: int, window_s: int, stop: threading.Event)
         "engine": "bpftrace" if use_bt else "bcc",
         "runqueue": runqueue,
         "block_io": block_io,
-        "block_io_pid": ebpf_mod.parse_biosnoop(bs_out, {pid}) if bs_ok else {"error": bs_reason},
+        "block_io_pid": ebpf_mod.parse_biosnoop(bs_out, set(_descendant_pids(pid))) if bs_ok else {"error": bs_reason},
     }
     storage.write_json(run_dir / "latency.json", latency)
     storage.record_artifact(run.id, "latency", run_dir / "latency.json")
@@ -561,15 +690,20 @@ def _run_attach_profile(run_id: str, pid: int, window_s: int) -> None:
     run = runs.get(run_id)
     if run is None:
         return
-    with _lock:
-        ctx = _active.get(run_id)
-    stop = ctx.stop_event if ctx else threading.Event()
-    ebpf_t = _start_ebpf(run, pid, window_s, stop)
-    ok, reason = _capture_profile(run, pid, window_s, stop)
-    if ebpf_t is not None:
-        ebpf_t.join(timeout=window_s + 40)
-    end_run(run_id, exit_code=0 if ok else None, exit_signal=None, ended_at=None)
-    _ensure_flamegraph_reason(Path(run.run_dir), reason)
+    try:
+        with _lock:
+            ctx = _active.get(run_id)
+        stop = ctx.stop_event if ctx else threading.Event()
+        ebpf_t = _start_ebpf(run, pid, window_s, stop)
+        ok, reason = _capture_profile(run, pid, window_s, stop)
+        if ebpf_t is not None:
+            ebpf_t.join(timeout=window_s + 40)
+        final = end_run(run_id, exit_code=0 if ok else None, exit_signal=None, ended_at=None)
+        if final is not None:  # None: run deleted mid-window — don't recreate its dir
+            _ensure_flamegraph_reason(Path(run.run_dir), reason)
+    except Exception:  # noqa: BLE001 — sole finalizer: a crash must not strand the run
+        log.exception("attach profile thread failed for run %s", run_id)
+        _fail_run(run_id)
 
 
 def _run_attach_monitor(run_id: str, pid: int, window_s: int) -> None:
@@ -583,18 +717,26 @@ def _run_attach_monitor(run_id: str, pid: int, window_s: int) -> None:
         ctx = _active.get(run_id)
     if ctx is None:
         return
-    stop = ctx.stop_event
-    reason = None
-    while not stop.is_set() and psutil.pid_exists(pid):
-        ebpf_t = _start_ebpf(run, pid, window_s, stop)  # concurrent off-CPU + latency
-        ok, reason = _capture_profile(run, pid, window_s, stop)
-        if ebpf_t is not None:
-            ebpf_t.join(timeout=window_s + 40)
-        if ok:
-            _refresh_flamegraph(run)
-        _eval_sliding_rules(ctx)
-    end_run(run_id, exit_code=0, exit_signal=None, ended_at=None)
-    _ensure_flamegraph_reason(Path(run.run_dir), reason)
+    try:
+        stop = ctx.stop_event
+        reason = None
+        while not stop.is_set() and psutil.pid_exists(pid):
+            ebpf_t = _start_ebpf(run, pid, window_s, stop)  # concurrent off-CPU + latency
+            ok, reason = _capture_profile(run, pid, window_s, stop)
+            if ebpf_t is not None:
+                ebpf_t.join(timeout=window_s + 40)
+            if stop.is_set():
+                break  # Stop/abort mid-window: no snapshot refresh, no late incidents
+            if ok and runs.get(run_id) is not None:  # deleted run: don't recreate its dir
+                _refresh_flamegraph(run)
+            _eval_sliding_rules(ctx)
+            _check_slow_leak(ctx)  # long-horizon leak the sliding window can't see
+        final = end_run(run_id, exit_code=0, exit_signal=None, ended_at=None)
+        if final is not None:
+            _ensure_flamegraph_reason(Path(run.run_dir), reason)
+    except Exception:  # noqa: BLE001 — sole finalizer: a crash must not strand the run
+        log.exception("monitor thread failed for run %s", run_id)
+        _fail_run(run_id)
 
 
 # --- live incidents (monitor mode) ------------------------------------------
@@ -627,9 +769,9 @@ def _make_incident(ctx: _RunContext, rule_id: str, severity: str, title: str, ts
                 return  # counted in-memory; throttle disk + SSE churn
             rec["last_pub"] = ts
             inc_id, count, is_new = rec["id"], rec["count"], False
-    metrics = [s.to_ndjson() for s in samples if abs(s.timestamp_ms - ts) <= _INCIDENT_WINDOW_MS]
 
     if is_new:
+        metrics = [s.to_ndjson() for s in samples if abs(s.timestamp_ms - ts) <= _INCIDENT_WINDOW_MS]
         incident = {
             "id": inc_id, "run_id": ctx.run.id, "ts": ts, "first_ts": ts, "last_ts": ts,
             "count": 1, "rule_id": rule_id, "severity": severity, "title": title,
@@ -646,7 +788,10 @@ def _make_incident(ctx: _RunContext, rule_id: str, severity: str, title: str, ts
         if hot is not None:
             _maybe_incident_ai(ctx.run, incident)
     else:
-        patch: dict = {"count": count, "last_ts": ts, "metrics": metrics}
+        # No metrics in the patch: the stored/displayed first-occurrence window
+        # persists (the frontend shallow-merges patches), and re-embedding ~19KB
+        # of samples per rule every 10s just bloats incidents.ndjson.
+        patch: dict = {"count": count, "last_ts": ts}
         if hot is not None:
             patch["hot"] = hot
         try:
@@ -697,7 +842,7 @@ def _incident_ai_worker(run_id: str, run_dir: str, incident: dict) -> None:
     broker.publish(run_id, "incident_ai", {"id": incident["id"], "ai": text})
 
 
-_SEV_RANK = {"low": 1, "medium": 2, "high": 3}
+_SEV_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
 def _incidents_to_anomalies(incidents: list[dict]) -> list[Anomaly]:
@@ -735,11 +880,16 @@ def _eval_sliding_rules(ctx: _RunContext) -> None:
     if len(window) < 8:
         return
     span = window[-1].timestamp_ms - window[0].timestamp_ms
+    cc = ctx.run.collector_config or {}
     rctx = RuleContext(
         events=[],
         metrics=[s.to_ndjson() for s in window],
         duration_ms=int(span) or None,
         cpu_cores=metrics_mod.cpu_count(),
+        collectors=cc,
+        cgroup_cpu_quota_cores=cc.get("cgroup_cpu_quota_cores"),
+        cgroup_mem_limit_bytes=cc.get("cgroup_mem_limit_bytes"),
+        thresholds=_rule_thresholds(),
     )
     try:
         found = run_rules(rctx)
@@ -749,6 +899,62 @@ def _eval_sliding_rules(ctx: _RunContext) -> None:
     for a in found:
         # cooldown-deduped inside _make_incident (re-fires after a quiet gap)
         _make_incident(ctx, a.rule_id, a.severity, a.title, window[-1].timestamp_ms)
+
+
+# Slow-leak long-horizon check (R8): the 90s sliding window can't see a ~1MB/min
+# creep, and monitor finalize derives findings only from incidents — so a slow
+# leak would be wholly invisible. We compare the full DB metric history against a
+# baseline every Nth scan and raise an incident (→ Overview, via _incidents_to_
+# anomalies) when RSS has grown steadily over a multi-minute horizon.
+_SLOW_LEAK_SCAN_EVERY = 4          # ~ every 4th monitor snapshot
+_SLOW_LEAK_MIN_HORIZON_MS = 180_000  # need >=3min of history to call it a trend
+_SLOW_LEAK_MIN_MB = 50.0           # ignore sub-50MB drift (allocator noise)
+_SLOW_LEAK_MIN_MB_PER_MIN = 0.5    # sustained creep rate to flag
+
+
+def _check_slow_leak(ctx: _RunContext) -> None:
+    """Long-horizon RSS-growth check for a live monitor run. Reads the complete
+    metric history (not just the in-memory ring buffer) every Nth scan so a leak
+    too slow for the sliding window still fires. Raises a collapsed incident, so
+    the Overview and Incidents feed stay in agreement."""
+    if not ctx.monitor:
+        return
+    ctx.scan_count += 1
+    if ctx.scan_count % _SLOW_LEAK_SCAN_EVERY != 0:
+        return
+    try:
+        rows = storage.read_metrics(ctx.run.id)
+    except Exception:  # noqa: BLE001
+        return
+    series = [(r["timestamp_ms"], r["rss_mb"]) for r in rows if r.get("rss_mb") is not None]
+    if len(series) < 20:
+        return
+    span_ms = series[-1][0] - series[0][0]
+    if span_ms < _SLOW_LEAK_MIN_HORIZON_MS:
+        return
+    # Baseline = a low-percentile of the opening tenth (robust to a warmup blip);
+    # current = median of the closing tenth (robust to a momentary spike/dip).
+    head = sorted(v for _, v in series[: max(2, len(series) // 10)])
+    tail = sorted(v for _, v in series[-max(2, len(series) // 10):])
+    if ctx.baseline_rss is None:
+        ctx.baseline_rss = head[0]
+    baseline = min(ctx.baseline_rss, head[len(head) // 2])
+    current = tail[len(tail) // 2]
+    growth = current - baseline
+    rate = growth / (span_ms / 60_000.0)  # MB per minute
+    if growth < _SLOW_LEAK_MIN_MB or rate < _SLOW_LEAK_MIN_MB_PER_MIN:
+        return
+    # Confirm it's a steady climb, not one step: majority of samples non-decreasing.
+    vals = [v for _, v in series]
+    non_decr = sum(1 for a, b in zip(vals, vals[1:]) if b >= a - 0.5)
+    if non_decr < len(vals) * 0.7:
+        return
+    _make_incident(
+        ctx, "slow_memory_leak", "high",
+        f"Slow memory leak — RSS crept {baseline:.0f}MB → {current:.0f}MB "
+        f"(~{rate:.1f}MB/min over {span_ms / 60_000.0:.0f}min)",
+        series[-1][0],
+    )
 
 
 def _auto_finalize(run_id: str) -> None:
@@ -783,12 +989,18 @@ _FD_ALERT = 200
 _RSS_SPIKE_MB = 100.0
 _CPU_HOT = 90.0          # raw % ~= one full core
 _CPU_STREAK = 8          # ~2s sustained
+_ALERT_REARM = 8         # consecutive below-threshold samples (~2s) before re-arming
 
 
 def _live_detect(ctx: _RunContext, sample: MetricSample) -> None:
     """Emit `anomaly_alert` SSE events from metric thresholds as a run unfolds, so
     the Live Monitor can warn the developer before the run even finishes. For a
-    monitor run these also become *incidents* (with when/where/leading-metrics)."""
+    monitor run these also become *incidents* (with when/where/leading-metrics).
+
+    Threshold alerts use hysteresis, not a one-shot latch: a fired key is cleared
+    (re-armed) once its metric stays below threshold for `_ALERT_REARM` samples,
+    so a genuine RE-occurrence re-alerts — and the collapsed incident count keeps
+    growing — instead of firing once and going silent forever."""
     rid = ctx.run.id
     ts = sample.timestamp_ms
 
@@ -803,21 +1015,39 @@ def _live_detect(ctx: _RunContext, sample: MetricSample) -> None:
             ctx.alerts_fired.add(key)
             emit(rule_id, severity, title)
 
-    if sample.open_fds is not None and sample.open_fds > _FD_ALERT:
-        once("fd", "fd_leak_live", "high", f"Open file descriptors exceed {_FD_ALERT} "
-                                           f"({sample.open_fds}) — possible leak")
+    def rearm(key: str, active: bool) -> None:
+        """Track how long `key` has been quiet; clear the latch once it's been
+        below threshold long enough so it can fire again on the next spike."""
+        if active:
+            ctx.alert_cooldown[key] = 0
+        else:
+            c = ctx.alert_cooldown.get(key, 0) + 1
+            ctx.alert_cooldown[key] = c
+            if c >= _ALERT_REARM:
+                ctx.alerts_fired.discard(key)
+                ctx.alert_cooldown[key] = 0
+
+    if sample.open_fds is not None:
+        fd_active = sample.open_fds > _FD_ALERT
+        if fd_active:
+            once("fd", "fd_leak_live", "high", f"Open file descriptors exceed {_FD_ALERT} "
+                                               f"({sample.open_fds}) — possible leak")
+        rearm("fd", fd_active)
     if sample.rss_mb is not None:
         if ctx.last_rss is not None and sample.rss_mb - ctx.last_rss > _RSS_SPIKE_MB:
             # incidents are cooldown-deduped in _make_incident (no per-sample spam)
             emit("mem_spike", "medium",
                  f"Memory spiked +{sample.rss_mb - ctx.last_rss:.0f}MB (now {sample.rss_mb:.0f}MB)")
         ctx.last_rss = sample.rss_mb
-    if sample.cpu_pct is not None and sample.cpu_pct > _CPU_HOT:
-        ctx.cpu_streak += 1
-        if ctx.cpu_streak == _CPU_STREAK:
-            once("cpu", "cpu_hot_live", "medium", "CPU pegged for ~2s — compute-bound")
-    elif sample.cpu_pct is not None:
-        ctx.cpu_streak = 0
+    if sample.cpu_pct is not None:
+        if sample.cpu_pct > _CPU_HOT:
+            ctx.cpu_streak += 1
+            if ctx.cpu_streak == _CPU_STREAK:
+                once("cpu", "cpu_hot_live", "medium", "CPU pegged for ~2s — compute-bound")
+            rearm("cpu", True)
+        else:
+            ctx.cpu_streak = 0
+            rearm("cpu", False)
 
 
 def end_run(
@@ -828,18 +1058,26 @@ def end_run(
     ended_at: int | None = None,
     _stop_poller: bool = True,
 ) -> runs.Run | None:
-    run = runs.get(run_id)
-    if run is None:
-        return None
+    # Teardown BEFORE the missing-row check: a run deleted while active must
+    # still have its context popped, monitor loop stopped, and poller torn down
+    # — otherwise the ctx leaks in `_active` forever.
     with _lock:
         ctx = _active.pop(run_id, None)
+    if ctx is not None:
+        # Stop a live monitor loop too — otherwise a finalize from elsewhere
+        # (e.g. a generic POST /runs/{id}/end) leaves the monitor thread spawning
+        # profilers and appending incidents to an already-completed run.
+        ctx.stop_event.set()
+    run = runs.get(run_id)
+    if run is None:
+        # Row deleted out from under a live run: wind down, nothing to finalize.
+        # (_stop_poller=False means we're ON the poller thread — never join it.)
+        if ctx is not None and ctx.poller is not None and _stop_poller:
+            ctx.poller.stop()
+        return None
     if ctx is None:
         # Already finalized (e.g. by _auto_finalize racing a real /end).
         return run
-    # Stop a live monitor loop too — otherwise a finalize from elsewhere (e.g. a
-    # generic POST /runs/{id}/end) leaves the monitor thread spawning profilers and
-    # appending incidents to an already-completed run.
-    ctx.stop_event.set()
     if ctx.poller is not None and _stop_poller:
         # One last sample to catch end-of-run state, then stop the thread.
         try:
@@ -850,22 +1088,32 @@ def end_run(
             pass
         ctx.poller.stop()
 
-    runs.set_status(run_id, runs.ANALYZING)
-    broker.publish(run_id, "run_analyzing", {"id": run_id})
+    final = None
     try:
+        runs.set_status(run_id, runs.ANALYZING)
+        broker.publish(run_id, "run_analyzing", {"id": run_id})
         final = _finalize(run, ctx, exit_code, exit_signal, ended_at)
     except Exception:  # noqa: BLE001
         log.exception("finalize failed for run %s", run_id)
-        final = runs.finalize(
-            run_id, ended_at=ended_at, exit_code=exit_code,
-            exit_signal=exit_signal, status=runs.ERROR,
-        )
+        try:
+            final = runs.finalize(
+                run_id, ended_at=ended_at, exit_code=exit_code,
+                exit_signal=exit_signal, status=runs.ERROR,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("error-finalize failed for run %s", run_id)
     broker.publish(run_id, "run_ended", final.model_dump() if final else {"id": run_id})
     log.info("run %s finalized (severity=%s)", run_id, final.max_severity if final else "?")
     return final
 
 
 # --- finalize ---------------------------------------------------------------
+
+# Cap on events held in memory for analysis. The complete stream still goes to
+# events.ndjson.zst; past the cap only running totals are kept, so a traced
+# build/find-style command (tens of millions of syscalls) can't OOM the backend.
+_MAX_ANALYZED_EVENTS = 1_000_000
+
 
 def _finalize(
     run: runs.Run,
@@ -883,20 +1131,35 @@ def _finalize(
     if use_ltrace:
         trace_log = run_dir / "ltrace.log"
         trace_kind = "ltrace-log"
-        events: list[TraceEvent] = (
-            list(ltrace_parser.parse_file(trace_log)) if trace_log.exists() else []
-        )
+        parser = ltrace_parser
     else:
         trace_log = run_dir / "strace.log"
         trace_kind = "strace-log"
-        events = (
-            list(strace_parser.parse_file(trace_log)) if trace_log.exists() else []
-        )
+        parser = strace_parser
 
-    # Full event stream -> compressed ndjson (source of truth for replay).
-    storage.write_ndjson_zst(
-        run_dir / "events.ndjson.zst", (e.to_ndjson() for e in events)
-    )
+    # Single pass: every event streams straight into the compressed archive
+    # (source of truth for replay), but only the first _MAX_ANALYZED_EVENTS stay
+    # in memory for rules/curation. Full-stream counters keep the summary honest.
+    events: list[TraceEvent] = []
+    stream_totals: Counter = Counter()
+    top_syscalls: Counter = Counter()
+
+    def _tee():
+        for ev in (parser.parse_file(trace_log) if trace_log.exists() else ()):
+            stream_totals["events"] += 1
+            if ev.event_type == SIGNAL:
+                stream_totals["signals"] += 1
+            elif ev.event_type not in (EXIT, LIBCALL):
+                stream_totals["syscall_events"] += 1
+                if ev.error is not None:
+                    stream_totals["errors"] += 1
+                if ev.syscall:
+                    top_syscalls[ev.syscall] += 1
+            if len(events) < _MAX_ANALYZED_EVENTS:
+                events.append(ev)
+            yield ev.to_ndjson()
+
+    storage.write_ndjson_zst(run_dir / "events.ndjson.zst", _tee())
 
     # Syscall-oriented analysis (rate, rules, summary) must NOT see ltrace
     # LIBCALL events: they're profiled separately and would otherwise inflate the
@@ -925,16 +1188,32 @@ def _finalize(
             metrics=metrics_rows,
             duration_ms=run.duration_ms,
             cpu_cores=metrics_mod.cpu_count(),
+            collectors=collectors,
+            cgroup_cpu_quota_cores=collectors.get("cgroup_cpu_quota_cores"),
+            cgroup_mem_limit_bytes=collectors.get("cgroup_mem_limit_bytes"),
+            thresholds=_rule_thresholds(),
         )
         anomalies = run_rules(rctx)
 
+    # Fail-open note when the in-memory cap truncated the analysis window.
+    if stream_totals["events"] > len(events):
+        anomalies.append(Anomaly(
+            rule_id="analysis_truncated",
+            severity="low",
+            severity_score=0.1,
+            title=f"Analysis truncated after {len(events):,} of "
+                  f"{stream_totals['events']:,} events",
+            description="The complete stream is archived in events.ndjson.zst; "
+                        "rules, curation, and syscall rates were computed over "
+                        f"the first {len(events):,} events only.",
+        ))
+
     # Phase-6 profiling artifacts (only for the collectors that ran).
     if use_ltrace and events:
-        event_dicts = [e.to_ndjson() for e in events]
-        prof = profile_mod.malloc_profile(event_dicts)
+        prof = profile_mod.malloc_profile(e.to_ndjson() for e in events)
         storage.write_json(run_dir / "profile.json", {
             "malloc": prof,
-            "hotspots": profile_mod.libcall_stats(event_dicts),
+            "hotspots": profile_mod.libcall_stats(e.to_ndjson() for e in events),
         })
         storage.record_artifact(run.id, "profile", run_dir / "profile.json")
         anomalies.extend(profile_mod.profile_anomalies(prof, run.duration_ms))
@@ -981,7 +1260,15 @@ def _finalize(
         storage.record_artifact(run.id, kind, path)
 
     # Human-readable meta.json summary (syscall totals exclude library calls).
-    summary = _summary(run, syscall_events, metrics_rows, anomalies, exit_code, exit_signal)
+    # Totals come from the full-stream counters, so they stay honest even when
+    # the in-memory analysis window was truncated.
+    totals = {
+        "syscall_events": stream_totals["syscall_events"],
+        "errors": stream_totals["errors"],
+        "signals": stream_totals["signals"],
+        "top_syscalls": top_syscalls.most_common(10),
+    }
+    summary = _summary(run, totals, metrics_rows, anomalies, exit_code, exit_signal)
     storage.write_meta(run_dir, summary)
     storage.record_artifact(run.id, "meta", run_dir / "meta.json")
 
@@ -1063,16 +1350,12 @@ def _is_lib(path: str | None) -> bool:
 
 def _summary(
     run: runs.Run,
-    events: list[TraceEvent],
+    totals: dict,
     metrics_rows: list[dict],
     anomalies: list,
     exit_code: int | None,
     exit_signal: str | None,
 ) -> dict:
-    syscalls = [e for e in events if e.event_type not in (SIGNAL, EXIT)]
-    errors = [e for e in syscalls if e.error is not None]
-    top = Counter(e.syscall for e in syscalls if e.syscall).most_common(10)
-
     def peak(key: str) -> float | None:
         vals = [m[key] for m in metrics_rows if m.get(key) is not None]
         return round(max(vals), 3) if vals else None
@@ -1090,11 +1373,11 @@ def _summary(
         "exit_code": exit_code,
         "exit_signal": exit_signal,
         "totals": {
-            "syscall_events": len(syscalls),
-            "errors": len(errors),
-            "signals": sum(1 for e in events if e.event_type == SIGNAL),
+            "syscall_events": totals.get("syscall_events", 0),
+            "errors": totals.get("errors", 0),
+            "signals": totals.get("signals", 0),
             "metric_samples": len(metrics_rows),
-            "top_syscalls": top,
+            "top_syscalls": totals.get("top_syscalls", []),
         },
         "peaks": {
             "rss_mb": peak("rss_mb"),

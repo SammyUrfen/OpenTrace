@@ -1,3 +1,5 @@
+import { downsamplePoints, maxOf, minOf } from './seriesUtils'
+
 export interface Series {
   name: string
   color: string
@@ -43,18 +45,20 @@ export function TimeSeriesChart({
   const fin = (pts: [number, number][]) =>
     pts.filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]))
   // Pre-filter every series to finite points so a stray NaN/Infinity can never
-  // poison the axis scaling or produce a degenerate SVG path.
-  const cleaned = series.map((s) => ({ ...s, points: fin(s.points) }))
+  // poison the axis scaling or produce a degenerate SVG path, then decimate to
+  // a bounded point budget — multi-hour monitor runs otherwise produce
+  // multi-hundred-KB paths that freeze the renderer.
+  const cleaned = series.map((s) => ({ ...s, points: downsamplePoints(fin(s.points)) }))
   const allPts = cleaned.flatMap((s) => s.points)
   const hasData = allPts.length >= 2
 
-  const tMin = hasData ? Math.min(...allPts.map((p) => p[0])) : 0
-  const tMax = hasData ? Math.max(...allPts.map((p) => p[0])) : 1
+  const tMin = hasData ? (minOf(allPts, (p) => p[0]) ?? 0) : 0
+  const tMax = hasData ? (maxOf(allPts, (p) => p[0]) ?? 1) : 1
   const tSpan = tMax - tMin || 1
   const vMaxRaw = Math.max(
     yMax ?? 0,
-    ...allPts.map((p) => p[1]),
-    ...thresholds.map((t) => t.value),
+    maxOf(allPts, (p) => p[1]) ?? 0,
+    maxOf(thresholds, (t) => t.value) ?? 0,
     1,
   )
   const vMax = yMax ?? vMaxRaw * 1.1

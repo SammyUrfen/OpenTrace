@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useRunResource } from './useRunResource'
 
 export interface SyscallStat {
   syscall: string
@@ -13,35 +13,5 @@ export interface SyscallStat {
 }
 
 /** Lazily fetch per-syscall stats for a run (only when the tab mounts). */
-export function useSyscalls(backendUrl: string, runId: string | null) {
-  const [rows, setRows] = useState<SyscallStat[]>([])
-  const [loading, setLoading] = useState(false)
-
-  useEffect(() => {
-    if (!runId) {
-      setRows([])
-      return
-    }
-    let cancelled = false
-    setLoading(true)
-    fetch(`${backendUrl}/runs/${runId}/syscalls`)
-      .then((r) => (r.ok ? r.json() : []))
-      .then((data: SyscallStat[]) => {
-        if (!cancelled) {
-          setRows(data)
-          setLoading(false)
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setRows([])
-          setLoading(false)
-        }
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [backendUrl, runId])
-
-  return { rows, loading }
-}
+export const useSyscalls = (backendUrl: string, runId: string | null) =>
+  useRunResource<SyscallStat>(backendUrl, runId, 'syscalls')

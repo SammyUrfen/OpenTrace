@@ -2,7 +2,7 @@
 
 Creates `paths.sessions_db()` and the OpenTrace schema (the three-level
 sessions -> terminals -> runs model from the user's data-model spec, plus the
-per-run `run_views`, `events`, `metrics`, `anomalies`, and `artifacts` tables).
+per-run `events`, `metrics`, `anomalies`, and `artifacts` tables).
 
 A *session* is a project/workspace (e.g. "My-compiler-app"); a *terminal* is a
 shell living inside it; a *run* is a single traced command execution. Everything
@@ -89,15 +89,6 @@ CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, started_at DESC)
 CREATE INDEX IF NOT EXISTS idx_runs_terminal ON runs(terminal_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 
--- Per-run, per-view persisted UI state (overview, timeline, memory, ...).
-CREATE TABLE IF NOT EXISTS run_views (
-    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-    view_name TEXT NOT NULL,
-    state_json TEXT NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (run_id, view_name)
-);
-
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -154,7 +145,9 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
 # applied exactly once when the on-disk version is older. Keep migrations
 # additive and idempotent where possible.
 MIGRATIONS: list[tuple[int, str]] = [
-    # (2, "ALTER TABLE runs ADD COLUMN ..."),
+    # v2: the run_views feature (per-run persisted UI state) was removed
+    # before any client ever used it; clean the orphan table from older DBs.
+    (2, "DROP TABLE IF EXISTS run_views;"),
 ]
 
 CURRENT_VERSION = 1 + len(MIGRATIONS)

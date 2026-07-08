@@ -1,7 +1,9 @@
-import type { ReactNode } from 'react'
-import type { Incident, LiveState, Run } from '../state/useOpenTrace'
+import { memo, type ReactNode } from 'react'
+import type { Incident, Run } from '../state/useOpenTrace'
 import type { RunDetail } from '../state/useRunDetail'
+import { useLiveMetrics } from '../state/liveMetrics'
 import type { ViewDef } from './SecondaryTabs'
+import { ErrorBoundary } from './ErrorBoundary'
 import { IncidentFeed } from './IncidentFeed'
 import { TabGuide } from './TabGuide'
 import { OverviewTab } from './OverviewTab'
@@ -17,19 +19,6 @@ import { ProfilingTab } from './ProfilingTab'
 import { FlamegraphTab } from './FlamegraphTab'
 import { LatencyTab } from './LatencyTab'
 import { FilesTab } from './FilesTab'
-
-/** The set of analytics views available for a run. Extended as tabs land. */
-export const RUN_VIEWS: ViewDef[] = [
-  { key: 'overview', label: 'Overview' },
-  { key: 'timeline', label: 'Timeline' },
-  { key: 'memory', label: 'Memory' },
-  { key: 'cpu', label: 'CPU' },
-  { key: 'io', label: 'I/O' },
-  { key: 'network', label: 'Network' },
-  { key: 'processes', label: 'Processes' },
-  { key: 'syscalls', label: 'Syscalls' },
-  { key: 'logs', label: 'Logs' },
-]
 
 /** Views for a specific run, reflecting which collectors actually ran:
  *  - psutil  -> Overview / Timeline / Memory / CPU (always shown)
@@ -69,7 +58,6 @@ export function runViews(run: Run | null): ViewDef[] {
 interface Props {
   run: Run
   detail: RunDetail
-  live: LiveState | null
   activeView: string
   backendUrl: string
   onOpenSettings: () => void
@@ -80,9 +68,27 @@ interface Props {
   onStopMonitor?: () => void
 }
 
+/** Overview with the live metric subscription scoped to this subtree, so the
+ *  4Hz SSE sample stream re-renders only the visible Overview of a live run. */
+function LiveOverview({
+  run, detail, backendUrl, onOpenSettings, incidents,
+}: Pick<Props, 'run' | 'detail' | 'backendUrl' | 'onOpenSettings' | 'incidents'>) {
+  const live = useLiveMetrics(run.status === 'running' ? run.id : null)
+  return (
+    <OverviewTab
+      run={run}
+      detail={detail}
+      live={live}
+      backendUrl={backendUrl}
+      onOpenSettings={onOpenSettings}
+      incidents={incidents}
+    />
+  )
+}
+
 /** Main content for an open run: renders the selected analytics view. */
-export function RunView({
-  run, detail, live, activeView, backendUrl, onOpenSettings, topSlot, incidents, onStopMonitor,
+export const RunView = memo(function RunView({
+  run, detail, activeView, backendUrl, onOpenSettings, topSlot, incidents, onStopMonitor,
 }: Props) {
   const isLiveMonitor = !!run.collector_config?.monitor && run.status === 'running'
   return (
@@ -97,16 +103,19 @@ export function RunView({
         </div>
       )}
       {topSlot}
+      {/* one bad view renders an inline error + Retry instead of blanking the app;
+          switching tab or run resets the boundary */}
+      <ErrorBoundary resetKey={`${run.id}:${activeView}`}>
       {activeView === 'incidents' && (
         <IncidentFeed backendUrl={backendUrl} runId={run.id} live={incidents ?? []} />
       )}
       {activeView === 'overview' && (
-        <OverviewTab
+        <LiveOverview
           run={run}
           detail={detail}
-          live={live}
           backendUrl={backendUrl}
           onOpenSettings={onOpenSettings}
+          incidents={incidents}
         />
       )}
       {activeView === 'timeline' && (
@@ -127,7 +136,8 @@ export function RunView({
       )}
       {activeView === 'latency' && <LatencyTab backendUrl={backendUrl} runId={run.id} />}
       {activeView === 'files' && <FilesTab backendUrl={backendUrl} runId={run.id} />}
+      </ErrorBoundary>
       <TabGuide view={activeView} />
     </div>
   )
-}
+})

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { MetricSample } from './useOpenTrace'
+import { cachedFetch, fetchJsonStrict } from './runCache'
 
 /** Mirrors `app.storage.read_anomalies` rows. */
 export interface Anomaly {
@@ -50,20 +51,14 @@ export interface RunDetail {
   loading: boolean
 }
 
-async function getJson<T>(url: string, fallback: T): Promise<T> {
-  try {
-    const r = await fetch(url)
-    if (!r.ok) return fallback
-    return (await r.json()) as T
-  } catch {
-    return fallback
-  }
-}
-
 /**
  * Fetch a run's analytical detail (summary + metrics + anomalies). Re-fetches
- * when `runId` or `statusKey` changes — pass the run's status as `statusKey` so
- * a still-running run's detail refreshes once it finalizes.
+ * when `runId` changes or the run finalizes — pass the run's status as
+ * `statusKey` so a still-running run's detail refreshes once it's done. The
+ * dependency is the derived `finalized` boolean (not the raw status) so the
+ * transient running→analyzing hop doesn't trigger a wasted full refetch.
+ * Finalized runs are immutable, so their payloads are served from the shared
+ * run cache on revisit instead of re-downloading the full metrics array.
  */
 export function useRunDetail(
   backendUrl: string,
@@ -76,6 +71,7 @@ export function useRunDetail(
     anomalies: [],
     loading: false,
   })
+  const finalized = statusKey !== 'running' && statusKey !== 'analyzing'
 
   useEffect(() => {
     if (!runId) {
@@ -84,10 +80,16 @@ export function useRunDetail(
     }
     let cancelled = false
     setDetail((d) => ({ ...d, loading: true }))
+    const get = <T,>(resource: string, fallback: T): Promise<T> => {
+      const url = `${backendUrl}/runs/${runId}/${resource}`
+      return cachedFetch<T>(runId, url, finalized, () => fetchJsonStrict<T>(url)).catch(
+        () => fallback,
+      )
+    }
     Promise.all([
-      getJson<RunSummary | null>(`${backendUrl}/runs/${runId}/summary`, null),
-      getJson<MetricSample[]>(`${backendUrl}/runs/${runId}/metrics`, []),
-      getJson<Anomaly[]>(`${backendUrl}/runs/${runId}/anomalies`, []),
+      get<RunSummary | null>('summary', null),
+      get<MetricSample[]>('metrics', []),
+      get<Anomaly[]>('anomalies', []),
     ]).then(([summary, metrics, anomalies]) => {
       if (cancelled) return
       setDetail({ summary, metrics, anomalies, loading: false })
@@ -95,7 +97,7 @@ export function useRunDetail(
     return () => {
       cancelled = true
     }
-  }, [backendUrl, runId, statusKey])
+  }, [backendUrl, runId, finalized])
 
   return detail
 }

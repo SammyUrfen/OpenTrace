@@ -1,29 +1,16 @@
-import type { MetricSample } from '../state/useOpenTrace'
+import { useMemo } from 'react'
 import type { RunDetail } from '../state/useRunDetail'
+import { maxOf, pts } from './seriesUtils'
+import { StatCell } from './StatCell'
 import { TimeSeriesChart } from './TimeSeriesChart'
-
-function pts(metrics: MetricSample[], key: keyof MetricSample): [number, number][] {
-  return metrics
-    .filter((m) => m[key] != null)
-    .map((m) => [m.timestamp_ms, m[key] as number])
-}
-
-function StatCell({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="stat-cell">
-      <div className="stat-cell__value">{value}</div>
-      <div className="stat-cell__label">{label}</div>
-    </div>
-  )
-}
 
 export function MemoryTab({ detail }: { detail: RunDetail }) {
   const { metrics, anomalies } = detail
-  const rss = pts(metrics, 'rss_mb')
-  const vms = pts(metrics, 'vms_mb')
+  const rss = useMemo(() => pts(metrics, 'rss_mb'), [metrics])
+  const vms = useMemo(() => pts(metrics, 'vms_mb'), [metrics])
   const growth = anomalies.find((a) => a.rule_id === 'monotonic_memory_growth')
-  const peakRss = rss.length ? Math.max(...rss.map((p) => p[1])) : null
-  const peakVms = vms.length ? Math.max(...vms.map((p) => p[1])) : null
+  const peakRss = maxOf(rss, (p) => p[1])
+  const peakVms = maxOf(vms, (p) => p[1])
   const avgRss = rss.length ? rss.reduce((s, p) => s + p[1], 0) / rss.length : null
 
   return (

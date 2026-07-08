@@ -1,5 +1,13 @@
 import '@testing-library/jest-dom/vitest'
-import { vi } from 'vitest'
+import { beforeEach, vi } from 'vitest'
+import { clearRunCache } from '../state/runCache'
+
+// The run fetch-cache is module-level state: reset it between tests so one
+// test's mocked payload can never satisfy another test's fetch for the same
+// run id.
+beforeEach(() => {
+  clearRunCache()
+})
 
 // jsdom has no fetch/EventSource; stub benign defaults so components that load
 // data on mount don't throw during unit tests. Individual tests can override.

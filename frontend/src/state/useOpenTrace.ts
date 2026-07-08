@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { evictLiveMetrics, recordLiveSample } from './liveMetrics'
+import { clearRunCache, registerRunStatuses } from './runCache'
 
 /** Mirrors `app.sessions.Session` (a project/workspace). */
 export interface Project {
@@ -73,20 +75,14 @@ export interface Incident {
   title: string
   hot: { functions: string[]; stack: string[]; samples?: number } | null
   metrics: MetricSample[]
+  /** true sample count when the endpoint downsampled the embedded window */
+  metrics_n?: number
   ai: string | null
-}
-
-const RING = 120 // samples kept per series for the sparklines
-
-function push(arr: number[], v: number | null): number[] {
-  const next = arr.concat(v ?? 0)
-  return next.length > RING ? next.slice(next.length - RING) : next
 }
 
 interface Hook {
   projects: Project[]
   runs: Run[]
-  live: Record<string, LiveState>
   alerts: Record<string, LiveAlert[]>
   /** monitor-mode incidents keyed by runId, newest first */
   incidents: Record<string, Incident[]>
@@ -103,6 +99,8 @@ interface Hook {
    *  pruning restored tabs before the run list has loaded). */
   loaded: boolean
   refresh: () => Promise<void>
+  /** Merge a run fetched outside the newest-200 window into local state. */
+  upsertRun: (run: Run) => void
   deleteRun: (id: string) => Promise<void>
   stopMonitor: (id: string) => Promise<void>
   renameRun: (id: string, displayName: string) => Promise<void>
@@ -117,7 +115,6 @@ interface Hook {
 export function useOpenTrace(backendUrl: string): Hook {
   const [projects, setProjects] = useState<Project[]>([])
   const [runs, setRuns] = useState<Run[]>([])
-  const [live, setLive] = useState<Record<string, LiveState>>({})
   const [alerts, setAlerts] = useState<Record<string, LiveAlert[]>>({})
   const [incidents, setIncidents] = useState<Record<string, Incident[]>>({})
   const [liveRunId, setLiveRunId] = useState<string | null>(null)
@@ -125,7 +122,6 @@ export function useOpenTrace(backendUrl: string): Hook {
   const [connected, setConnected] = useState(false)
   const [connectionError, setConnectionError] = useState(false)
   const [loaded, setLoaded] = useState(false)
-  const esRef = useRef<EventSource | null>(null)
   const endCount = useRef(0)
 
   const refresh = useCallback(async () => {
@@ -137,6 +133,22 @@ export function useOpenTrace(backendUrl: string): Hook {
       setProjects(p)
       setRuns(r)
       setLoaded(true)
+      // Reconcile live-run state: a run that finished while the stream was
+      // down (suspend, backend restart) never delivered its run_ended, so
+      // drop its live indicator, alerts and ring buffers here — refresh()
+      // runs on every SSE (re)connect, making it the resync path.
+      const ended = new Set(
+        (r as Run[]).filter((x) => x.status !== 'running').map((x) => x.id),
+      )
+      setLiveRunId((cur) => (cur && ended.has(cur) ? null : cur))
+      setAlerts((prev) => {
+        const stale = Object.keys(prev).filter((id) => ended.has(id))
+        if (stale.length === 0) return prev
+        const next = { ...prev }
+        for (const id of stale) delete next[id]
+        return next
+      })
+      ended.forEach((id) => evictLiveMetrics(id))
     } catch {
       /* backend not up yet; SSE + retry will catch up */
     }
@@ -164,7 +176,8 @@ export function useOpenTrace(backendUrl: string): Hook {
       }
       setIncidents(drop)
       setAlerts(drop)
-      setLive(drop)
+      evictLiveMetrics(id)
+      clearRunCache(id)
     },
     [backendUrl],
   )
@@ -243,11 +256,18 @@ export function useOpenTrace(backendUrl: string): Hook {
     [backendUrl],
   )
 
+  // Keep the run-status registry in sync so the per-run fetch cache knows
+  // which runs are finalized (immutable) — see state/runCache.ts.
+  useEffect(() => {
+    registerRunStatuses(runs)
+  }, [runs])
+
   useEffect(() => {
     void refresh()
     const es = new EventSource(`${backendUrl}/stream`)
-    esRef.current = es
-    es.onopen = () => { setConnected(true); setConnectionError(false) }
+    // Re-sync on every (re)connect: lifecycle events emitted while the stream
+    // was down are gone for good (the broker has no replay), so refetch.
+    es.onopen = () => { setConnected(true); setConnectionError(false); void refresh() }
     es.onerror = () => { setConnected(false); setConnectionError(true) }
     es.onmessage = (ev) => {
       let msg: { type: string; run_id: string; data: any }
@@ -290,13 +310,11 @@ export function useOpenTrace(backendUrl: string): Hook {
         setLiveRunId((cur) => (cur === run_id ? null : cur))
         endCount.current += 1
         setLastEnded({ id: run_id, n: endCount.current })
-        // Drop the finished run's live ring buffers so `live` can't grow without
-        // bound over a long session (the run's metrics are persisted server-side).
-        setLive((prev) => {
-          if (!(run_id in prev)) return prev
-          const { [run_id]: _dropped, ...rest } = prev
-          return rest
-        })
+        // Drop the finished run's live ring buffers so the store can't grow
+        // without bound over a long session (metrics persist server-side), and
+        // defensively clear any cached fetches made before it finalized.
+        evictLiveMetrics(run_id)
+        clearRunCache(run_id)
         // live alerts are superseded by the finalized anomalies/incidents; drop them
         setAlerts((prev) => {
           if (!(run_id in prev)) return prev
@@ -304,19 +322,9 @@ export function useOpenTrace(backendUrl: string): Hook {
           return rest
         })
       } else if (type === 'metric') {
-        const s = data as MetricSample
-        setLive((prev) => {
-          const cur = prev[run_id] ?? { latest: null, cpu: [], rss: [], fds: [] }
-          return {
-            ...prev,
-            [run_id]: {
-              latest: s,
-              cpu: push(cur.cpu, s.cpu_pct),
-              rss: push(cur.rss, s.rss_mb),
-              fds: push(cur.fds, s.open_fds),
-            },
-          }
-        })
+        // Deliberately NOT React state: 4 samples/s per live run would
+        // re-render the whole app — subscribers pull from the module store.
+        recordLiveSample(run_id, data as MetricSample)
       }
     }
 
@@ -331,13 +339,12 @@ export function useOpenTrace(backendUrl: string): Hook {
 
     return () => {
       es.close()
-      esRef.current = null
     }
   }, [backendUrl, refresh, upsertRun])
 
   return {
-    projects, runs, live, alerts, incidents, liveRunId, lastEnded, connected,
-    connectionError, loaded, refresh, deleteRun, stopMonitor, renameRun,
-    createSession, renameSession,
+    projects, runs, alerts, incidents, liveRunId, lastEnded, connected,
+    connectionError, loaded, refresh, upsertRun, deleteRun, stopMonitor,
+    renameRun, createSession, renameSession,
   }
 }

@@ -30,8 +30,9 @@ npm test             # vitest run
 npm run lint         # eslint
 npx tsc --noEmit     # typecheck only (fast gate)
 
-# Full app (repo root, conda env active)
-./start.sh           # builds frontend if dist/ missing, launches Electron+backend
+# Full app (repo root)
+./start.sh           # installs frontend deps + builds if dist/ missing, launches Electron+backend
+                     # (probes $OPENTRACE_PYTHON — default `python`/`python3` — for the backend deps; any env works)
 ```
 
 `start.sh` pins `OPENTRACE_HOME=$ROOT/tmp-opentrace` (dev-local data). Electron uses `OPENTRACE_PYTHON` to spawn the backend and `OPENTRACE_DEV=1` to serve the Vite dev server instead of `dist/`.
@@ -48,7 +49,7 @@ npx tsc --noEmit     # typecheck only (fast gate)
 
 ## Architecture principles (cross-cutting, not obvious from one file)
 
-**Data spine.** `sessions` (projects) → `terminals` → `runs`; every analytical table (`events`, `metrics`, `anomalies`, `artifacts`, `run_views`) hangs off `run_id` (`backend/app/db.py`). On disk under `~/.opentrace/`, a run keeps the *complete* compressed record (`events.ndjson.zst`, `metrics.ndjson.zst`) while SQLite stores all metrics but only a **curated** event subset (errors, lifecycle, slow calls, anomaly evidence) to stay small.
+**Data spine.** `sessions` (projects) → `terminals` → `runs`; every analytical table (`events`, `metrics`, `anomalies`, `artifacts`) hangs off `run_id` (`backend/app/db.py`). On disk under `~/.opentrace/`, a run keeps the *complete* compressed record (`events.ndjson.zst`, `metrics.ndjson.zst`) while SQLite stores all metrics but only a **curated** event subset (errors, lifecycle, slow calls, anomaly evidence) to stay small.
 
 **Two ways a run is created, one analysis pipeline.** (1) *Launch-trace:* the zsh `accept-line` widget rewrites `python app.py` → `otrace -- python app.py` before the shell parses it (native foreground job semantics preserved); `otrace` does the `/runs/start`→pid→`/runs/end` handshake. (2) *Attach:* `POST /runs/attach {pid|port, window_s, monitor, ebpf}` profiles an existing process for a bounded window. Both converge on `trace/orchestrator.py` (`_finalize`) → the same folded-flamegraph, metrics, rule-engine, anomaly pipeline.
 
@@ -60,19 +61,25 @@ npx tsc --noEmit     # typecheck only (fast gate)
 
 **Universal profiling fold.** `perf.py::_fold_stacks` is the shared core (weighted root→leaf stacks). Every sampler feeds it via a format-specific folder: `fold_perf_script`, `fold_collapsed` (py-spy/asprof/phpspy/bcc), `fold_speedscope` (rbspy/dotnet-trace), `fold_cpuprofile` (Node/V8). `attach.py`'s registry (`_SAMPLERS`/`profiler_plan`/`sampler_argv`) picks the best available per-runtime profiler; Node/Deno/Bun use the built-in V8 inspector via `node_cdp.py` (SIGUSR1→CDP over a hand-rolled WebSocket, no external tool). `_fold_profile` dispatches on the run's `profile_format`.
 
-**Live monitor + incidents.** A `monitor` attach run repeats bounded profiling snapshots + sliding-window rule scans → an Incident feed. Incidents **collapse by rule** (one row with an occurrence count, not one per re-fire). For monitor runs the Overview "Top Findings" are **derived from the incidents** so the two always agree — preserve that invariant if you touch `orchestrator._make_incident` / `_incidents_to_anomalies` / `_finalize`.
+**Live monitor + incidents.** A `monitor` attach run repeats bounded profiling snapshots + sliding-window rule scans → an Incident feed. Incidents **collapse by rule** (one row with an occurrence count, not one per re-fire). For monitor runs the Overview "Top Findings" are **derived from the incidents** so the two always agree — preserve that invariant if you touch `orchestrator._make_incident` / `_incidents_to_anomalies` / `_finalize`. The frontend also derives a live monitor run's Overview findings from the live incident SSE store (not the not-yet-written finalized anomalies), so the Overview and Incidents tabs agree *during* the run too. Live alerts re-arm via hysteresis; a monitor run additionally runs a long-horizon slow-leak check (full metric history vs a start baseline) that the ~90s sliding window can't catch.
+
+**Rule engine is signal-gated.** Each rule in `rules/engine.py` is tagged with the signal it needs (`events` vs `metrics`); `run_rules` only invokes rules whose input is present, so attach/monitor runs (no syscall stream) get **metric-only** rules (`cpu_bound_metric`, `io_wait_metric`, cgroup-aware `cpu_throttled` / `rss_near_cgroup_limit`) instead of an events-rule mis-firing on absent data. `RuleContext` carries a `collectors` dict, optional cgroup limits, and `RuleThresholds` (defaults overridable via `config.tracing.rule_thresholds`). `slow_downstream_peer` attributes a launch run's slowness to a socket peer. When you add an anomaly source, keep it fail-open and route monitor findings through `_make_incident` (there are several parallel generators — `run_rules`/`perf`/`profile`/`latency` — a shared protocol is deferred to the request-tracing phase).
 
 **eBPF (Phase D/E, `backend/app/ebpf.py`).** Off-CPU flamegraphs + run-queue/block-I/O latency + Python GC (USDT), all capability-gated (`GET /runs/attach/ebpf-capabilities`) and fail-open. Hard-won specifics baked into the code:
 - eBPF needs privilege (root / `CAP_BPF`+`CAP_PERFMON` / passwordless sudo for the tools) — the probe checks all paths. `unprivileged_bpf_disabled=0` does **not** suffice for tracing programs.
 - On very new kernels bcc's bundled headers fail to compile most tools (`runqlat`/`biolatency`/`biosnoop`/`pythongc`); only `offcputime` survives. So **bpftrace (CO-RE) is the preferred engine** for the latency histograms + GC when available; `offcputime` (folded stacks) stays on bcc.
 - The latency+GC bpftrace runs as **one combined program** (avoids concurrent CO-RE compiles wedging each other) and **without `-p PID`** (which silently pid-filters *all* probes and kills the system-wide sched/block tracepoints) — GC is scoped by an in-script `/pid==PID/` filter instead.
 - `_run_proc` captures stdout+stderr to **temp files, never pipes** — an undrained PIPE fills its 64KB buffer and deadlocks a verbose eBPF child.
+- A stuck sudo-wrapped tool is killed via relayed SIGTERM then `sudo -n kill` of the snapshotted child pid — never a bare SIGKILL of the sudo frontend (that orphans the root child).
+- `ebpf.capabilities()`/`bpftrace_available()` and `tools.detect()` are TTL-cached (60s/30s); pass `refresh=True` (or `?refresh=true` on their endpoints) after installing tools.
 
 **Container awareness (`backend/app/container.py`).** Pure `/proc` parsing (no root): label a target's container from its cgroup (docker/podman/containerd/cri-o/k8s, cgroup v1+v2) and resolve a container-local PID → host PID via `NSpid`.
 
 ## Gotchas
 
-- Secrets: the LLM API key lives only in the file-based secret store (`~/.opentrace/secrets/`), never in `config.json` or git.
+- Secrets: the LLM API key lives only in the file-based secret store (`~/.opentrace/secrets/`), never in `config.json` or git. Changing the LLM `base_url` without re-entering the key **clears** the stored key (exfiltration guard) — preserve that invariant in `llm.py`.
+- The API allows only local callers: real web `Origin`s and non-localhost `Host` headers get 403 (`main.py` LocalOnlyMiddleware). Electron `file://`, Vite `:5173`, and curl all pass; don't reopen wildcard CORS.
+- `POST /runs/attach` rejects pids owned by other users (unless the backend runs as root) and caps concurrent attach contexts at 16.
 - Don't `sudo npm install` in `electron/` (ownership breakage); packaging needs a `node-pty` native rebuild for the target Electron ABI (`npm run rebuild`).
 - ltrace mode only sees the main binary's PLT calls → suits native (C/C++/Rust) programs, not interpreted ones.
 - The zsh hook must keep shell history showing the command *as typed* (a `zshaddhistory` hook strips the `otrace --` wrapper); test hook changes in a real pty, not just by eye.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -84,7 +85,19 @@ def _perf_paranoid() -> int | None:
         return None
 
 
-def detect() -> dict:
+# The `--version` subprocess probes are pure fixed cost for data that only changes
+# when the user installs a package — cache briefly. The Settings/wizard re-check
+# buttons must pass refresh=True (via /info/tools?refresh=true) so an
+# install-then-recheck within the TTL isn't served stale "not installed".
+_DETECT_TTL_S = 30.0
+_detect_cache: tuple[float, dict] | None = None
+
+
+def detect(refresh: bool = False) -> dict:
+    global _detect_cache
+    now = time.monotonic()
+    if not refresh and _detect_cache is not None and now - _detect_cache[0] < _DETECT_TTL_S:
+        return _detect_cache[1]
     paranoid = _perf_paranoid()
     out = []
     for name, (label, unlocks) in _TOOLS.items():
@@ -106,4 +119,6 @@ def detect() -> dict:
                 f"(sudo sysctl kernel.perf_event_paranoid=1) to capture profiles"
             )
         out.append(info)
-    return {"tools": out, "perf_event_paranoid": paranoid, "distro": _distro_id() or None}
+    result = {"tools": out, "perf_event_paranoid": paranoid, "distro": _distro_id() or None}
+    _detect_cache = (time.monotonic(), result)
+    return result

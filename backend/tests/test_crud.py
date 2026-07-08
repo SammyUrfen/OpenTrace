@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app import paths, run_views, runs, sessions, storage, terminals
+from app import paths, runs, sessions, storage, terminals
 from app.trace.events import Anomaly, MetricSample, TraceEvent
 
 
@@ -68,16 +68,6 @@ def test_run_delete_removes_row_and_dir(ot_home):
     assert runs.delete("nope") is False
     # deleting a run leaves its session intact
     assert sessions.get(s.id) is not None
-
-
-def test_run_views_upsert(ot_home):
-    s = sessions.create(sessions.SessionCreate(display_name="Proj"))
-    r = runs.create(runs.RunCreate(command="x", cwd="/", session_id=s.id))
-    run_views.upsert(r.id, "timeline", {"zoom": 2})
-    run_views.upsert(r.id, "timeline", {"zoom": 5})
-    v = run_views.get(r.id, "timeline")
-    assert v.state == {"zoom": 5}
-    assert len(run_views.list_for_run(r.id)) == 1
 
 
 def test_delete_session_cascades(ot_home):

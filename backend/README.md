@@ -23,7 +23,7 @@ On first run the backend creates:
 - `~/.opentrace/` — base directory (override with `OPENTRACE_HOME`)
 - `~/.opentrace/config.json` — defaults from `app.config.Config`
 - `~/.opentrace/sessions.db` — SQLite (sessions → terminals → runs + per-run
-  events / metrics / anomalies / artifacts / run_views)
+  events / metrics / anomalies / artifacts)
 - `~/.opentrace/sessions/<slug>/` — per-project folders with `terminals/` and `runs/`
 
 ## Endpoints
@@ -31,12 +31,11 @@ On first run the backend creates:
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /health`, `GET /info` | liveness + resolved paths / cpu cores |
-| `POST/GET/PATCH/DELETE /sessions` | projects (with `/sessions/default`, `/{id}/touch`) |
+| `POST/GET/PATCH/DELETE /sessions` | projects |
 | `POST /terminals`, `POST /terminals/attach` | register a shell; `attach` is used by the hook |
 | `POST /runs/start`, `/runs/{id}/pid`, `/runs/{id}/end` | run lifecycle (driven by `otrace`) |
 | `GET /runs`, `/runs/{id}` | run list + detail |
-| `GET /runs/{id}/{events,metrics,anomalies,artifacts,summary}` | analytical detail |
-| `PUT/GET /runs/{id}/views/{name}` | persisted per-view UI state |
+| `GET /runs/{id}/{events,metrics,anomalies,artifacts,summary}` | analytical detail (`metrics` takes `?max_points`, default 2000) |
 | `GET /stream`, `GET /runs/{id}/stream` | SSE live channel (run lifecycle + metric samples) |
 
 ## Layout
@@ -50,10 +49,9 @@ app/
 ├── sessions.py      projects CRUD + router
 ├── terminals.py     terminals CRUD + /attach + router
 ├── runs.py          runs CRUD + lifecycle endpoints + router
-├── run_views.py     per-run view state + router
 ├── storage.py       events/metrics/anomalies/artifacts + ndjson.zst + meta.json
 ├── streaming.py     SSE pub/sub broker
-├── trace/           strace_parser · metrics (psutil) · fdresolve · orchestrator · events
+├── trace/           strace_parser · metrics (psutil) · orchestrator · events
 └── rules/           anomaly detection engine
 ```
 

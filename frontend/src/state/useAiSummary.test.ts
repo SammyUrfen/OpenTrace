@@ -70,7 +70,6 @@ describe('useAiSummary', () => {
     const { result } = renderHook(() => useAiSummary('http://x', 'run-cached'))
     await waitFor(() => expect(result.current.status).toBe('done'))
     expect(result.current.text).toBe('cached summary')
-    expect(result.current.cached).toBe(true)
   })
 
   it('reports unconfigured when no LLM is set up', async () => {

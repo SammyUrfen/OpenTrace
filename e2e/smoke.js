@@ -32,7 +32,7 @@ async function main() {
 
     // Prove we can find real UI: the sessions sidebar + the tracing toggle.
     const hasSessions = await page.getByText(/sessions/i).count().catch(() => 0)
-    const hasToggle = await page.getByText(/OpenTrace (ON|OFF)/i).count().catch(() => 0)
+    const hasToggle = await page.getByText(/Terminal Tracing (ON|OFF)/i).count().catch(() => 0)
     log(`found: sessions-panel=${hasSessions} tracing-toggle=${hasToggle}`)
 
     const shot = path.join(__dirname, 'out', 'smoke.png')

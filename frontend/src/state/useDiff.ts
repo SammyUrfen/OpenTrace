@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { MetricSample, Run } from './useOpenTrace'
 import type { Anomaly, RunSummary } from './useRunDetail'
 import type { SyscallStat } from './useSyscalls'
+import { cachedFetch, fetchJsonStrict, isRunImmutable } from './runCache'
 
 export interface RunBundle {
   run: Run | undefined
@@ -15,10 +16,12 @@ const EMPTY: Omit<RunBundle, 'run'> = {
   summary: null, metrics: [], anomalies: [], syscalls: [],
 }
 
-async function getJson<T>(url: string, fallback: T): Promise<T> {
+// Finalized runs' payloads come from the shared run cache (same entries the
+// single-run tabs use), so closing and reopening a diff tab doesn't refetch.
+async function getJson<T>(backendUrl: string, id: string, resource: string, fallback: T) {
+  const url = `${backendUrl}/runs/${id}/${resource}`
   try {
-    const r = await fetch(url)
-    return r.ok ? ((await r.json()) as T) : fallback
+    return await cachedFetch<T>(id, url, isRunImmutable(id), () => fetchJsonStrict<T>(url))
   } catch {
     return fallback
   }
@@ -26,10 +29,10 @@ async function getJson<T>(url: string, fallback: T): Promise<T> {
 
 async function loadRun(backendUrl: string, id: string) {
   const [summary, metrics, anomalies, syscalls] = await Promise.all([
-    getJson<RunSummary | null>(`${backendUrl}/runs/${id}/summary`, null),
-    getJson<MetricSample[]>(`${backendUrl}/runs/${id}/metrics`, []),
-    getJson<Anomaly[]>(`${backendUrl}/runs/${id}/anomalies`, []),
-    getJson<SyscallStat[]>(`${backendUrl}/runs/${id}/syscalls`, []),
+    getJson<RunSummary | null>(backendUrl, id, 'summary', null),
+    getJson<MetricSample[]>(backendUrl, id, 'metrics', []),
+    getJson<Anomaly[]>(backendUrl, id, 'anomalies', []),
+    getJson<SyscallStat[]>(backendUrl, id, 'syscalls', []),
   ])
   return { summary, metrics, anomalies, syscalls }
 }

@@ -49,7 +49,7 @@ async function attachPid(ctx, pid, opts = {}) {
 // Open settings (optionally a section already routed by the palette 'guide' item).
 const openSettings = (ctx) => cmd(ctx, /Open settings/i)
 const toggleTheme = (ctx) => cmd(ctx, /Toggle theme/i)
-const toggleTracing = (ctx) => cmd(ctx, /Turn tracing (ON|OFF)/i)
+const toggleTracing = (ctx) => cmd(ctx, /Turn terminal tracing (ON|OFF)/i)
 
 // Click the sidebar run row for a specific pid (deterministic when many runs exist).
 async function openRunByPid(ctx, pid) {

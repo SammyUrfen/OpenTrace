@@ -24,6 +24,41 @@ def test_detect_runtime_missing_pid_is_unknown():
     assert attach.detect_runtime(2**31 - 1) == "unknown"
 
 
+def test_detect_runtime_rejects_node_prefixed_binaries(monkeypatch):
+    # node_exporter (a static Go binary) must NOT detect as node: the CDP path
+    # would SIGUSR1 it, and SIGUSR1 terminates processes that don't handle it.
+    monkeypatch.setattr(attach, "_read_maps", lambda _pid: "")
+    monkeypatch.setattr(attach.os, "readlink", lambda _p: "/usr/bin/node_exporter")
+    assert attach.detect_runtime(12345) == "native"
+    monkeypatch.setattr(attach.os, "readlink", lambda _p: "/usr/local/bin/node-agent")
+    assert attach.detect_runtime(12345) == "native"
+
+
+def test_detect_runtime_version_suffixed_exes(monkeypatch):
+    # exact names and version suffixes still match (conda CPython, Debian nodejs, …)
+    monkeypatch.setattr(attach, "_read_maps", lambda _pid: "")
+    for exe, expected in [("python3.11", "python"), ("python3", "python"),
+                          ("ruby3.2", "ruby"), ("php-fpm8.2", "php"),
+                          ("node", "node"), ("nodejs", "node")]:
+        monkeypatch.setattr(attach.os, "readlink", lambda _p, e=exe: f"/usr/bin/{e}")
+        assert attach.detect_runtime(12345) == expected, exe
+
+
+def test_node_cdp_capture_refuses_non_node_target(monkeypatch):
+    # Defense-in-depth at the point of harm: even if detection misfires, capture
+    # must refuse to SIGUSR1 anything that isn't positively Node.
+    from app import node_cdp
+
+    monkeypatch.setattr(node_cdp.os, "readlink", lambda _p: "/usr/bin/node_exporter")
+
+    def _no_kill(*_a):
+        raise AssertionError("SIGUSR1 must not be sent to a non-Node process")
+
+    monkeypatch.setattr(node_cdp.os, "kill", _no_kill)
+    ok, reason = node_cdp.capture(2**31 - 1, 1, "/tmp/never-written.cpuprofile")
+    assert not ok and "refusing" in reason
+
+
 def test_target_info_shape_and_whitespace_collapsed():
     info = attach.target_info(os.getpid())
     assert {"pid", "name", "cmdline", "runtime", "runtime_label", "hint", "rss_mb"} <= set(info)
@@ -120,10 +155,36 @@ def test_profiler_plan_selects_installed_sampler(monkeypatch):
 def test_sampler_argv_shapes():
     py = attach.sampler_argv("py-spy", 42, 15, "/tmp/o.folded")
     assert py[:2] == ["py-spy", "record"] and "--pid" in py and "42" in py and "/tmp/o.folded" in py
+    # R4: --subprocesses so an attach-to-master captures worker frames, not an idle master
+    assert "--subprocesses" in py
     rb = attach.sampler_argv("rbspy", 42, 15, "/tmp/o.json")
     assert rb[:2] == ["rbspy", "record"] and "speedscope" in rb
     jv = attach.sampler_argv("asprof", 42, 15, "/tmp/o.txt")
     assert jv[0] == "asprof" and "collapsed" in jv and jv[-1] == "42"
+
+
+def test_descendant_pids_includes_root_and_children():
+    # R4: capture the child pid set so perf/biosnoop attribute worker processes.
+    from app.trace import orchestrator
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        # give the child a moment to be visible under this process
+        for _ in range(50):
+            pids = orchestrator._descendant_pids(os.getpid())
+            if child.pid in pids:
+                break
+            time.sleep(0.02)
+        assert pids[0] == os.getpid()          # root first
+        assert child.pid in pids               # descendant captured
+        assert len(pids) == len(set(pids))     # deduped
+    finally:
+        child.terminate()
+        child.wait()
+
+
+def test_descendant_pids_fail_open_on_dead_pid():
+    from app.trace import orchestrator
+    assert orchestrator._descendant_pids(2**31 - 1) == [2**31 - 1]
 
 
 def test_incident_storage_roundtrip(tmp_path):

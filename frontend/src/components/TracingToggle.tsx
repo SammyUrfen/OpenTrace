@@ -14,7 +14,7 @@ export function TracingToggle({ enabled, onChange, disabled }: Props) {
       aria-pressed={enabled}
     >
       <span className="tracing-toggle__dot" aria-hidden />
-      OpenTrace {enabled ? 'ON' : 'OFF'}
+      Terminal Tracing {enabled ? 'ON' : 'OFF'}
     </button>
   )
 }

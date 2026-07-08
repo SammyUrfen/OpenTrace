@@ -23,7 +23,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
 from . import db, paths, sessions, storage
 from .util import new_id, now_ms
@@ -46,7 +46,6 @@ class RunCreate(BaseModel):
 class RunUpdate(BaseModel):
     label: str | None = None
     display_name: str | None = None
-    ui_state: dict | None = None
 
 
 class Run(BaseModel):
@@ -67,7 +66,6 @@ class Run(BaseModel):
     label: str | None = None
     collector_config: dict | None = None
     max_severity: str | None = None
-    ui_state: dict | None = None
     created_at: int
 
 
@@ -94,7 +92,6 @@ def _row_to_run(row: sqlite3.Row) -> Run:
         label=row["label"],
         collector_config=_loads(row["collector_config_json"]),
         max_severity=row["max_severity"],
-        ui_state=_loads(row["ui_state_json"]),
         created_at=row["created_at"],
     )
 
@@ -181,8 +178,6 @@ def update(rid: str, data: RunUpdate) -> Run | None:
         fields["label"] = data.label
     if data.display_name is not None:
         fields["display_name"] = data.display_name
-    if data.ui_state is not None:
-        fields["ui_state_json"] = json.dumps(data.ui_state)
     if not fields:
         return get(rid)
     assignments = ", ".join(f"{k} = ?" for k in fields)
@@ -231,6 +226,12 @@ def delete(rid: str) -> bool:
     run = get(rid)
     if run is None:
         return False
+    # Tear down any live poller/monitor machinery first, or it keeps sampling and
+    # recreating the run dir forever. Function-local import: orchestrator imports
+    # this module.
+    from .trace import orchestrator
+
+    orchestrator.abort_run(rid)
     with db.connect() as conn:
         conn.execute("DELETE FROM runs WHERE id = ?", (rid,))
     if run.run_dir:
@@ -333,11 +334,12 @@ def http_attach(data: AttachRequest) -> Run:
 
 
 @router.get("/attach/ebpf-capabilities")
-def http_ebpf_capabilities() -> dict:
-    """What eBPF off-CPU + latency profiling this host can do (for the picker gate)."""
+def http_ebpf_capabilities(refresh: bool = False) -> dict:
+    """What eBPF off-CPU + latency profiling this host can do (for the picker gate).
+    `refresh=true` bypasses the TTL cache (rescan after installing tools/sudoers)."""
     from . import ebpf
 
-    return ebpf.capabilities()
+    return ebpf.capabilities(refresh=refresh)
 
 
 class ResolveRequest(BaseModel):
@@ -376,11 +378,39 @@ def http_stop(rid: str) -> Run:
     return _require(rid)
 
 
+# Transport cap on each incident's embedded metrics window (a full window is
+# ~110 samples ≈ 19KB; hundreds of incidents made multi-MB payloads).
+_INCIDENT_METRIC_POINTS = 30
+
+
+def _thin_incident_metrics(rows: list[dict]) -> list[dict]:
+    """Stride-downsample an incident's metrics window, always keeping the rows
+    with the peak cpu/rss/fd values the feed actually displays."""
+    stride = max(1, len(rows) // _INCIDENT_METRIC_POINTS)
+    keep = set(range(0, len(rows), stride))
+    keep.add(len(rows) - 1)
+    for key in ("cpu_pct", "rss_mb", "open_fds"):
+        vals = [(r.get(key), i) for i, r in enumerate(rows) if r.get(key) is not None]
+        if vals:
+            keep.add(max(vals)[1])
+    return [rows[i] for i in sorted(keep)]
+
+
 @router.get("/{rid}/incidents")
 def http_incidents(rid: str) -> list[dict]:
-    """Monitor-mode incidents (anomaly + when + hot path + leading metrics)."""
+    """Monitor-mode incidents (anomaly + when + hot path + leading metrics).
+    Pre-collapse legacy files (one row per re-fire) are compacted once the run
+    is finished; each metrics window is downsampled for transport with the true
+    sample count preserved in `metrics_n`."""
     run = _require(rid)
-    return storage.read_incidents(run.run_dir)
+    live = run.status in (RUNNING, ANALYZING)
+    incidents = storage.read_incidents(run.run_dir, compact_legacy=not live)
+    for inc in incidents:
+        m = inc.get("metrics")
+        if isinstance(m, list) and len(m) > _INCIDENT_METRIC_POINTS:
+            inc["metrics_n"] = len(m)
+            inc["metrics"] = _thin_incident_metrics(m)
+    return incidents
 
 
 @router.post("/{rid}/pid")
@@ -451,10 +481,15 @@ def http_events(rid: str, limit: int = 5000) -> list[dict]:
     return storage.read_events(rid, limit=limit)
 
 
-@router.get("/{rid}/metrics")
-def http_metrics(rid: str) -> list[dict]:
+@router.get("/{rid}/metrics", response_model=None)
+def http_metrics(rid: str, max_points: int = 2000) -> Response:
+    """Metric samples, stride-downsampled to ~max_points (0 = full stream).
+    Serialized directly (no inferred response model): a multi-hour monitor run's
+    payload is big enough that pydantic validation + loop-side rendering stall
+    every other endpoint."""
     _require(rid)
-    return storage.read_metrics(rid)
+    rows = storage.read_metrics(rid, max_points=max_points if max_points > 0 else None)
+    return Response(json.dumps(rows), media_type="application/json")
 
 
 @router.get("/{rid}/anomalies")
@@ -542,7 +577,9 @@ def http_file(rid: str, name: str) -> dict:
     size = target.stat().st_size
     content = None
     if target.suffix in _TEXT_SUFFIXES:
-        content = target.read_bytes()[:_FILE_MAX_BYTES].decode("utf-8", errors="replace")
+        # Read only the cap — strace.log can be multiple GB; never slurp it whole.
+        with open(target, "rb") as f:
+            content = f.read(_FILE_MAX_BYTES).decode("utf-8", errors="replace")
     return {"name": name, "size": size, "truncated": size > _FILE_MAX_BYTES, "content": content}
 
 

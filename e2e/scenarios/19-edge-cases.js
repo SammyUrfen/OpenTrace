@@ -83,7 +83,7 @@ module.exports = [
       }
       // palette fully dismissed and the app still responds
       ctx.assert(!(await ctx.exists('.palette')), 'palette left open after rapid cycling')
-      await ctx.assertText(/OpenTrace (ON|OFF)/i, 'app shell broke after rapid palette cycling')
+      await ctx.assertText(/Terminal Tracing (ON|OFF)/i, 'app shell broke after rapid palette cycling')
     },
   },
   {
@@ -184,7 +184,7 @@ module.exports = [
       // ensure a clean slate
       ctx.assert(!(await ctx.exists('.palette')) && !(await ctx.exists('.settings')), 'expected nothing open')
       for (let i = 0; i < 3; i++) { await ctx.press('Escape'); await ctx.sleep(150) }
-      await ctx.assertText(/OpenTrace (ON|OFF)/i, 'shell broke after stray Escapes')
+      await ctx.assertText(/Terminal Tracing (ON|OFF)/i, 'shell broke after stray Escapes')
     },
   },
   {

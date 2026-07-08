@@ -92,8 +92,23 @@ def _sudo_ok() -> bool:
         return False
 
 
-def capabilities() -> dict:
-    """What eBPF profiling this host can do, and why not if it can't."""
+# Host eBPF capability (BTF, tools, privileges) barely changes while the app runs,
+# but probing it spawns `sudo -n` subprocesses (~0.3-0.5s) — and the Attach modal
+# re-fetches on every open, the monitor loop on every iteration. A short TTL keeps
+# it fresh across a sudoers/tool install without an app restart; `refresh=True`
+# bypasses. A stale read under a racing refresh is fine (worst case: one re-probe).
+_CAPS_TTL_S = 60.0
+_caps_cache: tuple[float, dict] | None = None
+_bt_cache: tuple[float, bool] | None = None
+
+
+def capabilities(refresh: bool = False) -> dict:
+    """What eBPF profiling this host can do, and why not if it can't.
+    TTL-cached (see _CAPS_TTL_S); `refresh=True` re-probes."""
+    global _caps_cache
+    now = time.monotonic()
+    if not refresh and _caps_cache is not None and now - _caps_cache[0] < _CAPS_TTL_S:
+        return _caps_cache[1]
     btf = Path("/sys/kernel/btf/vmlinux").exists()
     unpriv = _read_int("/proc/sys/kernel/unprivileged_bpf_disabled")
     tools = {k: _find_tool(k) for k in _TOOL_NAMES}
@@ -119,7 +134,7 @@ def capabilities() -> dict:
                   "(loading kprobe/tracepoint programs needs CAP_BPF+CAP_PERFMON — "
                   "unprivileged_bpf_disabled does not grant that).")
 
-    return {
+    result = {
         "available": bool(btf and tools_ok and priv_ok),
         "reason": reason,
         "kernel": platform.release(),
@@ -133,8 +148,10 @@ def capabilities() -> dict:
         "use_sudo": bool(sudo and not (is_root or caps)),
         # bpftrace (CO-RE) is the preferred engine for the latency histograms —
         # it compiles where bcc's bundled headers won't (e.g. very new kernels).
-        "bpftrace": bpftrace_available(),
+        "bpftrace": bpftrace_available(refresh=refresh),
     }
+    _caps_cache = (time.monotonic(), result)
+    return result
 
 
 def tool_cmd(name: str, args: list[str], *, use_sudo: bool) -> list[str] | None:
@@ -154,6 +171,50 @@ def _reason_from_stderr(stderr: str) -> str:
         return "bcc tool not found — install bcc-tools."
     tail = (stderr or "").strip().splitlines()
     return tail[-1] if tail else "eBPF capture produced no output."
+
+
+def _child_pids(pid: int) -> list[int]:
+    """Direct children of `pid`, from /proc (cheaper and race-safer than pgrep)."""
+    try:
+        return [int(p) for p in
+                Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def _force_kill(proc: subprocess.Popen, is_sudo: bool) -> None:
+    """Last-resort stop for a tool that ignored/never got SIGINT. A plain SIGKILL
+    is fine for a directly-spawned tool, but sudo CANNOT relay SIGKILL — killing
+    only the frontend orphans its root child, which keeps running with probes
+    attached. So for sudo: snapshot the child pid, escalate SIGTERM first (sudo
+    relays it, and the bcc/bpftrace tools install no handler so it terminates them
+    even mid-wedged-compile), then SIGKILL the frontend and best-effort
+    `sudo -n kill -KILL` any survivor."""
+    if not is_sudo:
+        proc.kill()
+        proc.wait()
+        return
+    children = _child_pids(proc.pid)
+    proc.terminate()
+    end = time.monotonic() + 4
+    while proc.poll() is None and time.monotonic() < end:
+        time.sleep(0.1)
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+    for cpid in children:
+        if not Path(f"/proc/{cpid}").exists():
+            continue
+        try:
+            subprocess.run(["sudo", "-n", "kill", "-KILL", str(cpid)],
+                           capture_output=True, timeout=4)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if Path(f"/proc/{cpid}").exists():
+            # least-privilege sudoers that whitelist only the tool paths deny
+            # `sudo kill` — at least make the orphan observable.
+            log.warning("eBPF tool child pid %s survived kill (sudo kill denied?) — "
+                        "it may keep tracing until it exits on its own.", cpid)
 
 
 def _run_proc(cmd: list[str], *, timeout: float, stop=None,
@@ -179,12 +240,13 @@ def _run_proc(cmd: list[str], *, timeout: float, stop=None,
         outf.close(); errf.close()
         return "", str(e)
 
+    is_sudo = "sudo" in cmd[:3]  # ["sudo","-n",…] or stdbuf-wrapped ["stdbuf","-oL","sudo",…]
     hard = time.monotonic() + timeout
     soft = (time.monotonic() + duration) if duration is not None else None
     while proc.poll() is None:
         now = time.monotonic()
         if now > hard:
-            proc.kill(); proc.wait()
+            _force_kill(proc, is_sudo)
             return _read()
         if (stop is not None and stop.is_set()) or (soft is not None and now > soft):
             proc.send_signal(signal.SIGINT)  # sudo forwards SIGINT to the child
@@ -192,7 +254,7 @@ def _run_proc(cmd: list[str], *, timeout: float, stop=None,
             while proc.poll() is None and time.monotonic() < end:
                 time.sleep(0.1)
             if proc.poll() is None:
-                proc.kill()
+                _force_kill(proc, is_sudo)
             proc.wait()
             return _read()
         time.sleep(0.2)
@@ -398,17 +460,28 @@ def parse_ugc(text: str) -> list[dict]:
 # --- bpftrace path (CO-RE; works where bcc's bundled headers won't compile, e.g.
 #     very new kernels) --------------------------------------------------------
 
-def bpftrace_available() -> bool:
-    """bpftrace present AND runnable with privilege (root / caps / passwordless sudo)."""
-    if not shutil.which("bpftrace"):
-        return False
-    if os.geteuid() == 0 or _has_bpf_caps():
-        return True
-    try:
-        return subprocess.run(["sudo", "-n", "bpftrace", "--version"],
-                              capture_output=True, timeout=4).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+def bpftrace_available(refresh: bool = False) -> bool:
+    """bpftrace present AND runnable with privilege (root / caps / passwordless sudo).
+    TTL-cached like capabilities() — the sudo probe is a subprocess per call."""
+    global _bt_cache
+    now = time.monotonic()
+    if not refresh and _bt_cache is not None and now - _bt_cache[0] < _CAPS_TTL_S:
+        return _bt_cache[1]
+
+    def _probe() -> bool:
+        if not shutil.which("bpftrace"):
+            return False
+        if os.geteuid() == 0 or _has_bpf_caps():
+            return True
+        try:
+            return subprocess.run(["sudo", "-n", "bpftrace", "--version"],
+                                  capture_output=True, timeout=4).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    ok = _probe()
+    _bt_cache = (time.monotonic(), ok)
+    return ok
 
 
 # ONE combined bpftrace program (run-queue + block-I/O + optional GC). Running a
@@ -450,16 +523,15 @@ def build_combined_bt(pid: int, n: str, gc_lib: str | None = None) -> str:
     return "\n".join(parts)
 
 
-def run_bpftrace(script: str, *, timeout: float, stop=None, pid: int | None = None) -> tuple[bool, str, str | None]:
+def run_bpftrace(script: str, *, timeout: float, stop=None) -> tuple[bool, str, str | None]:
     """Run a bpftrace program (self-terminating via its own interval/exit). Fail-open.
-    `pid` adds `-p PID` (required for USDT probes on a running process)."""
+    Never add `-p PID` here — it silently pid-filters ALL probes (see _BT_GC /
+    build_combined_bt); scope with an in-script /pid==PID/ filter and full-path
+    USDT probes instead."""
     if not shutil.which("bpftrace"):
         return False, "", "bpftrace not installed."
     use_sudo = not (os.geteuid() == 0 or _has_bpf_caps())
-    cmd = (["sudo", "-n"] if use_sudo else []) + ["bpftrace"]
-    if pid is not None:
-        cmd += ["-p", str(pid)]
-    cmd += ["-e", script]
+    cmd = (["sudo", "-n"] if use_sudo else []) + ["bpftrace", "-e", script]
     out, err = _run_proc(cmd, timeout=timeout, stop=stop)
     if out.strip():
         return True, out, None
@@ -489,16 +561,12 @@ def _bt_num(s: str) -> int:
     return int(s[:-1]) * _BT_SUFFIX[s[-1]] if s and s[-1] in _BT_SUFFIX else int(s)
 
 
-def parse_bpftrace_hist(text: str, unit: str) -> dict:
-    """Parse a bpftrace `hist()` map dump into the same shape as parse_log2_hist.
-    Rows look like `[1]  5 |@@@|` (single) or `[2K, 4K)  3 |@@|` (range)."""
-    buckets: list[dict] = []
-    for line in text.splitlines():
-        m = _BT_HIST_RE.search(line)
-        if m:
-            lo = _bt_num(m.group(1))
-            hi = _bt_num(m.group(2)) if m.group(2) else lo
-            buckets.append({"lo": lo, "hi": hi, "count": int(m.group(3))})
+def _hist_summary(buckets: list[dict], unit: str) -> dict:
+    """Shared summary shape for BOTH histogram engines (bpftrace `hist()` dumps
+    and bcc log2 rows), so their latency.json outputs — which latency_anomalies
+    compares against the same thresholds — can never diverge. Percentiles are the
+    upper bound of the bucket where the cumulative count crosses the fraction
+    (log2 buckets are coarse, so these are estimates — honest for latency)."""
     total = sum(b["count"] for b in buckets)
 
     def _pct(frac: float) -> int | None:
@@ -517,6 +585,19 @@ def parse_bpftrace_hist(text: str, unit: str) -> dict:
             "max": hi_nz[-1] if hi_nz else None}
 
 
+def parse_bpftrace_hist(text: str, unit: str) -> dict:
+    """Parse a bpftrace `hist()` map dump into the same shape as parse_log2_hist.
+    Rows look like `[1]  5 |@@@|` (single) or `[2K, 4K)  3 |@@|` (range)."""
+    buckets: list[dict] = []
+    for line in text.splitlines():
+        m = _BT_HIST_RE.search(line)
+        if m:
+            lo = _bt_num(m.group(1))
+            hi = _bt_num(m.group(2)) if m.group(2) else lo
+            buckets.append({"lo": lo, "hi": hi, "count": int(m.group(3))})
+    return _hist_summary(buckets, unit)
+
+
 # --- log2 histogram parsing (runqlat / biolatency) --------------------------
 
 _HDR_RE = re.compile(r"\s*(nsecs|usecs|msecs|secs)\s*:\s*count", re.I)
@@ -528,8 +609,6 @@ def parse_log2_hist(text: str) -> dict:
 
     bcc prints:  `     msecs               : count     distribution`
     then rows:   `         2 -> 3          : 5        |****        |`
-    Percentiles are the upper bound of the bucket where the cumulative count crosses
-    the fraction (log2 buckets are coarse, so these are estimates — honest for latency).
     """
     unit = "usecs"
     buckets: list[dict] = []
@@ -541,25 +620,4 @@ def parse_log2_hist(text: str) -> dict:
         m = _ROW_RE.match(line)
         if m:
             buckets.append({"lo": int(m.group(1)), "hi": int(m.group(2)), "count": int(m.group(3))})
-    total = sum(b["count"] for b in buckets)
-
-    def _pct(frac: float) -> int | None:
-        if not total:
-            return None
-        target, cum = frac * total, 0
-        for b in buckets:
-            cum += b["count"]
-            if cum >= target:
-                return b["hi"]
-        return buckets[-1]["hi"] if buckets else None
-
-    hi_nonzero = [b["hi"] for b in buckets if b["count"] > 0]
-    return {
-        "unit": unit,
-        "buckets": buckets,
-        "total": total,
-        "p50": _pct(0.5),
-        "p90": _pct(0.9),
-        "p99": _pct(0.99),
-        "max": hi_nonzero[-1] if hi_nonzero else None,
-    }
+    return _hist_summary(buckets, unit)

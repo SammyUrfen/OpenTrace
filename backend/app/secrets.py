@@ -12,9 +12,7 @@ manager). The implementation can swap; callers don't change.
 Public surface (stable):
 - `get_secret(name) -> str | None`
 - `set_secret(name, value) -> None`
-- `has_secret(name) -> bool`
 - `delete_secret(name) -> bool`
-- `list_secret_names() -> list[str]`
 """
 from __future__ import annotations
 
@@ -67,17 +65,9 @@ def set_secret(name: str, value: str) -> None:
     os.chmod(p, 0o600)
 
 
-def has_secret(name: str) -> bool:
-    return _path_for(name).exists()
-
-
 def delete_secret(name: str) -> bool:
     p = _path_for(name)
     if p.exists():
         p.unlink()
         return True
     return False
-
-
-def list_secret_names() -> list[str]:
-    return sorted(p.name for p in _secrets_dir().iterdir() if p.is_file())

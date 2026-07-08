@@ -1,3 +1,5 @@
+import { downsampleValues, maxOf, minOf } from './seriesUtils'
+
 interface Props {
   data: number[]
   width?: number
@@ -5,13 +7,15 @@ interface Props {
   color?: string
 }
 
-/** Minimal dependency-free SVG sparkline. Auto-scales to its own max. */
-export function Sparkline({ data, width = 96, height = 22, color = '#c084fc' }: Props) {
+/** Minimal dependency-free SVG sparkline. Auto-scales to its own max; long
+ *  metric series are decimated so a multi-hour run can't bloat the polyline. */
+export function Sparkline({ data: raw, width = 96, height = 22, color = '#c084fc' }: Props) {
+  const data = downsampleValues(raw)
   if (data.length < 2) {
     return <svg width={width} height={height} className="sparkline" />
   }
-  const max = Math.max(...data, 1)
-  const min = Math.min(...data, 0)
+  const max = Math.max(maxOf(data, (v) => v) ?? 1, 1)
+  const min = Math.min(minOf(data, (v) => v) ?? 0, 0)
   const span = max - min || 1
   const step = width / (data.length - 1)
   const points = data

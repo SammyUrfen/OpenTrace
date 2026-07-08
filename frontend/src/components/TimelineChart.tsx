@@ -1,4 +1,5 @@
 import { useRef } from 'react'
+import { maxOf } from './seriesUtils'
 
 export interface TlEvent {
   t: number
@@ -71,7 +72,7 @@ export function TimelineChart(props: Props) {
   const line = (series: [number, number][], laneKey: string) => {
     const lane = LANES.find((l) => l.key === laneKey)!
     const top = tops[laneKey]
-    const vmax = Math.max(1, ...series.map((p) => p[1]))
+    const vmax = Math.max(1, maxOf(series, (p) => p[1]) ?? 1)
     const xy = series
       .filter((p) => Number.isFinite(p[1]))
       .map((p) => [x(p[0]), top + lane.h - (p[1] / vmax) * (lane.h - 3)] as [number, number])

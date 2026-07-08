@@ -25,6 +25,34 @@ interface Props {
 /** Runtimes perf symbolizes well today (Phase A); others get a "VM frames" caveat. */
 const PERF_NATIVE = new Set(['native', 'go'])
 
+interface EbpfCaps {
+  available: boolean
+  reason: string | null
+}
+
+// eBPF capabilities are stable within a host boot, and the backend probe spawns
+// sudo subprocesses with multi-second timeouts — cache the result per backend
+// for the app session instead of re-probing on every modal open. A failed
+// probe is evicted so a transient startup error doesn't pin the checkbox at
+// "Checking…"; the rescan button bypasses the cache (so users can re-check
+// after installing bcc / adding a sudoers rule per the `reason` instructions).
+const ebpfCapsCache = new Map<string, Promise<EbpfCaps | null>>()
+
+function fetchEbpfCaps(backendUrl: string, force = false): Promise<EbpfCaps | null> {
+  if (force || !ebpfCapsCache.has(backendUrl)) {
+    // force also bypasses the backend's TTL cache, not just this client one
+    const probe = fetch(`${backendUrl}/runs/attach/ebpf-capabilities${force ? '?refresh=true' : ''}`)
+      .then((r) => (r.ok ? (r.json() as Promise<EbpfCaps>) : null))
+      .catch(() => null)
+      .then((caps) => {
+        if (caps === null) ebpfCapsCache.delete(backendUrl)
+        return caps
+      })
+    ebpfCapsCache.set(backendUrl, probe)
+  }
+  return ebpfCapsCache.get(backendUrl)!
+}
+
 /**
  * "Attach to a running process" picker (profiling Phase A). Lists attachable
  * PIDs from `GET /runs/attach/targets`, then `POST /runs/attach` samples the
@@ -37,8 +65,11 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
   const [windowS, setWindowS] = useState(20)
   const [monitor, setMonitor] = useState(false)
   const [ebpf, setEbpf] = useState(false)
-  const [ebpfCaps, setEbpfCaps] = useState<{ available: boolean; reason: string | null } | null>(null)
-  const [busy, setBusy] = useState<number | null>(null)
+  const [ebpfCaps, setEbpfCaps] = useState<EbpfCaps | null>(null)
+  // in-flight attach key: `pid-<n>` for a listed row or manual PID, `port-<n>`
+  // for a manual port. A single string lets rows and the manual affordance share
+  // one busy gate (only one attach can be in flight).
+  const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const load = () => {
@@ -55,12 +86,14 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
         setError(`Couldn't list processes: ${e instanceof Error ? e.message : String(e)}`)
       })
   }
+  const rescan = () => {
+    load()
+    setEbpfCaps(null)
+    void fetchEbpfCaps(backendUrl, true).then(setEbpfCaps)
+  }
   useEffect(load, [backendUrl])
   useEffect(() => {
-    fetch(`${backendUrl}/runs/attach/ebpf-capabilities`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => setEbpfCaps(d))
-      .catch(() => setEbpfCaps(null))
+    void fetchEbpfCaps(backendUrl).then(setEbpfCaps)
   }, [backendUrl])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -77,20 +110,30 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
     )
   }, [targets, filter])
 
-  const attach = async (t: Target) => {
-    setBusy(t.pid)
+  // The list is only the top targets by RSS, so a small/short-lived process may
+  // never appear. When the filter is a bare number, offer a direct attach to it
+  // as a PID or a port (the endpoint accepts either) — an escape from the picker.
+  const manualId = useMemo(() => {
+    const q = filter.trim()
+    return /^\d+$/.test(q) ? Number(q) : null
+  }, [filter])
+
+  const postAttach = async (body: Record<string, unknown>, key: string) => {
+    setBusy(key)
     setError(null)
     try {
       const r = await fetch(`${backendUrl}/runs/attach`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          pid: t.pid, window_s: windowS, monitor,
+          window_s: windowS, monitor,
           ebpf: ebpf && !!ebpfCaps?.available, session_id: sessionId ?? null,
+          ...body,
         }),
       })
       if (!r.ok) {
         const d = await r.json().catch(() => ({}))
+        // surface the backend's 404 (no listening process on the port) / 400 inline
         throw new Error(d.detail || `HTTP ${r.status}`)
       }
       onAttached?.()
@@ -100,6 +143,10 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
       setBusy(null)
     }
   }
+
+  const attach = (t: Target) => postAttach({ pid: t.pid }, `pid-${t.pid}`)
+  const attachManual = (kind: 'pid' | 'port', id: number) =>
+    postAttach(kind === 'pid' ? { pid: id } : { port: id }, `${kind}-${id}`)
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -125,7 +172,7 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
             />
             s
           </label>
-          <button type="button" className="ai-btn" onClick={load} title="rescan">↻</button>
+          <button type="button" className="ai-btn" onClick={rescan} title="rescan">↻</button>
         </div>
 
         <label className="attach__monitor">
@@ -163,7 +210,33 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
 
         <div className="attach__list">
           {targets === null && <div className="attach__empty">Scanning processes…</div>}
-          {targets && shown.length === 0 && <div className="attach__empty">No matching processes.</div>}
+          {targets && shown.length === 0 && (
+            manualId !== null ? (
+              <div
+                className="attach__empty"
+                data-testid="attach-manual"
+                style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap' }}
+              >
+                <span>No matching processes. Attach directly to</span>
+                <button
+                  type="button" className="ai-btn" data-testid="attach-manual-pid"
+                  disabled={busy !== null} onClick={() => attachManual('pid', manualId)}
+                >
+                  {busy === `pid-${manualId}` ? 'attaching…' : `PID ${manualId}`}
+                </button>
+                <button
+                  type="button" className="ai-btn" data-testid="attach-manual-port"
+                  disabled={busy !== null} onClick={() => attachManual('port', manualId)}
+                >
+                  {busy === `port-${manualId}` ? 'attaching…' : `port ${manualId}`}
+                </button>
+              </div>
+            ) : (
+              <div className="attach__empty">
+                No matching processes — type a PID or port number to attach one directly.
+              </div>
+            )
+          )}
           {shown.map((t) => (
             <button
               key={t.pid}
@@ -185,16 +258,17 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
                 )}
               </span>
               <span className="attach__meta">pid {t.pid} · {t.rss_mb} MB</span>
-              <span className="attach__hint">{busy === t.pid ? 'attaching…' : t.hint}</span>
+              <span className="attach__hint">{busy === `pid-${t.pid}` ? 'attaching…' : t.hint}</span>
             </button>
           ))}
         </div>
 
         <div className="modal__foot">
           <span className="attach__foot-note">
-            perf samples the process for the window, then builds a flamegraph.
-            Native/Go show real symbols; interpreted runtimes show VM frames until
-            their samplers land.
+            Samples the process for the window, then builds a flamegraph. Native/Go
+            use perf; interpreted runtimes get real frames from their own samplers
+            (py-spy, rbspy, async-profiler, the V8 inspector, phpspy) — see each row's
+            hint. Tick the eBPF option for off-CPU + latency.
           </span>
         </div>
       </div>

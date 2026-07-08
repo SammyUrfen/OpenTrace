@@ -30,6 +30,27 @@ const GUIDES: Record<string, GuideEntry> = {
       </>
     ),
   },
+  incidents: {
+    title: 'Reading Incidents',
+    body: (
+      <>
+        <p>
+          An <b>incident</b> is one finding the rule engine raised while monitoring a
+          live attach run — the same rules the Overview uses, but evaluated over a
+          sliding window as the process runs. Each row records <b>when</b> it fired,
+          <b> where</b> (the function, syscall, or metric that tripped it), and the
+          <b> leading metrics</b> at that moment, so you can see the evidence in context.
+        </p>
+        <p>
+          Repeat firings of the same rule <b>collapse into one row</b> with an
+          occurrence count and a last-seen time — a flapping condition is one entry,
+          not hundreds. A healthy, idle target simply produces nothing: an empty feed
+          means nothing crossed a threshold, which is a clean bill of health, not a
+          failure to capture.
+        </p>
+      </>
+    ),
+  },
   timeline: {
     title: 'Reading the Timeline',
     body: (
@@ -194,6 +215,28 @@ const GUIDES: Record<string, GuideEntry> = {
           Find the widest bar that isn't a framework/entry frame: that's your hot
           path. Click a frame to zoom into its subtree. A single wide leaf function
           is the thing actually eating the CPU you saw on the CPU tab.
+        </p>
+      </>
+    ),
+  },
+  latency: {
+    title: 'Reading Latency',
+    body: (
+      <>
+        <p>
+          Where the process <b>waited</b>, from eBPF — the mirror image of the
+          Flamegraph. On-CPU sampling shows where code <i>burns</i> the CPU; this tab
+          shows the time it spent <b>off CPU</b>, blocked and making no progress, which
+          sampling can't see.
+        </p>
+        <p>
+          <b>Scheduler run-queue latency</b> is how long a runnable thread waited for a
+          free CPU — high values mean oversubscription/CPU contention, not slow code.
+          <b> Block-I/O latency</b> is how long disk I/O took: a per-process figure for
+          this target plus a host-wide histogram (slow or contended storage). Each
+          histogram is power-of-2 buckets with <b>p50 / p90 / p99 / max</b> — the tail
+          percentiles are where stalls hide. A <b>GC pauses</b> card appears for Python
+          dtrace builds (stop-the-world time via USDT).
         </p>
       </>
     ),

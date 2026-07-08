@@ -1,5 +1,6 @@
 import { useRunResource } from '../state/useRunResource'
 import { formatBytes } from '../state/format'
+import { basename } from './textUtils'
 
 export interface IoRow {
   path: string
@@ -10,11 +11,6 @@ export interface IoRow {
   read_bytes: number
   write_bytes: number
   leaked: number
-}
-
-function basename(p: string): string {
-  const i = p.lastIndexOf('/')
-  return i >= 0 ? p.slice(i + 1) || p : p
 }
 
 interface Props {

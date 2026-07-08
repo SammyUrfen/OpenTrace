@@ -113,17 +113,30 @@ export function FlamegraphTab({ backendUrl, runId, offCpu }: Props) {
   }
 
   if (!data?.supported || !root) {
+    // The launch advice ("enable a collector and re-run") is wrong for an attach
+    // run — there's no command to re-run, you re-attach. Detect attach from the
+    // eBPF prop or the backend reason (these phrases come only from the attach
+    // profiler path), and de-nest the parenthesised reason with an em-dash.
+    const reason = data?.reason ?? ''
+    const isAttachRun =
+      !!offCpu || /captured no samples|target exited|resource timeline only|could not start/i.test(reason)
     return (
       <div className="overview" data-testid="flamegraph-tab">
         <h3 className="overview__h">{isOff ? 'Off-CPU flamegraph' : 'CPU flamegraph'}{toggle}</h3>
         <div className="overview__muted">
           {isOff ? (
-            <>No off-CPU profile{data?.reason ? ` — ${data.reason}` : ''}. Off-CPU
+            <>No off-CPU profile{reason ? ` — ${reason}` : ''}. Off-CPU
               needs the <b>eBPF</b> option at attach time and elevated privileges;
               when present it shows where the process is <b>blocked</b> (I/O, locks, waits).</>
           ) : (
-            <>No CPU profile for this run{data?.reason ? ` (${data.reason})` : ''}. Enable the{' '}
-              <b>Hardware perf</b> collector (Live Monitor) and re-run a CPU-bound program.</>
+            <>No CPU profile for this run{reason ? ` — ${reason}` : '.'}{' '}
+              {isAttachRun ? (
+                <>Re-attach with the <b>perf</b> or a language sampler (py-spy, rbspy,
+                  async-profiler) collector while the target is doing work — a process
+                  that stays idle for the window produces no stacks.</>
+              ) : (
+                <>Enable the <b>Hardware perf</b> collector and re-run a CPU-bound program.</>
+              )}</>
           )}
         </div>
       </div>

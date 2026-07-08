@@ -30,6 +30,12 @@ contextBridge.exposeInMainWorld('opentrace', {
   session: {
     set: (id) => ipcRenderer.invoke('session:set', id),
   },
+  // Backend lifecycle from the main process: {state: 'restarting'|'ok'|'failed',
+  // attempt?, max?} — lets the renderer distinguish "crashed, restarting (n/3)"
+  // from a generic SSE disconnect.
+  backend: {
+    onStatus: (cb) => subscribe('backend:status', cb),
+  },
   // Native application-menu / keyboard-shortcut actions are delivered here as
   // string action names (e.g. 'new-session', 'settings', 'toggle-tracing').
   menu: {

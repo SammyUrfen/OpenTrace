@@ -29,16 +29,6 @@ class LLMConfig(BaseModel):
     continuous_summaries: bool = False
 
 
-class UIConfig(BaseModel):
-    theme: str = "auto"  # 'auto' | 'dark' | 'light'
-    sidebar_width: int = 280
-
-
-class TerminalConfig(BaseModel):
-    font_size: int = 13
-    scrollback: int = 5000
-
-
 class CollectorsConfig(BaseModel):
     """Which collectors run for a traced command. strace and psutil are
     functional today; ltrace/perf are reserved for Phase 6 (opt-in profiling)."""
@@ -51,13 +41,15 @@ class CollectorsConfig(BaseModel):
 class TracingConfig(BaseModel):
     default_enabled: bool = False
     collectors: CollectorsConfig = Field(default_factory=CollectorsConfig)
+    # Sparse per-rule threshold overrides ({name: value}) applied over the
+    # defaults in `rules.engine.RuleThresholds` — retune the anomaly engine
+    # without a code change. Empty = use every rule's built-in default.
+    rule_thresholds: dict[str, float] = Field(default_factory=dict)
 
 
 class Config(BaseModel):
     version: int = 1
     llm: LLMConfig = Field(default_factory=LLMConfig)
-    ui: UIConfig = Field(default_factory=UIConfig)
-    terminal: TerminalConfig = Field(default_factory=TerminalConfig)
     tracing: TracingConfig = Field(default_factory=TracingConfig)
 
 

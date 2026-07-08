@@ -174,8 +174,30 @@ def backfill_syscall_rate(run_id: str, rate_by_ts: dict[float, float]) -> None:
         )
 
 
-def read_metrics(run_id: str) -> list[dict]:
+def read_metrics(run_id: str, max_points: int | None = None) -> list[dict]:
+    """Read a run's metric samples, oldest first.
+
+    `max_points=None` returns the complete stream (what finalize/summarize need
+    — exact timestamps for the syscall_rate backfill and the full archive).
+    When set, rows are STRIDE-downsampled (every Nth real row, never averaged,
+    so spikes and exact timestamps survive) to at most ~max_points."""
     with db.connect() as conn:
+        if max_points is not None and max_points > 0:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM metrics WHERE run_id = ?", (run_id,)
+            ).fetchone()[0]
+            stride = -(-total // max_points)  # ceil
+            if stride > 1:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT m.*, ROW_NUMBER() OVER (ORDER BY timestamp_ms) - 1 AS rn
+                          FROM metrics m WHERE run_id = ?
+                    ) WHERE rn % ? = 0 ORDER BY timestamp_ms
+                    """,
+                    (run_id, stride),
+                ).fetchall()
+                return [{k: r[k] for k in r.keys() if k != "rn"} for r in rows]
         rows = conn.execute(
             "SELECT * FROM metrics WHERE run_id = ? ORDER BY timestamp_ms",
             (run_id,),
@@ -319,9 +341,69 @@ def append_incident(run_dir: str | Path, incident: dict) -> None:
         f.write(json.dumps(incident, separators=(",", ":"), default=str) + "\n")
 
 
-def read_incidents(run_dir: str | Path) -> list[dict]:
+def _collapse_legacy_incidents(incidents: list[dict]) -> list[dict] | None:
+    """Group pre-collapse incident rows (a `rule_id` but no `count` field, one row
+    per re-fire) into one collapsed row per rule. Rows without a rule_id and
+    already-collapsed rows pass through untouched. None when nothing is legacy."""
+    if not any(i.get("rule_id") and "count" not in i for i in incidents):
+        return None
+    by_rule: dict[str, dict] = {}
+    out: list[dict] = []
+    for inc in incidents:
+        rid = inc.get("rule_id")
+        if not rid or "count" in inc:
+            out.append(inc)
+            continue
+        ts = inc.get("ts")
+        cur = by_rule.get(rid)
+        if cur is None:
+            cur = dict(inc)
+            cur.update(count=1, first_ts=ts, last_ts=ts)
+            by_rule[rid] = cur
+            out.append(cur)
+            continue
+        cur["count"] += 1
+        if ts is not None:
+            if cur.get("first_ts") is None or ts < cur["first_ts"]:
+                cur["first_ts"] = ts
+                cur["ts"] = ts
+            if cur.get("last_ts") is None or ts > cur["last_ts"]:
+                cur["last_ts"] = ts
+        if _SEV_RANK.get(inc.get("severity"), 99) < _SEV_RANK.get(cur.get("severity"), 99):
+            cur["severity"] = inc["severity"]
+        for k in ("hot", "ai"):
+            if inc.get(k) is not None:
+                cur[k] = inc[k]
+        if inc.get("metrics"):
+            cur["metrics"] = inc["metrics"]
+    return out
+
+
+def _rewrite_incidents_unlocked(run_dir: str | Path, incidents: list[dict]) -> None:
+    p = _incidents_path(run_dir)
+    tmp = p.with_suffix(".ndjson.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for inc in incidents:
+            f.write(json.dumps(inc, separators=(",", ":"), default=str) + "\n")
+    os.replace(tmp, p)
+
+
+def read_incidents(run_dir: str | Path, *, compact_legacy: bool = False) -> list[dict]:
+    """Read a run's incidents. With `compact_legacy` (finished runs only), rows
+    written by pre-collapse builds (one per re-fire, each embedding a full metrics
+    window — multi-MB files) are collapsed one-time to one row per rule and the
+    file rewritten; idempotent thereafter."""
     with _incidents_lock:
-        return _read_incidents_unlocked(run_dir)
+        incidents = _read_incidents_unlocked(run_dir)
+        if compact_legacy:
+            compacted = _collapse_legacy_incidents(incidents)
+            if compacted is not None:
+                try:
+                    _rewrite_incidents_unlocked(run_dir, compacted)
+                except OSError:
+                    pass  # serve the compacted view even if the rewrite failed
+                incidents = compacted
+    return incidents
 
 
 def update_incident(run_dir: str | Path, incident_id: str, **fields) -> None:
@@ -337,9 +419,4 @@ def update_incident(run_dir: str | Path, incident_id: str, **fields) -> None:
                 changed = True
         if not changed:
             return
-        p = _incidents_path(run_dir)
-        tmp = p.with_suffix(".ndjson.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            for inc in incidents:
-                f.write(json.dumps(inc, separators=(",", ":"), default=str) + "\n")
-        os.replace(tmp, p)
+        _rewrite_incidents_unlocked(run_dir, incidents)

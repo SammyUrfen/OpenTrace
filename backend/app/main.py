@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import Headers
+from starlette.responses import PlainTextResponse
 
-from . import config, db, llm, paths, run_views, runs, sessions, terminals
+from . import config, db, llm, paths, runs, sessions, terminals
 from .streaming import sse_response
 from .trace import metrics as metrics_mod
 from .trace import orchestrator
@@ -31,21 +34,59 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="OpenTrace", version="0.1.0", lifespan=lifespan)
 
-# Renderer is loaded from a `file://` URL in packaged Electron, which Chromium
-# reports as the `null` origin. Allowing all origins is fine for a local-first
-# desktop app where the backend only listens on localhost.
+# Origins a legitimate client can carry: the packaged Electron renderer loads
+# from `file://` (Chromium reports Origin `null`), dev uses the Vite server on
+# localhost, and non-browser clients (curl, the otrace hook) send no Origin.
+# Anything else is a random web page poking the localhost API.
+_LOCAL_ORIGIN = re.compile(
+    r"^(null|file://.*|https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?)$",
+    re.IGNORECASE,
+)
+# Hosts the backend answers for; a real DNS name here is a rebinding attempt.
+_LOCAL_HOST = re.compile(
+    r"^(localhost|127\.0\.0\.1|\[::1\]|::1)(:\d+)?$", re.IGNORECASE
+)
+
+
+class LocalOnlyMiddleware:
+    """Reject requests from real web origins (CSRF from a page the user has
+    open) and non-local Host headers (DNS rebinding). CORS alone is not enough:
+    simple cross-origin requests execute server-side even when the browser
+    withholds the response."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            headers = Headers(scope=scope)
+            origin = headers.get("origin")
+            host = headers.get("host")
+            if (origin is not None and not _LOCAL_ORIGIN.match(origin)) or (
+                host is not None and not _LOCAL_HOST.match(host)
+            ):
+                resp = PlainTextResponse(
+                    "forbidden: OpenTrace accepts local clients only",
+                    status_code=403,
+                )
+                await resp(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=_LOCAL_ORIGIN.pattern,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Added after CORS so it runs first (outermost) and rejects before preflight.
+app.add_middleware(LocalOnlyMiddleware)
 
 app.include_router(sessions.router)
 app.include_router(terminals.router)
 app.include_router(runs.router)
-app.include_router(run_views.router)
 app.include_router(llm.router)
 
 
@@ -81,12 +122,13 @@ def info() -> dict[str, object]:
 
 
 @app.get("/info/tools")
-def info_tools() -> dict[str, object]:
+def info_tools(refresh: bool = False) -> dict[str, object]:
     """Which tracing tools (strace/ltrace/perf) are installed, with versions and
-    a distro-tailored install hint for any that are missing."""
+    a distro-tailored install hint for any that are missing. `refresh=true`
+    bypasses the TTL cache (the UI's re-check button, after installing a tool)."""
     from . import tools
 
-    return tools.detect()
+    return tools.detect(refresh=refresh)
 
 
 # --- live SSE channels ------------------------------------------------------

@@ -95,7 +95,8 @@ export function IncidentFeed({ backendUrl, runId, live }: Props) {
               {cpu != null && <span>peak CPU {cpu.toFixed(0)}%</span>}
               {rss != null && <span>peak RSS {rss.toFixed(0)}MB</span>}
               {fds != null && <span>FDs {fds}</span>}
-              <span>{inc.metrics.length} samples</span>
+              {/* the endpoint downsamples the embedded window; metrics_n is the true count */}
+              <span>{inc.metrics_n ?? inc.metrics.length} samples</span>
             </div>
             {inc.ai && <div className="incident__ai">✦ {inc.ai}</div>}
           </div>

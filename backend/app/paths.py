@@ -118,10 +118,6 @@ def run_dir(slug: str, run_folder: str) -> Path:
     return runs_dir(slug) / run_folder
 
 
-def run_artifacts_dir(slug: str, run_folder: str) -> Path:
-    return run_dir(slug, run_folder) / "artifacts"
-
-
 # --- directory creators (mkdir -p) ------------------------------------------
 
 def create_project_dir(slug: str) -> Path:

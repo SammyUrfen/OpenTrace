@@ -174,7 +174,13 @@ def http_get() -> LLMSettings:
 def http_put(data: LLMUpdate) -> LLMSettings:
     cfg = config.load()
     if data.base_url is not None:
-        cfg.llm.base_url = data.base_url.strip() or None
+        new_base = data.base_url.strip() or None
+        # The stored key is bound to the base_url it was entered for: changing
+        # the base without re-entering the key drops the secret, so a redirected
+        # base_url can never receive a key stored for the old host.
+        if new_base != cfg.llm.base_url and not data.api_key:
+            secrets.delete_secret(cfg.llm.api_key_secret_name)
+        cfg.llm.base_url = new_base
     if data.model is not None:
         cfg.llm.model = data.model.strip() or None
     if data.continuous_summaries is not None:

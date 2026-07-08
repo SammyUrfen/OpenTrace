@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
+import { cachedFetch, fetchJsonStrict, isRunImmutable } from './runCache'
 
 /**
  * Lazy fetch of a run sub-resource that returns a single JSON object (e.g.
  * `profile`, `flamegraph`). Re-fetches when the run changes; cancels stale
- * responses. Mirrors `useRunResource` but for object (not array) payloads.
+ * responses. Mirrors `useRunResource` but for object (not array) payloads,
+ * including the shared run cache for finalized (immutable) runs.
  */
 export function useRunObject<T>(
   backendUrl: string,
@@ -20,9 +22,9 @@ export function useRunObject<T>(
     }
     let cancelled = false
     setLoading(true)
-    fetch(`${backendUrl}/runs/${runId}/${resource}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d: T) => {
+    const url = `${backendUrl}/runs/${runId}/${resource}`
+    cachedFetch<T>(runId, url, isRunImmutable(runId), () => fetchJsonStrict<T>(url))
+      .then((d) => {
         if (!cancelled) {
           setData(d ?? null)
           setLoading(false)

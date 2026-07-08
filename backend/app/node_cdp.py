@@ -30,6 +30,25 @@ log = logging.getLogger(__name__)
 _INSPECTOR_PORTS = range(9229, 9330)
 
 
+def _looks_like_node(pid: int) -> bool:
+    """Positive evidence that `pid` is actually Node BEFORE we SIGUSR1 it (SIGUSR1's
+    default disposition is Term — signalling a misdetected non-Node process would
+    kill it): exe basename is exactly node/nodejs, or libnode is mapped (bundled
+    runtimes like Electron)."""
+    exe = ""
+    try:
+        exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+    except OSError:
+        pass
+    if exe in ("node", "nodejs"):
+        return True
+    try:
+        maps = Path(f"/proc/{pid}/maps").read_text(errors="replace")
+    except OSError:
+        return False
+    return "libnode" in maps
+
+
 def _target_inspector_port(pid: int) -> int | None:
     """The inspector port OUR target pid is listening on — so we never attach to a
     DIFFERENT Node's inspector that happens to hold 9229 (multiple node procs, a
@@ -162,6 +181,9 @@ def capture(pid: int, window_s: int, out_path: str, stop=None) -> tuple[bool, st
     process that doesn't handle it terminates it. The caller must gate this to
     Node (see attach._CDP_RUNTIMES). `stop` (a threading.Event) cuts the window
     short on Stop / target-exit."""
+    if not _looks_like_node(pid):
+        return False, ("target does not look like a Node process — refusing to send "
+                       "SIGUSR1 (it would terminate a non-Node process).")
     try:
         os.kill(pid, signal.SIGUSR1)  # ask Node to open its inspector
     except OSError as e:

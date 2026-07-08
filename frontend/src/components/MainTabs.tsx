@@ -1,4 +1,4 @@
-import { useRef, type ReactNode } from 'react'
+import { useRef } from 'react'
 
 export interface TabInfo {
   key: string
@@ -16,11 +16,10 @@ interface Props {
   onClose: (key: string) => void
   /** Double-click a run tab to rename it (diff tabs ignore this). */
   onRename?: (key: string) => void
-  rightSlot?: ReactNode
 }
 
-/** Main tab bar: one tab per open run or diff, plus a right-hand slot. */
-export function MainTabs({ tabs, activeKey, onSelect, onClose, onRename, rightSlot }: Props) {
+/** Main tab bar: one tab per open run or diff. */
+export function MainTabs({ tabs, activeKey, onSelect, onClose, onRename }: Props) {
   const stripRef = useRef<HTMLDivElement>(null)
   // The tab strip hides its scrollbar (see App.css); translate vertical wheel
   // motion into horizontal scroll so overflowing tabs stay reachable.
@@ -71,7 +70,6 @@ export function MainTabs({ tabs, activeKey, onSelect, onClose, onRename, rightSl
           </div>
         ))}
       </div>
-      {rightSlot && <div className="region__right-slot">{rightSlot}</div>}
     </div>
   )
 }

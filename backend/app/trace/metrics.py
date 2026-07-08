@@ -12,9 +12,10 @@ Design notes:
   exceed 100% on multi-core machines — that's intentional; consumers normalize
   by `psutil.cpu_count()` if they want a per-core view.
 - I/O throughput is derived from a *monotonic* cumulative total: each pid's last
-  seen read/write byte counts are carried forward even after it exits, so a
-  child exiting between samples can never make the total drop (which would mask
-  real I/O as zero).
+  seen read/write byte counts are carried forward even after it exits (folded
+  into retired-total scalars once the pid leaves the tree), so a child exiting
+  between samples can never make the total drop (which would mask real I/O as
+  zero) and the per-pid map stays bounded on fork-heavy targets.
 - Self-terminates after a sustained run of empty samples (the whole tree is
   gone) so a poller whose `otrace` parent was SIGKILL'd before `/runs/end` does
   not become a zombie thread writing empty metrics forever; `on_exhausted` lets
@@ -63,8 +64,12 @@ class MetricsPoller:
         self._thread: threading.Thread | None = None
         # persistent Process objects so cpu_percent() deltas are meaningful
         self._procs: dict[int, psutil.Process] = {}
-        # last-seen cumulative IO per pid (carried forward after exit)
+        # last-seen cumulative IO per LIVE pid; dead pids are folded into the
+        # retired scalars below so the dict can't grow one entry per pid ever seen
         self._io_cum: dict[int, tuple[int, int]] = {}
+        self._io_missing: dict[int, int] = {}  # pid -> consecutive ticks absent
+        self._retired_read = 0
+        self._retired_write = 0
         # previous monotonic total for throughput derivation: (t, read, write)
         self._prev_total: tuple[float, int, int] | None = None
 
@@ -130,9 +135,29 @@ class MetricsPoller:
             except psutil.Error:
                 continue
 
-        # Monotonic totals: sum last-seen cumulative across every pid ever seen.
-        total_read = sum(r for r, _ in self._io_cum.values())
-        total_write = sum(w for _, w in self._io_cum.values())
+        # Retire pids gone from the tree into monotonic scalars (a fork-heavy
+        # target would otherwise grow the dict without bound). `set(self._procs)`
+        # is deliberate: _resolve_tree's root-gone early return leaves _procs
+        # stale rather than empty, so a tree-gone tick doesn't mass-retire. A pid
+        # must be absent a few consecutive ticks before retiring, so a transient
+        # children() enumeration miss can't double-count its bytes.
+        live = set(self._procs)
+        for pid in list(self._io_cum):
+            if pid in live:
+                self._io_missing.pop(pid, None)
+                continue
+            misses = self._io_missing.get(pid, 0) + 1
+            if misses >= 3:
+                r, w = self._io_cum.pop(pid)
+                self._io_missing.pop(pid, None)
+                self._retired_read += r
+                self._retired_write += w
+            else:
+                self._io_missing[pid] = misses
+
+        # Monotonic totals: retired (exited pids) + last-seen cumulative (live).
+        total_read = self._retired_read + sum(r for r, _ in self._io_cum.values())
+        total_write = self._retired_write + sum(w for _, w in self._io_cum.values())
         io_read_bps = io_write_bps = None
         if self._prev_total is not None:
             pt, pr, pw = self._prev_total

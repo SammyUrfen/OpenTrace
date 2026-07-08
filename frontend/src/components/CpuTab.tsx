@@ -1,19 +1,14 @@
-import type { MetricSample } from '../state/useOpenTrace'
+import { useMemo } from 'react'
 import type { RunDetail } from '../state/useRunDetail'
+import { maxOf, pts } from './seriesUtils'
 import { TimeSeriesChart } from './TimeSeriesChart'
-
-function pts(metrics: MetricSample[], key: keyof MetricSample): [number, number][] {
-  return metrics
-    .filter((m) => m[key] != null)
-    .map((m) => [m.timestamp_ms, m[key] as number])
-}
 
 export function CpuTab({ detail }: { detail: RunDetail }) {
   const { metrics, anomalies } = detail
-  const cpu = pts(metrics, 'cpu_pct')
-  const syscalls = pts(metrics, 'syscall_rate')
+  const cpu = useMemo(() => pts(metrics, 'cpu_pct'), [metrics])
+  const syscalls = useMemo(() => pts(metrics, 'syscall_rate'), [metrics])
   const cpuBound = anomalies.find((a) => a.rule_id === 'cpu_bound_no_syscalls')
-  const peakCpu = cpu.length ? Math.max(...cpu.map((p) => p[1])) : null
+  const peakCpu = maxOf(cpu, (p) => p[1])
 
   return (
     <div className="overview" data-testid="cpu-tab">

@@ -169,7 +169,7 @@ module.exports = [
       await openTop(ctx, /Run/i)
       const runTexts = (await dropdownTexts(ctx)).join(' | ')
       ctx.assert(/Attach to running process/i.test(runTexts), `Run missing Attach: ${runTexts}`)
-      ctx.assert(/Turn Tracing (On|Off)/i.test(runTexts), `Run missing tracing toggle: ${runTexts}`)
+      ctx.assert(/Turn Terminal Tracing (On|Off)/i.test(runTexts), `Run missing tracing toggle: ${runTexts}`)
       await ctx.press('Escape')
       await ctx.gone('.menubar__dropdown', 4000)
       await openTop(ctx, /Help/i)

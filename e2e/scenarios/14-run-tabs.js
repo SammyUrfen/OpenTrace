@@ -175,17 +175,49 @@ module.exports = [
     run: async (ctx) => {
       const a = await ctx.spawnTarget('cpu'); const b = await ctx.spawnTarget('memgrow')
       await H.attachPid(ctx, a, { window: 3 }); await H.attachPid(ctx, b, { window: 3 })
+      // run A: switch its analytics view to CPU
       await H.openRunByPid(ctx, a)
       await ctx.waitFor('.secondary-tabs', 6000)
       await ctx.page.locator('.secondary-tab', { hasText: /CPU/i }).first().click()
       await ctx.waitFor('[data-testid="cpu-tab"]', 6000)
+      // run B: its own view is independent (defaults to Overview)
       await H.openRunByPid(ctx, b)
+      await ctx.waitFor('[data-testid="overview-tab"]', 6000)
+      // back to A by its pid tab → its CPU view must be preserved, not reset to Overview
+      await ctx.page.locator('.main-tab', { hasText: `pid ${a}` }).first().locator('.main-tab__label').click()
+      await ctx.waitFor('[data-testid="cpu-tab"]', 6000)
+      ctx.assert(
+        await ctx.exists('.secondary-tab--active[data-view="cpu"]'),
+        'CPU view was not preserved after switching tabs away and back',
+      )
+    },
+  },
+  {
+    id: 'tab-finished-run-no-steal-focus',
+    name: 'A second finished run opens a tab but does not steal focus',
+    tags: ['tabs', 'attach'],
+    timeout: 45000,
+    run: async (ctx) => {
+      const a = await ctx.spawnTarget('cpu')
+      await H.attachPid(ctx, a, { window: 3 })
+      await H.openRunByPid(ctx, a) // focus run A
       await ctx.waitFor('.secondary-tabs', 6000)
-      // back to a
-      const n = await tabCount(ctx)
-      await (await nthTab(ctx, n - 2)).locator('.main-tab__label').click()
-      await ctx.waitFor('.secondary-tabs', 6000)
-      ctx.assert((await ctx.count('.secondary-tab')) > 0, 'analytics tabs vanished after switching back')
+      const activeBefore = (
+        await ctx.page.locator('.main-tab[aria-selected="true"] .main-tab__label').innerText()
+      ).trim()
+      const tabsBefore = await tabCount(ctx)
+      // a second run finishes while A is focused → it should open a background tab
+      const b = await ctx.spawnTarget('cpu')
+      await H.attachPid(ctx, b, { window: 3 })
+      await waitTabCount(ctx, tabsBefore + 1) // its tab appeared (auto-opened on finish)
+      await ctx.sleep(600) // let any (unwanted) focus change settle
+      const activeAfter = (
+        await ctx.page.locator('.main-tab[aria-selected="true"] .main-tab__label').innerText()
+      ).trim()
+      ctx.assert(
+        activeAfter === activeBefore,
+        `finished run stole focus (active "${activeBefore}" -> "${activeAfter}")`,
+      )
     },
   },
   {
@@ -249,7 +281,9 @@ module.exports = [
       await waitTabCount(ctx, (await tabCount(ctx)))
       const label = (await lastTab(ctx).locator('.main-tab__label').innerText()).trim()
       const runs = await ctx.api.get('/runs?limit=500')
-      const names = runs.map((r) => (r.label ?? r.display_name ?? String(r.id).slice(0, 8)))
+      // Tab + sidebar both show runLabel = `label ?? command` (the same user-facing
+      // name), never the display_name slug — so assert the tab matches that.
+      const names = runs.map((r) => (r.label ?? r.command ?? String(r.id).slice(0, 8)))
       ctx.assert(names.some((n) => (n || '').trim() === label), `tab label "${label}" matches no backend run name`)
     },
   },

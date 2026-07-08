@@ -12,7 +12,6 @@ interface AiSnapshot {
   text: string
   status: AiStatus
   error: string | null
-  cached: boolean
 }
 
 interface AiState extends AiSnapshot {
@@ -30,14 +29,13 @@ interface Entry {
   text: string
   status: AiStatus
   error: string | null
-  cached: boolean
   es: EventSource | null
   loaded: boolean // cached summary has been fetched for this run
   snapshot: AiSnapshot // stable reference for useSyncExternalStore
   listeners: Set<() => void>
 }
 
-const DEFAULT_SNAPSHOT: AiSnapshot = { text: '', status: 'idle', error: null, cached: false }
+const DEFAULT_SNAPSHOT: AiSnapshot = { text: '', status: 'idle', error: null }
 const store = new Map<string, Entry>()
 
 const keyFor = (backendUrl: string, runId: string) => `${backendUrl}::${runId}`
@@ -49,7 +47,6 @@ function getEntry(key: string): Entry {
       text: '',
       status: 'idle',
       error: null,
-      cached: false,
       es: null,
       loaded: false,
       snapshot: DEFAULT_SNAPSHOT,
@@ -62,7 +59,7 @@ function getEntry(key: string): Entry {
 
 /** Rebuild the immutable snapshot and notify subscribers. */
 function commit(e: Entry) {
-  e.snapshot = { text: e.text, status: e.status, error: e.error, cached: e.cached }
+  e.snapshot = { text: e.text, status: e.status, error: e.error }
   e.listeners.forEach((l) => l())
 }
 
@@ -81,7 +78,6 @@ function loadCached(backendUrl: string, runId: string) {
       if (d.text) {
         e.text = d.text
         e.status = 'done'
-        e.cached = true
       } else if (!d.configured) {
         e.status = 'unconfigured'
       } else {
@@ -98,7 +94,6 @@ function startGenerate(backendUrl: string, runId: string, force: boolean) {
   e.es = null
   e.text = ''
   e.error = null
-  e.cached = false
   e.status = 'thinking'
   commit(e)
 

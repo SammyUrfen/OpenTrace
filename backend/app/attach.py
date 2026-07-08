@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -44,7 +45,9 @@ _MAPS_MARKERS: list[tuple[str, tuple[str, ...]]] = [
 
 # Runtimes whose main binary name is the giveaway (statically-linked interpreters
 # — e.g. conda CPython bakes libpython into the exe — that don't show a
-# distinguishing .so in maps). Matched by exact name or `startswith`.
+# distinguishing .so in maps). Matched by exact name or a version suffix only
+# (python3.11, ruby3.2, php-fpm8.2) — NEVER a loose prefix: "node_exporter" must
+# not detect as node, or the CDP path would SIGUSR1 (and thereby TERMINATE) it.
 _EXE_MARKERS: dict[str, str] = {
     "node": "node",
     "deno": "deno",
@@ -114,9 +117,12 @@ def sampler_argv(tool: str, pid: int, window_s: int, out_path: str) -> list[str]
     """Build the argv to sample `pid` for `window_s` seconds into `out_path`."""
     n, p = str(window_s), str(pid)
     if tool == "py-spy":
-        # --nonblocking: don't pause the target (production-safe, slightly less exact)
+        # --nonblocking: don't pause the target (production-safe, slightly less exact).
+        # --subprocesses: also sample the target's children, so a gunicorn/uWSGI
+        # master's WORKER frames are captured (attach-to-master would otherwise fold
+        # to an idle master); py-spy folds every process into one collapsed stream.
         return ["py-spy", "record", "--pid", p, "--format", "raw", "--rate", "99",
-                "--duration", n, "--nonblocking", "--output", out_path]
+                "--duration", n, "--nonblocking", "--subprocesses", "--output", out_path]
     if tool == "rbspy":
         return ["rbspy", "record", "--pid", p, "--format", "speedscope",
                 "--file", out_path, "--duration", n]
@@ -136,6 +142,13 @@ def sampler_argv(tool: str, pid: int, window_s: int, out_path: str) -> list[str]
         # across versions → the orchestrator's window loop SIGINTs it at window_s.
         return ["phpspy", "-H", "99", "-p", p, "-o", out_path]
     raise ValueError(f"unknown sampler: {tool}")
+
+
+def _exe_matches(exe: str, base: str) -> bool:
+    """`base` exactly, or `base` plus only a version suffix (python3.11, ruby3.2,
+    php-fpm8.2). Letters/underscore after the base never match (node_exporter,
+    node-agent — native binaries that must not be treated as interpreters)."""
+    return exe == base or re.fullmatch(re.escape(base) + r"[-.]?[0-9][0-9.]*", exe) is not None
 
 
 def _read_maps(pid: int) -> str:
@@ -167,8 +180,10 @@ def detect_runtime(pid: int) -> str:
         except (psutil.Error, OSError):
             exe = ""
     if exe:
+        if exe == "nodejs":  # Debian's legacy Node binary name
+            return "node"
         for runtime, base in _EXE_MARKERS.items():
-            if exe == base or exe.startswith(base):
+            if _exe_matches(exe, base):
                 return runtime
 
     # Reachable at all? If we could read maps or exe, it's a real native process.
@@ -198,6 +213,24 @@ def profiler_hint(runtime: str) -> str:
     )
 
 
+def _target_dict(pid: int, name: str, cmdline: str, rss: int) -> dict:
+    """The shared target shape for /runs/attach/targets rows AND /runs/attach/resolve
+    — one place so new fields can't silently diverge between the two."""
+    runtime = detect_runtime(pid)
+    plan = profiler_plan(runtime)
+    return {
+        "pid": pid,
+        "name": name,
+        "cmdline": cmdline or name,
+        "runtime": runtime,
+        "runtime_label": RUNTIME_LABELS.get(runtime, runtime),
+        "hint": profiler_hint(runtime),
+        "sampler": plan["tool"] if plan else None,
+        "rss_mb": round(rss / (1024 * 1024), 1),
+        "container": container.container_info(pid),
+    }
+
+
 def target_info(pid: int) -> dict:
     """Detail for one attach target (used by /runs/attach validation + the run label)."""
     proc = psutil.Process(pid)  # raises NoSuchProcess if gone
@@ -213,19 +246,7 @@ def target_info(pid: int) -> dict:
             rss = proc.memory_info().rss
         except (psutil.Error, OSError):
             rss = 0
-    runtime = detect_runtime(pid)
-    plan = profiler_plan(runtime)
-    return {
-        "pid": pid,
-        "name": name,
-        "cmdline": cmdline or name,
-        "runtime": runtime,
-        "runtime_label": RUNTIME_LABELS.get(runtime, runtime),
-        "hint": profiler_hint(runtime),
-        "sampler": plan["tool"] if plan else None,
-        "rss_mb": round(rss / (1024 * 1024), 1),
-        "container": container.container_info(pid),
-    }
+    return _target_dict(pid, name, cmdline, rss)
 
 
 def list_targets(limit: int = 60) -> list[dict]:
@@ -255,17 +276,5 @@ def list_targets(limit: int = 60) -> list[dict]:
     candidates.sort(reverse=True)  # by rss desc
     out: list[dict] = []
     for rss, pid, name, cmdline in candidates[:limit]:
-        runtime = detect_runtime(pid)
-        plan = profiler_plan(runtime)
-        out.append({
-            "pid": pid,
-            "name": name,
-            "cmdline": cmdline or name,
-            "runtime": runtime,
-            "runtime_label": RUNTIME_LABELS.get(runtime, runtime),
-            "hint": profiler_hint(runtime),
-            "sampler": plan["tool"] if plan else None,
-            "rss_mb": round(rss / (1024 * 1024), 1),
-            "container": container.container_info(pid),
-        })
+        out.append(_target_dict(pid, name, cmdline, rss))
     return out

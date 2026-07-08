@@ -40,7 +40,12 @@ class Broker:
 
     def unsubscribe(self, channel: str, q: queue.Queue) -> None:
         with self._lock:
-            self._subs.get(channel, set()).discard(q)
+            s = self._subs.get(channel)
+            if s is None:
+                return
+            s.discard(q)
+            if not s:  # prune the emptied channel; subscribe() recreates it
+                del self._subs[channel]
 
     def publish(self, run_id: str, type: str, data: dict) -> None:
         payload = {"type": type, "run_id": run_id, "data": data}

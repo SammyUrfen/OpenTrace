@@ -128,8 +128,8 @@ export function RunSidebar({
           />
           Sessions
         </span>
-        <span className="session-list__hint" title="Create from the menu (File ▸ New Session) or ⌘/Ctrl+K">
-          ⌘K
+        <span className="session-list__hint" title="Create from the menu (File ▸ New Session) or Ctrl+K">
+          Ctrl+K
         </span>
       </div>
       <div className="session-list__body">

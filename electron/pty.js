@@ -27,6 +27,62 @@ let tracingEnabled = false
 let rtFile = null
 let activeSessionId = null
 
+// --- scrollback persistence -------------------------------------------------
+// A rolling, capped copy of the pty's output. Replayed into a freshly-mounted
+// xterm (renderer reload / panel remount) so the shell's history isn't lost to a
+// blank screen, and mirrored to disk so it survives a full app restart. The
+// renderer needs no code for this — the replay flows through the same `pty:data`
+// channel the xterm already reads.
+const SCROLLBACK_CAP = 256 * 1024   // chars of output kept for restore
+const PERSIST_DEBOUNCE_MS = 3000
+let scrollbackChunks = []           // output chunks, oldest first
+let scrollbackChars = 0
+let scrollbackFile = null           // on-disk mirror (survives full restart)
+let persistTimer = null
+
+function pushScrollback(data) {
+  scrollbackChunks.push(data)
+  scrollbackChars += data.length
+  while (scrollbackChars > SCROLLBACK_CAP && scrollbackChunks.length > 1) {
+    scrollbackChars -= scrollbackChunks.shift().length
+  }
+  schedulePersist()
+}
+
+function getScrollback() {
+  return scrollbackChunks.join('')
+}
+
+function seedScrollback(text) {
+  scrollbackChunks = text ? [text] : []
+  scrollbackChars = text ? text.length : 0
+}
+
+function schedulePersist() {
+  if (persistTimer || !scrollbackFile) return
+  persistTimer = setTimeout(() => { persistTimer = null; persistNow() }, PERSIST_DEBOUNCE_MS)
+}
+
+function persistNow() {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null }
+  if (!scrollbackFile) return
+  try {
+    fs.writeFileSync(scrollbackFile, getScrollback())
+  } catch {
+    // best-effort; scrollback restore is a convenience, never load-bearing
+  }
+}
+
+function loadPersisted() {
+  if (!scrollbackFile) return ''
+  try {
+    const buf = fs.readFileSync(scrollbackFile, 'utf8')
+    return buf.length > SCROLLBACK_CAP ? buf.slice(buf.length - SCROLLBACK_CAP) : buf
+  } catch {
+    return ''  // no prior file (first run) or unreadable — start clean
+  }
+}
+
 function writeRuntime() {
   if (!rtFile) return
   let body = `export OPENTRACE_ENABLE_STRACE=${tracingEnabled ? '1' : '0'}\n`
@@ -39,9 +95,12 @@ function writeRuntime() {
 }
 
 function shellType(shellPath) {
-  const base = path.basename(shellPath)
-  if (base.includes('zsh')) return 'zsh'
-  return 'bash'
+  // Exact basenames only (leading '-' marks a login shell). Substring checks
+  // would misclassify fish: 'fish'.includes('sh') is true.
+  const base = path.basename(shellPath).replace(/^-/, '')
+  if (base === 'zsh') return 'zsh'
+  if (base === 'bash' || base === 'sh' || base === 'dash') return 'bash'
+  return 'unsupported'
 }
 
 function defaultShell() {
@@ -55,14 +114,52 @@ function banner(text) {
   return `\r\n\x1b[36m[opentrace] ${text}\x1b[0m\r\n`
 }
 
+// A live shell survives renderer reloads (Ctrl+R, dev StrictMode remounts):
+// rebind the session to the (possibly new) WebContents, replay the saved
+// scrollback so the reloaded (blank) xterm shows the full history — not just the
+// current prompt a SIGWINCH jog would repaint — then apply the new geometry.
+function reattach(webContents, cols, rows) {
+  session.webContents = webContents
+  session.cols = cols
+  session.rows = rows
+  const sb = getScrollback()
+  if (sb && !webContents.isDestroyed()) webContents.send('pty:data', sb)
+  resize(cols, rows)
+  return getInfo()
+}
+
 /**
  * Start a pty in the given cwd and stream its output to the given WebContents.
- * Idempotent for a given WebContents — calling again disposes the previous
- * session first. Returns a small info object the caller can hand to a session
- * record.
+ * Idempotent: if a live session exists it is reattached (shell and any running
+ * command survive a renderer reload); the shell is only respawned when the
+ * previous WebContents is gone (true window recreation). Returns a small info
+ * object the caller can hand to a session record.
  */
-function start({ webContents, cwd, cols = 80, rows = 24, backendUrl }) {
-  if (session) dispose()
+function start({ webContents, cwd, cols = 80, rows = 24, backendUrl, scrollbackPath }) {
+  if (scrollbackPath && !scrollbackFile) scrollbackFile = scrollbackPath
+  // A blank xterm that needs the full history replayed into it: a rebuilt window
+  // (below) or a cold start that loads the disk mirror. A restart after the shell
+  // exits reuses the SAME xterm — it still shows the history, so replaying would
+  // duplicate every line; that path leaves `blankXterm` false.
+  let blankXterm = false
+  if (session) {
+    if (!session.webContents.isDestroyed()) {
+      return reattach(webContents, cols, rows)
+    }
+    dispose()          // window destroyed; buffer stays in memory
+    blankXterm = true
+  }
+
+  // Cold start (fresh process, empty buffer): restore from the disk mirror so the
+  // new shell's prompt appears below the history the user had last run.
+  if (scrollbackChars === 0) {
+    const prior = loadPersisted()
+    if (prior) {
+      seedScrollback(prior)
+      blankXterm = true
+    }
+  }
+  const restored = blankXterm ? getScrollback() : ''
 
   const shell = defaultShell()
   const resolvedCwd = cwd || process.cwd()
@@ -100,25 +197,50 @@ function start({ webContents, cwd, cols = 80, rows = 24, backendUrl }) {
   )
 
   // Source the hook once the shell has drawn its first prompt. Leading space so
-  // it stays out of history when HIST_IGNORE_SPACE is set.
+  // it stays out of history when HIST_IGNORE_SPACE is set. The hook is bash/zsh
+  // syntax — sourcing it into fish/nushell/etc. would only spew parse errors,
+  // so unsupported shells get a plain terminal and an explanatory notice.
   setTimeout(() => {
+    if (type === 'unsupported') {
+      sendToSession(
+        proc,
+        banner(`auto-tracing hooks support zsh/bash — terminal works, tracing disabled for ${path.basename(shell)}`),
+      )
+      return
+    }
     proc.write(` source "${hookPath}"\r`)
   }, 350)
 
+  // Read session.webContents at call time (not the start() parameter): a
+  // renderer reload rebinds the session to a fresh handle via reattach(). The
+  // proc identity check keeps a late exit of an already-disposed shell from
+  // touching its replacement session. Every chunk is also mirrored into the
+  // scrollback buffer for reload/restart restore.
   proc.onData((data) => {
-    if (webContents.isDestroyed()) return
-    webContents.send('pty:data', data)
+    pushScrollback(data)
+    sendToSession(proc, data, 'pty:data')
   })
 
   proc.onExit(({ exitCode, signal }) => {
-    if (!webContents.isDestroyed()) {
-      webContents.send('pty:exit', { exitCode, signal })
-    }
+    if (!session || session.proc !== proc) return
+    sendToSession(proc, { exitCode, signal }, 'pty:exit')
+    persistNow()
     session = null
   })
 
-  session = { proc, webContents, shell, cwd: resolvedCwd, cols, rows }
+  session = { proc, webContents, shell, type, cwd: resolvedCwd, cols, rows }
+  // Replay restored history first (a marker separates it from the fresh shell),
+  // before the new shell's prompt streams in on the same channel.
+  if (restored) {
+    sendToSession(proc, restored + banner('restored from previous session'), 'pty:data')
+  }
   return getInfo()
+}
+
+function sendToSession(proc, payload, channel = 'pty:data') {
+  if (!session || session.proc !== proc) return
+  if (session.webContents.isDestroyed()) return
+  session.webContents.send(channel, payload)
 }
 
 function getInfo() {
@@ -142,6 +264,10 @@ function resize(cols, rows) {
 }
 
 function dispose() {
+  // Flush scrollback to disk so the next launch can restore it. Keep the buffer
+  // in memory: dispose() fires from BOTH 'closed' and 'before-quit', so clearing
+  // here would let the second call overwrite the good file with an empty buffer.
+  persistNow()
   if (session) {
     try {
       session.proc.kill()
@@ -167,10 +293,12 @@ function setTracing(enabled) {
   writeRuntime()
 
   if (session && !session.webContents.isDestroyed()) {
-    session.webContents.send(
-      'pty:data',
-      banner(`tracing ${tracingEnabled ? 'enabled' : 'disabled'}`),
-    )
+    // Never claim a state the shell can't deliver: without the zsh/bash hook
+    // the toggle has no effect.
+    const text = session.type === 'unsupported'
+      ? `auto-tracing hooks support zsh/bash — tracing unavailable for ${path.basename(session.shell)}`
+      : `tracing ${tracingEnabled ? 'enabled' : 'disabled'}`
+    session.webContents.send('pty:data', banner(text))
   }
 }
 

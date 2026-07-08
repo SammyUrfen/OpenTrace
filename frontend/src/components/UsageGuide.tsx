@@ -36,7 +36,7 @@ export function UsageGuide() {
 
       <h4 className="guide__h">A good workflow</h4>
       <ol className="guide__list">
-        <li>Turn tracing ON and run your command (e.g. <code>python app.py</code>).</li>
+        <li>Turn Terminal Tracing ON and run your command (e.g. <code>python app.py</code>).</li>
         <li>The finished run opens automatically — read the Overview + AI summary.</li>
         <li>Dig into Timeline / Memory / CPU / I/O / Syscalls (and Profiling or Flamegraph if enabled).</li>
         <li>Right-click two runs → <b>Compare</b> for a side-by-side diff ("better or worse?").</li>

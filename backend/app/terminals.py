@@ -6,7 +6,7 @@ the shell's `HISTFILE` at `histfile_path` so history survives across launches.
 
 Public surface (stable):
 - `Terminal`, `TerminalCreate`, `TerminalUpdate` — pydantic models
-- `create`, `get`, `list_for_session`, `update`, `touch`, `close`, `delete`
+- `create`, `get`, `list_for_session`, `update`, `close`
 - `router` — FastAPI APIRouter mounted at `/terminals`
 """
 from __future__ import annotations
@@ -142,26 +142,9 @@ def update(tid: str, data: TerminalUpdate) -> Terminal | None:
     return term
 
 
-def touch(tid: str) -> Terminal | None:
-    now = now_ms()
-    with db.connect() as conn:
-        cur = conn.execute(
-            "UPDATE terminals SET last_seen_at = ? WHERE id = ?", (now, tid)
-        )
-        if cur.rowcount == 0:
-            return None
-    return get(tid)
-
-
 def close(tid: str) -> Terminal | None:
     """Mark a terminal inactive (its shell exited). Row is kept for history."""
     return update(tid, TerminalUpdate(is_active=False))
-
-
-def delete(tid: str) -> bool:
-    with db.connect() as conn:
-        cur = conn.execute("DELETE FROM terminals WHERE id = ?", (tid,))
-        return cur.rowcount > 0
 
 
 # --- HTTP -------------------------------------------------------------------

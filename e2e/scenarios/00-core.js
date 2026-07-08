@@ -8,7 +8,7 @@ module.exports = [
     run: async (ctx) => {
       await ctx.dismissOnboarding()
       await ctx.assertText(/Backend:\s*connected/i, 'backend not connected')
-      await ctx.assertText(/OpenTrace (ON|OFF)/i, 'tracing toggle missing')
+      await ctx.assertText(/Terminal Tracing (ON|OFF)/i, 'tracing toggle missing')
     },
   },
   {
@@ -36,11 +36,11 @@ module.exports = [
     id: 'tracing-toggle', name: 'Tracing toggle ON/OFF',
     tags: ['smoke'],
     run: async (ctx) => {
-      await ctx.assertText(/OpenTrace OFF/i, 'expected tracing OFF at start')
+      await ctx.assertText(/Terminal Tracing OFF/i, 'expected tracing OFF at start')
       await H.toggleTracing(ctx)
-      await ctx.waitText(/OpenTrace ON/i, 4000)
+      await ctx.waitText(/Terminal Tracing ON/i, 4000)
       await H.toggleTracing(ctx)
-      await ctx.waitText(/OpenTrace OFF/i, 4000)
+      await ctx.waitText(/Terminal Tracing OFF/i, 4000)
     },
   },
   {

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Terminal as XTerm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -65,6 +65,10 @@ export function Terminal({ onStart, onExit }: Props) {
   const onExitRef = useRef(onExit)
   onStartRef.current = onStart
   onExitRef.current = onExit
+  // Set when the shell exits (user typed `exit`, or it crashed); the overlay's
+  // Restart button re-spawns a pty into the same xterm instance.
+  const [exited, setExited] = useState<TerminalExitInfo | null>(null)
+  const restartRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
     const host = hostRef.current
@@ -123,22 +127,34 @@ export function Terminal({ onStart, onExit }: Props) {
           info.signal ? ` signal=${info.signal}` : ''
         }]\x1b[0m\r\n`,
       )
+      setExited(info)
       onExitRef.current?.(info)
     })
 
     const inputDisposable = term.onData((data) => api.write(data))
 
-    api
-      .start({ cols: term.cols, rows: term.rows })
-      .then((info) => {
-        onStartRef.current?.({
-          shell: info.shell,
-          shellName: info.shellName,
-          cwd: info.cwd,
-          pid: info.pid,
+    // pty.start is idempotent in the main process (it disposes any live
+    // session), and the channel-based onData/onExit subscriptions carry the new
+    // session's output into this same xterm — so restart is just start again.
+    const doStart = () => {
+      api
+        .start({ cols: term.cols, rows: term.rows })
+        .then((info) => {
+          setExited(null)
+          fit.fit()
+          api.resize(term.cols, term.rows)
+          term.focus()
+          onStartRef.current?.({
+            shell: info.shell,
+            shellName: info.shellName,
+            cwd: info.cwd,
+            pid: info.pid,
+          })
         })
-      })
-      .catch((err) => term.write(`\r\n[opentrace] failed to start pty: ${err}\r\n`))
+        .catch((err) => term.write(`\r\n[opentrace] failed to start pty: ${err}\r\n`))
+    }
+    restartRef.current = doStart
+    doStart()
 
     const observer = new ResizeObserver(() => {
       try {
@@ -151,6 +167,7 @@ export function Terminal({ onStart, onExit }: Props) {
     observer.observe(host)
 
     return () => {
+      restartRef.current = null
       observer.disconnect()
       themeObserver.disconnect()
       host.removeEventListener('contextmenu', onContextMenu)
@@ -171,5 +188,22 @@ export function Terminal({ onStart, onExit }: Props) {
     )
   }
 
-  return <div ref={hostRef} className="terminal-pane" />
+  // xterm stays a descendant of .terminal-pane so descendant selectors
+  // (e.g. `.terminal-pane .xterm`) keep matching with the overlay present.
+  return (
+    <div className="terminal-pane">
+      <div ref={hostRef} className="terminal-pane__host" />
+      {exited && (
+        <div className="terminal-pane__exit-overlay">
+          <span>
+            shell exited (code {exited.exitCode}
+            {exited.signal ? `, signal ${exited.signal}` : ''})
+          </span>
+          <button type="button" className="ai-btn" onClick={() => restartRef.current?.()}>
+            Restart shell
+          </button>
+        </div>
+      )}
+    </div>
+  )
 }

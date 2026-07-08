@@ -15,7 +15,12 @@ export function severityColor(maxSeverity: string | null, status: string): strin
   return SEVERITY_COLOR[maxSeverity ?? 'clean'] ?? '#4ade80'
 }
 
-export function statusLabel(run: { status: string; exit_code: number | null; exit_signal: string | null }): string {
+export function statusLabel(run: {
+  status: string
+  exit_code: number | null
+  exit_signal: string | null
+  collector_config?: Record<string, boolean> | null
+}): string {
   switch (run.status) {
     case 'running':
       return 'running'
@@ -24,15 +29,28 @@ export function statusLabel(run: { status: string; exit_code: number | null; exi
     case 'error':
       return 'error'
     default:
+      // Attach runs profile an already-running target for a bounded window; the
+      // target usually outlives us, so a null exit code is normal, not a failure.
+      // Use profiling-appropriate wording instead of exit-code semantics.
+      if (run.collector_config?.attach) {
+        if (run.exit_code == null && !run.exit_signal) return 'profiled'
+        return 'target exited'
+      }
       if (run.exit_signal) return run.exit_signal
       if (run.exit_code === 0) return 'ok'
       return `exit ${run.exit_code ?? '?'}`
   }
 }
 
-export function statusClass(run: { status: string; exit_code: number | null }): string {
+export function statusClass(run: {
+  status: string
+  exit_code: number | null
+  collector_config?: Record<string, boolean> | null
+}): string {
   if (run.status === 'running' || run.status === 'analyzing') return 'running'
   if (run.status === 'error') return 'fail'
+  // An attach run's exit code isn't ours to judge — keep it neutral (non-red).
+  if (run.collector_config?.attach) return 'ok'
   return run.exit_code === 0 ? 'ok' : 'fail'
 }
 

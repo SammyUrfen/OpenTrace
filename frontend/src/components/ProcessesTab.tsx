@@ -1,5 +1,6 @@
 import { useRunResource } from '../state/useRunResource'
 import { formatDuration } from '../state/format'
+import { basename } from './textUtils'
 
 export interface ProcRow {
   pid: number
@@ -11,12 +12,6 @@ export interface ProcRow {
   duration_ms: number | null
   exited: boolean
   ephemeral: boolean
-}
-
-function basename(p: string | null): string {
-  if (!p) return '?'
-  const i = p.lastIndexOf('/')
-  return i >= 0 ? p.slice(i + 1) || p : p
 }
 
 export function ProcessTable({ rows }: { rows: ProcRow[] }) {

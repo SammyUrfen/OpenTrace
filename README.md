@@ -101,7 +101,15 @@ for the product spec + phase status, and **`CLAUDE.md`** for a contributor orien
 ## Quick start
 
 OpenTrace targets **Linux**. The backend runs in a conda env (`opentrace-dev`, Python
-3.11+); the desktop shell is Electron + Node.
+3.11+) — any Python 3.11+ env with the backend installed works too (`start.sh` probes
+the interpreter; override with `OPENTRACE_PYTHON`). The desktop shell is Electron + Node.
+
+**Prerequisites:** Node.js **>= 22.12** with npm (required by Electron 42 and
+`@electron/rebuild` 4), plus a C/C++ toolchain for the node-pty native build —
+node-pty ships no Linux prebuilds, so it always compiles from source here
+(Fedora: `sudo dnf install gcc-c++ make`; Debian/Ubuntu: `sudo apt install
+build-essential`). node-gyp's Python requirement is covered by the activated
+conda env.
 
 ```bash
 # backend deps (once), in the conda env

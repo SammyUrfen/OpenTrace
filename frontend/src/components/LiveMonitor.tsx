@@ -1,6 +1,7 @@
 import type { LiveAlert, LiveState, Run } from '../state/useOpenTrace'
 import type { Collectors } from '../state/useCollectors'
 import { SEVERITY_COLOR, formatBytesPerSec, formatDuration } from '../state/format'
+import { COLLECTOR_ROWS } from './collectorRows'
 import { Sparkline } from './Sparkline'
 
 interface Props {
@@ -11,18 +12,6 @@ interface Props {
   collectors: Collectors | null
   onToggleCollector: (key: keyof Collectors) => void
 }
-
-const COLLECTOR_ROWS: {
-  key: keyof Collectors
-  label: string
-  sub: string
-  enabled: boolean
-}[] = [
-  { key: 'psutil', label: 'Resource metrics', sub: 'CPU · Memory · FDs', enabled: true },
-  { key: 'strace', label: 'Syscall trace', sub: 'Syscalls · I/O · Network', enabled: true },
-  { key: 'ltrace', label: 'Library calls', sub: 'malloc/free · hotspots', enabled: true },
-  { key: 'perf', label: 'Hardware perf', sub: 'CPU flamegraph', enabled: true },
-]
 
 const COLLECTOR_HINTS: Partial<Record<keyof Collectors, string>> = {
   ltrace: 'Library + malloc/free tracing — uses ptrace, so it replaces Syscall trace',
@@ -39,27 +28,20 @@ function Collectors({
   return (
     <div className="collectors">
       <div className="collectors__title">Collectors</div>
-      {COLLECTOR_ROWS.map((c) => {
-        const on = collectors ? collectors[c.key] : false
-        return (
-          <label
-            key={c.key}
-            className={`collector ${c.enabled ? '' : 'collector--disabled'}`}
-            title={COLLECTOR_HINTS[c.key] ?? ''}
-          >
-            <input
-              type="checkbox"
-              checked={on}
-              disabled={!c.enabled || !collectors}
-              onChange={() => onToggle(c.key)}
-            />
-            <span className="collector__text">
-              <span className="collector__label">{c.label}</span>
-              <span className="collector__sub">{c.sub}</span>
-            </span>
-          </label>
-        )
-      })}
+      {COLLECTOR_ROWS.map((c) => (
+        <label key={c.key} className="collector" title={COLLECTOR_HINTS[c.key] ?? ''}>
+          <input
+            type="checkbox"
+            checked={collectors ? collectors[c.key] : false}
+            disabled={!collectors}
+            onChange={() => onToggle(c.key)}
+          />
+          <span className="collector__text">
+            <span className="collector__label">{c.label}</span>
+            <span className="collector__sub">{c.sub}</span>
+          </span>
+        </label>
+      ))}
     </div>
   )
 }

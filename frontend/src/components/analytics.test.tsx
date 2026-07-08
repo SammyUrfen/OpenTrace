@@ -111,6 +111,19 @@ describe('TimeSeriesChart robustness', () => {
     expect(container.querySelector('svg')).toBeInTheDocument()
   })
 
+  it('renders a monitor-scale series (150k points) without crashing', () => {
+    // Regression: spreading Math.max over the flattened points threw RangeError
+    // (blank app) past ~125k points; paths must also stay bounded via decimation.
+    const points: [number, number][] = Array.from({ length: 150_000 }, (_, i) => [i, (i % 97) + 1])
+    const { container } = render(
+      <TimeSeriesChart series={[{ name: 'rss', color: '#c084fc', points, area: true }]} />,
+    )
+    const path = container.querySelector('path')
+    expect(path).toBeInTheDocument()
+    // ~1500 decimated points × ~14 chars ≪ raw path size
+    expect((path!.getAttribute('d') || '').length).toBeLessThan(40_000)
+  })
+
   it('filters NaN/Infinity points so paths never contain NaN', () => {
     const { container } = render(
       <TimeSeriesChart

@@ -1,5 +1,6 @@
 import { useRunObject } from '../state/useRunObject'
 import { formatBytes } from '../state/format'
+import { StatCell } from './StatCell'
 
 interface MallocProfile {
   supported: boolean
@@ -29,15 +30,6 @@ interface Profile {
 interface Props {
   backendUrl: string
   runId: string
-}
-
-function Stat({ label, value, warn }: { label: string; value: string; warn?: boolean }) {
-  return (
-    <div className="stat-cell">
-      <div className={`stat-cell__value ${warn ? 'stat-cell__value--warn' : ''}`}>{value}</div>
-      <div className="stat-cell__label">{label}</div>
-    </div>
-  )
 }
 
 /** Allocation ledger + library-call hotspots for an ltrace (Library calls) run. */
@@ -72,14 +64,14 @@ export function ProfilingTab({ backendUrl, runId }: Props) {
     <div className="overview" data-testid="profiling-tab">
       <h3 className="overview__h">Allocation profile</h3>
       <div className="stat-grid">
-        <Stat label="allocations" value={m.n_alloc.toLocaleString()} />
-        <Stat label="frees" value={m.n_free.toLocaleString()} />
-        <Stat label="bytes allocated" value={formatBytes(m.bytes_allocated)} />
-        <Stat label="bytes freed" value={formatBytes(m.bytes_freed)} />
-        <Stat label="peak live" value={formatBytes(m.peak_live_bytes)} />
-        <Stat label="leaked (live at exit)" value={formatBytes(m.outstanding_bytes)} warn={leaked} />
-        <Stat label="live blocks" value={m.outstanding_blocks.toLocaleString()} warn={leaked} />
-        <Stat label="unmatched frees" value={m.free_unmatched.toLocaleString()} warn={m.free_unmatched > 0} />
+        <StatCell label="allocations" value={m.n_alloc.toLocaleString()} />
+        <StatCell label="frees" value={m.n_free.toLocaleString()} />
+        <StatCell label="bytes allocated" value={formatBytes(m.bytes_allocated)} />
+        <StatCell label="bytes freed" value={formatBytes(m.bytes_freed)} />
+        <StatCell label="peak live" value={formatBytes(m.peak_live_bytes)} />
+        <StatCell label="leaked (live at exit)" value={formatBytes(m.outstanding_bytes)} warn={leaked} />
+        <StatCell label="live blocks" value={m.outstanding_blocks.toLocaleString()} warn={leaked} />
+        <StatCell label="unmatched frees" value={m.free_unmatched.toLocaleString()} warn={m.free_unmatched > 0} />
       </div>
 
       {m.largest_live.length > 0 && (

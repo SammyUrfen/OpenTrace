@@ -9,7 +9,12 @@ const STATUS_LABEL: Record<BackendStatus, string> = {
 export function MainContentPlaceholder({ backendStatus }: { backendStatus: BackendStatus }) {
   return (
     <div className="region region--main-content" data-placeholder="main-content">
-      <div className="region__label">Main content area</div>
+      <div className="main-content__welcome">
+        <div className="main-content__title">No run open</div>
+        <div className="main-content__hint">
+          Trace a command in the terminal below, or attach to a running process.
+        </div>
+      </div>
       <div className={`backend-badge backend-badge--${backendStatus}`}>
         Backend: {STATUS_LABEL[backendStatus]}
       </div>

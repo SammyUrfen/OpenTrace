@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { MainTabs, type TabInfo } from './components/MainTabs'
 import { SecondaryTabs } from './components/SecondaryTabs'
@@ -20,18 +20,58 @@ import { AttachModal } from './components/AttachModal'
 import { RunNameBar } from './components/RunNameBar'
 import { FirstRunWizard } from './components/FirstRunWizard'
 import { useTracing } from './state/useTracing'
-import { useOpenTrace } from './state/useOpenTrace'
+import {
+  useOpenTrace,
+  type Incident,
+  type LiveAlert,
+  type Project,
+  type Run,
+} from './state/useOpenTrace'
 import { useRunDetail } from './state/useRunDetail'
+import { useLiveMetrics } from './state/liveMetrics'
 import { useTheme } from './state/useTheme'
-import { useCollectors } from './state/useCollectors'
+import { useCollectors, type Collectors } from './state/useCollectors'
 import { useTabs, tabKey } from './state/useTabs'
 import { useResizable } from './state/useResizable'
 import { severityColor } from './state/format'
-import { commandBasename } from './state/text'
+import { commandBasename, runLabel } from './state/text'
 
 const BACKEND_URL =
   (typeof window !== 'undefined' && window.opentrace?.backendUrl) ||
   'http://localhost:8000'
+
+// Memoized shells for the heavy subtrees: App re-renders on every SSE
+// lifecycle/alert/incident event, and stable props let these bail out.
+const MemoMainTabs = memo(MainTabs)
+const MemoRunSidebar = memo(RunSidebar)
+
+// Stable empty fallbacks so `?? []` doesn't defeat the memoization above.
+const EMPTY_ALERTS: LiveAlert[] = []
+const EMPTY_INCIDENTS: Incident[] = []
+
+/** LiveMonitor with the 4Hz live-metric subscription scoped to itself, so
+ *  metric samples re-render only this pane (not the whole App tree). */
+const LiveMonitorPane = memo(function LiveMonitorPane({
+  activeRun, alerts, tracing, collectors, onToggleCollector,
+}: {
+  activeRun: Run | null
+  alerts: LiveAlert[]
+  tracing: boolean
+  collectors: Collectors | null
+  onToggleCollector: (key: keyof Collectors) => void
+}) {
+  const live = useLiveMetrics(activeRun?.id ?? null)
+  return (
+    <LiveMonitor
+      activeRun={activeRun}
+      live={live}
+      alerts={alerts}
+      tracing={tracing}
+      collectors={collectors}
+      onToggleCollector={onToggleCollector}
+    />
+  )
+})
 
 function App() {
   const { enabled: tracing, setEnabled: setTracing, ready: tracingReady } = useTracing()
@@ -82,10 +122,10 @@ function App() {
     }
   }, [ot.projects, activeSessionId])
 
-  const selectSession = (id: string) => {
+  const selectSession = useCallback((id: string) => {
     setActiveSessionId(id)
     void window.opentrace?.session?.set(id)
-  }
+  }, [])
   const createSession = async (name: string) => {
     const proj = await ot.createSession(name)
     if (proj) selectSession(proj.id)
@@ -116,6 +156,16 @@ function App() {
     return api.onAction(handleMenuAction)
   }, [handleMenuAction])
 
+  // Backend-process lifecycle from the Electron main process (crash → auto
+  // restart → give-up). Complements the SSE-derived reachability below: that
+  // says "unreachable", this says why. Cleared on the 'ok' heartbeat.
+  const [backendProc, setBackendProc] = useState<{ state: 'restarting' | 'ok' | 'failed'; attempt?: number; max?: number } | null>(null)
+  useEffect(() => {
+    const api = window.opentrace?.backend
+    if (!api) return
+    return api.onStatus((p) => setBackendProc(p.state === 'ok' ? null : p))
+  }, [])
+
   const MENUS: MenuDef[] = [
     { label: 'File', items: [
       { label: 'New Session', action: 'new-session', accel: 'Ctrl+N' },
@@ -130,7 +180,7 @@ function App() {
       { label: 'Toggle Theme', action: 'toggle-theme' },
     ] },
     { label: 'Run', items: [
-      { label: tracing ? 'Turn Tracing Off' : 'Turn Tracing On', action: 'toggle-tracing', accel: 'Ctrl+Shift+T' },
+      { label: tracing ? 'Turn Terminal Tracing Off' : 'Turn Terminal Tracing On', action: 'toggle-tracing', accel: 'Ctrl+Shift+T' },
       { separator: true },
       { label: 'Attach to running process…', action: 'attach-process' },
     ] },
@@ -154,19 +204,25 @@ function App() {
 
   const focusedTab = tabs.find((t) => tabKey(t) === activeKey) ?? null
   const focusedRunId = focusedTab?.kind === 'run' ? focusedTab.runId : null
+  // Live mirror of activeKey for the lastEnded effect below — read without adding
+  // activeKey to that effect's deps (which would re-open closed tabs on switch).
+  const focusedKeyRef = useRef(activeKey)
+  useEffect(() => { focusedKeyRef.current = activeKey }, [activeKey])
   const focusedRun = focusedRunId ? ot.runs.find((r) => r.id === focusedRunId) ?? null : null
   // Gate on focusedRun (not focusedRunId): when a run is deleted it leaves ot.runs
   // a render before its tab is pruned — fetching the stale id would 404 (3 console
   // errors). Passing the id only while the run still exists avoids the doomed fetch.
   const detail = useRunDetail(BACKEND_URL, focusedRun?.id ?? null, focusedRun?.status)
-  const focusedLive = focusedRunId ? ot.live[focusedRunId] ?? null : null
 
-  // Finished runs auto-open as the focused tab (roadmap behaviour), and — unless
-  // opted out — surface the non-blocking name prompt for the fresh run (once).
+  // A finished run always opens as a tab, but only *steals focus* when nothing is
+  // currently focused — otherwise it opens in the background so it can't yank the
+  // user off the tab they're reading (or a run whose name they're mid-editing).
+  // The name prompt only makes sense on the focused run, so it's tied to focusing.
   useEffect(() => {
     if (!ot.lastEnded) return
-    openRun(ot.lastEnded.id)
-    if (namePrompt && !dismissedNames.current.has(ot.lastEnded.id)) {
+    const focus = focusedKeyRef.current == null
+    openRun(ot.lastEnded.id, focus)
+    if (focus && namePrompt && !dismissedNames.current.has(ot.lastEnded.id)) {
       setNameBarRunId(ot.lastEnded.id)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -178,30 +234,82 @@ function App() {
     if (nameBarRunId && focusedRunId !== nameBarRunId) dismissNameBar(nameBarRunId)
   }, [focusedRunId, nameBarRunId, dismissNameBar])
 
-  const openRunRename = (id: string) => {
+  const openRunRename = useCallback((id: string) => {
     const r = ot.runs.find((x) => x.id === id)
     if (r) setRunRename({ id, name: r.label ?? r.display_name })
-  }
+  }, [ot.runs])
 
-  // Prune tabs whose run(s) no longer exist; reconcile the active tab. Wait for
-  // the first run-list load so restored tabs aren't wiped against an empty list.
+  // Prune tabs whose run(s) are confirmed gone; reconcile the active tab.
+  // `refresh()` only fetches the newest 200 runs, so absence from ot.runs is
+  // NOT deletion: unknown ids are resolved against GET /runs/{id} — a 404
+  // prunes the tab, a 200 keeps it and merges the run into state (sidebar
+  // label / severity / detail gating all key off ot.runs), and a network
+  // error fails open (never destroy persisted tabs on a blip). Wait for the
+  // first run-list load so restored tabs aren't wiped against an empty list.
+  const resolvedRuns = useRef<Map<string, Run>>(new Map())
+  const missingRuns = useRef<Set<string>>(new Set())
   useEffect(() => {
     if (!ot.loaded) return
     const ids = new Set(ot.runs.map((r) => r.id))
-    tabsApi.setTabs((prev) => {
-      const next = prev.filter((t) =>
-        t.kind === 'run' ? ids.has(t.runId) : ids.has(t.aId) && ids.has(t.bId),
-      )
-      return next.length === prev.length ? prev : next
+    const referenced = new Set<string>()
+    for (const t of tabs) {
+      if (t.kind === 'run') referenced.add(t.runId)
+      else { referenced.add(t.aId); referenced.add(t.bId) }
+    }
+    const prune = () =>
+      tabsApi.setTabs((prev) => {
+        const gone = (id: string) => missingRuns.current.has(id)
+        const next = prev.filter((t) =>
+          t.kind === 'run' ? !gone(t.runId) : !gone(t.aId) && !gone(t.bId),
+        )
+        return next.length === prev.length ? prev : next
+      })
+    const unknown: string[] = []
+    for (const id of referenced) {
+      if (ids.has(id)) continue
+      const known = resolvedRuns.current.get(id)
+      // refresh() replaces the run list wholesale — re-merge verified runs.
+      if (known) ot.upsertRun(known)
+      else if (!missingRuns.current.has(id)) unknown.push(id)
+    }
+    prune()
+    if (unknown.length === 0) return
+    let cancelled = false
+    void Promise.allSettled(
+      unknown.map(async (id) => {
+        const r = await fetch(`${BACKEND_URL}/runs/${id}`)
+        if (r.status === 404) {
+          missingRuns.current.add(id)
+        } else if (r.ok) {
+          const run: Run = await r.json()
+          resolvedRuns.current.set(id, run)
+          if (!cancelled) ot.upsertRun(run)
+        }
+        // other statuses / thrown errors: fail open, keep the tab
+      }),
+    ).then(() => {
+      if (!cancelled) prune()
     })
+    return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ot.runs, ot.loaded])
+  }, [ot.runs, ot.loaded, tabs])
   useEffect(() => {
     if (activeKey && !tabs.some((t) => tabKey(t) === activeKey)) {
-      tabsApi.setActiveKey(tabs.length ? tabKey(tabs[tabs.length - 1]) : null)
+      const next = tabs.length ? tabKey(tabs[tabs.length - 1]) : null
+      // select() (not setActiveKey) so the tab's remembered view is restored.
+      if (next) select(next)
+      else tabsApi.setActiveKey(null)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs, activeKey])
+
+  // Deleted runs must never be "resolved" back into existence by tab restore.
+  const otDeleteRun = ot.deleteRun
+  const deleteRun = useCallback(async (id: string) => {
+    missingRuns.current.add(id)
+    resolvedRuns.current.delete(id)
+    await otDeleteRun(id)
+  }, [otDeleteRun])
 
   // Backend reachability is derived from the always-open SSE connection
   // (`useOpenTrace`) rather than a separate /health poll — the stream IS the live
@@ -216,12 +324,14 @@ function App() {
       : 'connecting'
 
   // Build the tab bar info (resolve run names / diff labels).
-  const tabInfos: TabInfo[] = tabs.map((t) => {
+  const tabInfos: TabInfo[] = useMemo(() => tabs.map((t) => {
     if (t.kind === 'run') {
       const r = ot.runs.find((x) => x.id === t.runId)
       return {
         key: tabKey(t),
-        label: r?.label ?? r?.display_name ?? t.runId.slice(0, 8),
+        // Same name the sidebar shows (runLabel = label ?? command) so a run
+        // reads identically on its tab and its sidebar row.
+        label: r ? runLabel(r) : t.runId.slice(0, 8),
         dotColor: r ? severityColor(r.max_severity, r.status) : undefined,
         title: r?.command,
       }
@@ -232,9 +342,31 @@ function App() {
       key: tabKey(t),
       label: `${commandBasename(a?.command ?? '?')} ↔ ${commandBasename(b?.command ?? '?')}`,
       diff: true,
-      title: `Diff: ${a?.label ?? a?.display_name ?? t.aId} ↔ ${b?.label ?? b?.display_name ?? t.bId}`,
+      title: `Diff: ${a ? runLabel(a) : t.aId} ↔ ${b ? runLabel(b) : t.bId}`,
     }
-  })
+  }), [tabs, ot.runs])
+
+  // Stable handlers for the memoized MainTabs / RunSidebar / RunView shells.
+  const renameTab = useCallback((key: string) => {
+    if (key.startsWith('run:')) openRunRename(key.slice(4))
+  }, [openRunRename])
+  const handleSelectRun = useCallback((run: Run) => openRun(run.id), [openRun])
+  const handleDeleteRun = useCallback((run: Run) => void deleteRun(run.id), [deleteRun])
+  const handleRenameRun = useCallback(
+    (run: Run) => setRunRename({ id: run.id, name: run.label ?? run.display_name }),
+    [],
+  )
+  const handleCompareRuns = useCallback((a: Run, b: Run) => openDiff(a.id, b.id), [openDiff])
+  const handleSelectSession = useCallback((p: Project) => selectSession(p.id), [selectSession])
+  const handleRenameSession = useCallback(
+    (p: Project) => setSessionModal({ mode: 'rename', id: p.id, name: p.display_name }),
+    [],
+  )
+  const openAiSettings = useCallback(() => setSettings({ section: 'ai' }), [])
+  const otStopMonitor = ot.stopMonitor
+  const stopFocusedMonitor = useCallback(() => {
+    if (focusedRunId) void otStopMonitor(focusedRunId)
+  }, [focusedRunId, otStopMonitor])
 
   const views = focusedTab?.kind === 'diff' ? DIFF_VIEWS : runViews(focusedRun)
 
@@ -243,7 +375,7 @@ function App() {
     { id: 'a-new-session', group: 'Action', label: 'New session', run: () => setSessionModal({ mode: 'create' }) },
     { id: 'a-attach', group: 'Action', label: 'Attach to running process', run: () => setAttachOpen(true) },
     { id: 'a-settings', group: 'Action', label: 'Open settings', run: () => setSettings({ section: 'general' }) },
-    { id: 'a-tracing', group: 'Action', label: tracing ? 'Turn tracing OFF' : 'Turn tracing ON', run: () => setTracing(!tracing) },
+    { id: 'a-tracing', group: 'Action', label: tracing ? 'Turn terminal tracing OFF' : 'Turn terminal tracing ON', run: () => setTracing(!tracing) },
     { id: 'a-theme', group: 'Action', label: 'Toggle theme', run: toggleTheme },
     { id: 'a-guide', group: 'Action', label: 'How to use OpenTrace', run: () => setSettings({ section: 'guide' }) },
     ...ot.projects.map((p) => ({
@@ -286,12 +418,24 @@ function App() {
           <TracingToggle enabled={tracing} onChange={setTracing} disabled={!tracingReady} />
         </div>
       </div>
-      <MainTabs
+      {/* Persistent backend-health strip: the no-tab placeholder shows status, but a
+          mid-session backend crash must also be visible while a run/diff is focused.
+          position:fixed keeps it out of the app-shell grid. */}
+      {(backendProc || (backendStatus === 'unreachable' && focusedTab != null)) && (
+        <div className="backend-banner" role="alert">
+          {backendProc?.state === 'restarting'
+            ? `Backend crashed — restarting (attempt ${backendProc.attempt ?? 1}/${backendProc.max ?? 3})…`
+            : backendProc?.state === 'failed'
+              ? 'Backend could not be restarted — restart OpenTrace (see logs).'
+              : 'Backend unreachable — showing cached data; live updates paused.'}
+        </div>
+      )}
+      <MemoMainTabs
         tabs={tabInfos}
         activeKey={activeKey}
         onSelect={select}
         onClose={close}
-        onRename={(key) => { if (key.startsWith('run:')) openRunRename(key.slice(4)) }}
+        onRename={renameTab}
       />
       {focusedTab ? (
         <SecondaryTabs views={views} active={activeView} onSelect={setActiveView} />
@@ -304,12 +448,11 @@ function App() {
         <RunView
           run={focusedRun}
           detail={detail}
-          live={focusedLive}
           activeView={activeView}
           backendUrl={BACKEND_URL}
-          onOpenSettings={() => setSettings({ section: 'ai' })}
-          incidents={ot.incidents[focusedRun.id] ?? []}
-          onStopMonitor={() => void ot.stopMonitor(focusedRun.id)}
+          onOpenSettings={openAiSettings}
+          incidents={ot.incidents[focusedRun.id] ?? EMPTY_INCIDENTS}
+          onStopMonitor={stopFocusedMonitor}
           topSlot={
             namePrompt && nameBarRunId === focusedRun.id ? (
               <RunNameBar
@@ -338,18 +481,18 @@ function App() {
           onMouseDown={sidebar.onMouseDown}
           title="Drag to resize"
         />
-        <RunSidebar
+        <MemoRunSidebar
           projects={ot.projects}
           runs={ot.runs}
           connected={ot.connected}
           activeRunId={focusedRunId}
           activeSessionId={activeSessionId}
-          onSelectRun={(run) => openRun(run.id)}
-          onDeleteRun={(run) => void ot.deleteRun(run.id)}
-          onRenameRun={(run) => setRunRename({ id: run.id, name: run.label ?? run.display_name })}
-          onCompareRuns={(a, b) => openDiff(a.id, b.id)}
-          onSelectSession={(p) => selectSession(p.id)}
-          onRenameSession={(p) => setSessionModal({ mode: 'rename', id: p.id, name: p.display_name })}
+          onSelectRun={handleSelectRun}
+          onDeleteRun={handleDeleteRun}
+          onRenameRun={handleRenameRun}
+          onCompareRuns={handleCompareRuns}
+          onSelectSession={handleSelectSession}
+          onRenameSession={handleRenameSession}
         />
       </div>
       <div className="region region--bottom-panel" data-placeholder="bottom-panel">
@@ -360,12 +503,13 @@ function App() {
         />
         <div className="bottom-split">
           <div className="bottom-split__terminal">
-            <Terminal onStart={() => void ot.refresh()} onExit={() => void ot.refresh()} />
+            {/* Run lifecycle arrives over SSE (+ refresh-on-reconnect), so
+                shell start/exit doesn't need a world refetch. */}
+            <Terminal />
           </div>
-          <LiveMonitor
+          <LiveMonitorPane
             activeRun={ot.runs.find((r) => r.id === ot.liveRunId) ?? null}
-            live={ot.liveRunId ? ot.live[ot.liveRunId] ?? null : null}
-            alerts={ot.liveRunId ? ot.alerts[ot.liveRunId] ?? [] : []}
+            alerts={ot.liveRunId ? ot.alerts[ot.liveRunId] ?? EMPTY_ALERTS : EMPTY_ALERTS}
             tracing={tracing}
             collectors={collectors}
             onToggleCollector={toggleCollector}
@@ -391,7 +535,11 @@ function App() {
           backendUrl={BACKEND_URL}
           sessionId={activeSessionId}
           onClose={() => setAttachOpen(false)}
-          onAttached={() => void ot.refresh()}
+          onAttached={() => {
+            // The run streams in over SSE; refetch only if the stream is down
+            // (attach can succeed while the EventSource is in retry backoff).
+            if (!ot.connected) void ot.refresh()
+          }}
         />
       )}
       {runRename && (

@@ -1,5 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Collectors } from '../state/useCollectors'
+import { COLLECTOR_ROWS } from './collectorRows'
+import { LlmConfigForm, type LlmConfigHandle } from './LlmConfigForm'
+import { ToolChecklist, type ToolInfo } from './ToolChecklist'
 import { UsageGuide } from './UsageGuide'
 
 export type SettingsSection = 'general' | 'collectors' | 'ai' | 'tools' | 'guide' | 'about'
@@ -16,18 +19,6 @@ interface Props {
   onToggleNamePrompt: () => void
 }
 
-interface ToolInfo {
-  name: string
-  label: string
-  unlocks: string
-  available: boolean
-  version: string | null
-  install_hint: string | null
-  warning?: string
-}
-
-const GOOGLE_BASE = 'https://generativelanguage.googleapis.com/v1beta/openai'
-
 const NAV: { key: SettingsSection; label: string }[] = [
   { key: 'general', label: 'General' },
   { key: 'collectors', label: 'Collectors' },
@@ -35,13 +26,6 @@ const NAV: { key: SettingsSection; label: string }[] = [
   { key: 'tools', label: 'Tracing tools' },
   { key: 'guide', label: 'Guide' },
   { key: 'about', label: 'About' },
-]
-
-const COLLECTOR_ROWS: { key: keyof Collectors; label: string; sub: string }[] = [
-  { key: 'psutil', label: 'Resource metrics', sub: 'CPU · Memory · FDs · threads' },
-  { key: 'strace', label: 'Syscall trace', sub: 'Syscalls · I/O · Network · Logs' },
-  { key: 'ltrace', label: 'Library calls', sub: 'malloc/free · library hotspots (replaces Syscall trace)' },
-  { key: 'perf', label: 'Hardware perf', sub: 'CPU flamegraph · function hotspots' },
 ]
 
 export function SettingsPage({
@@ -168,32 +152,14 @@ function CollectorsPane({ collectors, onToggle }: {
 }
 
 function AiPane({ backendUrl }: { backendUrl: string }) {
-  const [baseUrl, setBaseUrl] = useState('')
-  const [model, setModel] = useState('')
-  const [apiKey, setApiKey] = useState('')
-  const [hasKey, setHasKey] = useState(false)
+  const formRef = useRef<LlmConfigHandle>(null)
   const [continuous, setContinuous] = useState(false)
-  const [test, setTest] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
-  useEffect(() => {
-    fetch(`${backendUrl}/config/llm`).then((r) => r.json()).then((d) => {
-      setBaseUrl(d.base_url ?? '')
-      setModel(d.model ?? '')
-      setHasKey(d.has_key)
-      setContinuous(!!d.continuous_summaries)
-    }).catch(() => {})
-  }, [backendUrl])
-
-  const save = async () => {
+  const drive = async (action: 'save' | 'test') => {
     setSaving(true)
-    const body: Record<string, unknown> = { base_url: baseUrl, model }
-    if (apiKey.trim()) body.api_key = apiKey.trim()
     try {
-      await fetch(`${backendUrl}/config/llm`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
+      await formRef.current?.[action]()
     } finally {
       setSaving(false)
     }
@@ -208,42 +174,18 @@ function AiPane({ backendUrl }: { backendUrl: string }) {
       body: JSON.stringify({ continuous_summaries: next }),
     })
   }
-  const onTest = async () => {
-    setTest('Testing…')
-    await save()
-    try {
-      const r = await fetch(`${backendUrl}/config/llm/test`, { method: 'POST' })
-      const d = await r.json()
-      setTest(d.ok
-        ? `✓ Connected — ${d.models_count} models${d.model_available ? '' : ' (configured model NOT found)'}`
-        : `✗ ${d.error}`)
-    } catch (e) {
-      setTest(`✗ ${e instanceof Error ? e.message : String(e)}`)
-    }
-  }
 
   return (
     <section className="settings__pane">
       <h3 className="settings__h">AI / LLM</h3>
-      <label className="field">
-        <span>Base URL (OpenAI-compatible)</span>
-        <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder={GOOGLE_BASE} />
-        <button type="button" className="ai-link" onClick={() => setBaseUrl(GOOGLE_BASE)}>use Google Gemini</button>
-      </label>
-      <label className="field">
-        <span>Model</span>
-        <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="gemma-4-26b-a4b-it · gemini-2.0-flash (faster)" />
-      </label>
-      <label className="field">
-        <span>API key</span>
-        <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
-          placeholder={hasKey ? '•••••••• (stored — leave blank to keep)' : 'paste API key'} />
-        <span className="field__hint">Stored in your OS-local secret store, never in config.</span>
-      </label>
-      {test && <div className="modal__test">{test}</div>}
+      <LlmConfigForm
+        ref={formRef}
+        backendUrl={backendUrl}
+        onLoaded={(d) => setContinuous(!!d.continuous_summaries)}
+      />
       <div className="settings__actions">
-        <button type="button" className="ai-btn" onClick={onTest} disabled={saving}>Test connection</button>
-        <button type="button" className="ai-btn ai-btn--primary" onClick={() => void save()} disabled={saving}>Save</button>
+        <button type="button" className="ai-btn" onClick={() => void drive('test')} disabled={saving}>Test connection</button>
+        <button type="button" className="ai-btn ai-btn--primary" onClick={() => void drive('save')} disabled={saving}>Save</button>
       </div>
       <div className="settings__row" style={{ marginTop: 14 }}>
         <div><div className="settings__rowlabel">Continuous incident summaries</div>
@@ -258,34 +200,21 @@ function AiPane({ backendUrl }: { backendUrl: string }) {
 
 function ToolsPane({ backendUrl }: { backendUrl: string }) {
   const [data, setData] = useState<{ tools: ToolInfo[]; perf_event_paranoid: number | null } | null>(null)
-  const load = () => fetch(`${backendUrl}/info/tools`).then((r) => r.json()).then(setData).catch(() => {})
+  // refresh=true bypasses the backend's TTL cache (recheck after installing a tool)
+  const load = (refresh = false) =>
+    fetch(`${backendUrl}/info/tools${refresh ? '?refresh=true' : ''}`).then((r) => r.json()).then(setData).catch(() => {})
   useEffect(() => { void load() }, [backendUrl])
 
   return (
     <section className="settings__pane">
       <h3 className="settings__h">Tracing tools
-        <button type="button" className="ai-btn settings__refresh" onClick={load}>↻ recheck</button>
+        <button type="button" className="ai-btn settings__refresh" onClick={() => void load(true)}>↻ recheck</button>
       </h3>
       <p className="settings__note">
         OpenTrace drives these external tools. Install any that are missing to
         unlock their collector; recheck after installing.
       </p>
-      {(data?.tools ?? []).map((t) => (
-        <div key={t.name} className={`tool ${t.available ? 'tool--ok' : 'tool--missing'}`}>
-          <div className="tool__head">
-            <span className="tool__name">{t.available ? '✓' : '✗'} {t.name}</span>
-            <span className="tool__version">{t.available ? t.version : 'not installed'}</span>
-          </div>
-          <div className="tool__sub">{t.label} — {t.unlocks}</div>
-          {t.warning && <div className="tool__warn">⚠ {t.warning}</div>}
-          {!t.available && t.install_hint && (
-            <code className="tool__hint" title="copy to clipboard"
-              onClick={() => void navigator.clipboard?.writeText(t.install_hint!)}>
-              {t.install_hint}
-            </code>
-          )}
-        </div>
-      ))}
+      <ToolChecklist tools={data?.tools ?? []} />
       {data && (
         <div className="settings__rowsub" style={{ marginTop: 8 }}>
           perf_event_paranoid = {String(data.perf_event_paranoid)} (≤2 lets perf

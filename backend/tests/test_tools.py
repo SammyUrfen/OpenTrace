@@ -5,7 +5,7 @@ from app import tools
 
 
 def test_detect_has_the_three_tools_and_shape():
-    d = tools.detect()
+    d = tools.detect(refresh=True)  # bypass the TTL cache for order-independence
     assert {"tools", "perf_event_paranoid", "distro"} <= set(d)
     names = {t["name"] for t in d["tools"]}
     assert names == {"strace", "ltrace", "perf"}

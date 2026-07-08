@@ -5,7 +5,7 @@ top of the data model; terminals and runs reference it by `session_id`.
 
 Public surface (stable):
 - `Session`, `SessionCreate`, `SessionUpdate` — pydantic models
-- `create`, `get`, `get_by_slug`, `update`, `touch`, `delete`, `list_all`
+- `create`, `get`, `get_by_slug`, `update`, `delete`, `list_all`
 - `get_or_create_default()` — convenience for the single-window app shell
 - `router` — FastAPI APIRouter mounted at `/sessions`
 """
@@ -110,12 +110,12 @@ def get_by_slug(slug: str) -> Session | None:
 
 
 def list_all() -> list[Session]:
+    # Newest-created first. (last_opened_at was only ever set at creation — the
+    # touch endpoint that would have updated it had no callers and was removed —
+    # so created_at DESC preserves the order the app has always shown.)
     with db.connect() as conn:
         rows = conn.execute(
-            """
-            SELECT * FROM sessions
-            ORDER BY COALESCE(last_opened_at, updated_at) DESC
-            """
+            "SELECT * FROM sessions ORDER BY created_at DESC"
         ).fetchall()
         return [_row_to_session(r) for r in rows]
 
@@ -139,23 +139,19 @@ def update(sid: str, data: SessionUpdate) -> Session | None:
     return sess
 
 
-def touch(sid: str) -> Session | None:
-    """Mark a session as just-opened (updates `last_opened_at`)."""
-    now = now_ms()
-    with db.connect() as conn:
-        cur = conn.execute(
-            "UPDATE sessions SET last_opened_at = ? WHERE id = ?", (now, sid)
-        )
-        if cur.rowcount == 0:
-            return None
-    return get(sid)
-
-
 def delete(sid: str) -> bool:
     """Remove a session, its DB rows (cascade), and its on-disk directory."""
     sess = get(sid)
     if sess is None:
         return False
+    # The DB cascade deletes run rows, but any live run's poller/monitor threads
+    # must be torn down explicitly or they keep running against nothing.
+    # Function-local imports: runs/orchestrator import this module.
+    from . import runs
+    from .trace import orchestrator
+
+    for run in runs.list_for_session(sid):
+        orchestrator.abort_run(run.id)
     with db.connect() as conn:
         conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
     shutil.rmtree(paths.session_dir(sess.slug), ignore_errors=True)
@@ -185,11 +181,6 @@ def http_list() -> list[Session]:
     return list_all()
 
 
-@router.get("/default", response_model=Session)
-def http_default() -> Session:
-    return get_or_create_default()
-
-
 @router.get("/{sid}", response_model=Session)
 def http_get(sid: str) -> Session:
     sess = get(sid)
@@ -201,14 +192,6 @@ def http_get(sid: str) -> Session:
 @router.patch("/{sid}", response_model=Session)
 def http_update(sid: str, data: SessionUpdate) -> Session:
     sess = update(sid, data)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    return sess
-
-
-@router.post("/{sid}/touch", response_model=Session)
-def http_touch(sid: str) -> Session:
-    sess = touch(sid)
     if sess is None:
         raise HTTPException(status_code=404, detail="session not found")
     return sess
