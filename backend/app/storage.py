@@ -117,7 +117,7 @@ def read_events(run_id: str, limit: int = 5000) -> list[dict]:
         rows = conn.execute(
             """
             SELECT id, timestamp_ms, source, event_type, pid, payload
-              FROM events WHERE run_id = ?
+              FROM events WHERE run_id = ? AND event_type != 'request'
              ORDER BY timestamp_ms LIMIT ?
             """,
             (run_id, limit),
@@ -130,6 +130,55 @@ def read_events(run_id: str, limit: int = 5000) -> list[dict]:
             "source": r["source"], "event_type": r["event_type"],
             "pid": r["pid"], **payload,
         })
+    return out
+
+
+def insert_request_spans(run_id: str, rows: Iterable[dict]) -> None:
+    """Persist CURATED request spans into `events` with `event_type='request'` (roadmap
+    §3.5 Phase-2 curated write). Each row is {timestamp_ms (EPOCH ms — converted from the
+    span's CLOCK_MONOTONIC nsecs via the child-launch anchor, §2.6), pid, payload}. Kept
+    separate from insert_events, and read_events excludes event_type='request', so the
+    syscall aggregations (syscall_stats/io_stats, which filter event_type=='syscall') and
+    the raw Events tab stay untouched. read_request_spans is the dedicated reader."""
+    out = []
+    for r in rows:
+        out.append((
+            new_id(), run_id, r["timestamp_ms"], "bpftrace", "request", r.get("pid"),
+            json.dumps(r["payload"], separators=(",", ":")).encode(),
+        ))
+    if out:
+        with db.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO events
+                    (id, run_id, timestamp_ms, source, event_type, pid, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                out,
+            )
+
+
+def read_request_spans(run_id: str, limit: int = 500, since_ms: float | None = None,
+                       until_ms: float | None = None) -> list[dict]:
+    """Curated request spans for a run (event_type='request'), newest first, epoch-
+    timestamped so they time-correlate with metrics/incidents. Optional [since_ms, until_ms]
+    window (for an incident-evidence / timeline overlay)."""
+    q = ["SELECT timestamp_ms, pid, payload FROM events WHERE run_id = ? AND event_type = 'request'"]
+    params: list = [run_id]
+    if since_ms is not None:
+        q.append("AND timestamp_ms >= ?")
+        params.append(since_ms)
+    if until_ms is not None:
+        q.append("AND timestamp_ms <= ?")
+        params.append(until_ms)
+    q.append("ORDER BY timestamp_ms DESC LIMIT ?")
+    params.append(limit)
+    with db.connect() as conn:
+        rows = conn.execute(" ".join(q), params).fetchall()
+    out = []
+    for r in rows:
+        payload = json.loads(bytes(r["payload"]).decode())
+        out.append({"timestamp_ms": r["timestamp_ms"], "pid": r["pid"], **payload})
     return out
 
 

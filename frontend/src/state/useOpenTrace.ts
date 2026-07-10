@@ -80,12 +80,92 @@ export interface Incident {
   ai: string | null
 }
 
+/** One captured DB query nested under a sampled request span. */
+export interface RequestDbSpan {
+  name: string
+  dur_ms: number
+  /** CLOCK_MONOTONIC start (relative to its parent request) — waterfall x-axis. */
+  start_ns?: number
+  statement: string | null
+}
+/**
+ * Per-request (or per-endpoint aggregate) decomposition of wall time. The four ms buckets
+ * sum to the duration: on-CPU + run-queue + DB-wait (off-CPU overlapping a DB span) +
+ * other off-CPU (labelled by blocking reason). Endpoint rows also carry the `_pct` shares
+ * and the dominant `top_off_reason`.
+ */
+export interface RequestBreakdown {
+  on_cpu_ms: number
+  runq_ms: number
+  db_wait_ms: number
+  other_off_ms: number
+  off_reasons?: Record<string, number>
+  on_cpu_pct?: number
+  runq_pct?: number
+  db_wait_pct?: number
+  other_off_pct?: number
+  top_off_reason?: string | null
+}
+/** A sampled (slowest) request for the waterfall, with its nested DB spans + breakdown. */
+export interface RequestSampleSpan {
+  kind: string
+  method: string | null
+  route: string | null
+  name: string
+  status: number | null
+  dur_ms: number
+  tid: number
+  db_ms: number
+  start_ns?: number
+  breakdown?: RequestBreakdown | null
+  db: RequestDbSpan[]
+}
+/** One row of the per-endpoint RED table. */
+export interface RequestEndpoint {
+  method: string
+  route: string
+  count: number
+  p50_ms: number | null
+  p95_ms: number | null
+  p99_ms: number | null
+  err_pct: number
+  db_ms_share: number
+  breakdown?: RequestBreakdown | null
+}
+/** A curated slow/errored request span persisted to SQLite (GET /runs/{id}/request-spans). */
+export interface RequestSpanRow {
+  timestamp_ms: number
+  method: string | null
+  route: string | null
+  name: string
+  status: number | null
+  dur_ms: number
+  db_ms: number
+  tid: number
+  breakdown?: RequestBreakdown | null
+  db: RequestDbSpan[]
+}
+/** The request-tracing rollup (`GET /runs/{id}/requests` + `request_rollup` SSE). */
+export interface Requests {
+  available: boolean
+  reason: string | null
+  window_s: number | null
+  engine: string
+  endpoints: RequestEndpoint[]
+  spans: RequestSampleSpan[]
+  request_count: number
+  db_span_count: number
+  has_breakdown?: boolean
+}
+
 interface Hook {
   projects: Project[]
   runs: Run[]
   alerts: Record<string, LiveAlert[]>
   /** monitor-mode incidents keyed by runId, newest first */
   incidents: Record<string, Incident[]>
+  /** latest request-tracing rollup keyed by runId (live SSE for monitor runs) */
+  requests: Record<string, Requests>
   liveRunId: string | null
   /** The most recently finalized run, as `{id, n}` — `n` increments per end so
    *  the same run ending twice (rare) still triggers a re-open. */
@@ -117,6 +197,7 @@ export function useOpenTrace(backendUrl: string): Hook {
   const [runs, setRuns] = useState<Run[]>([])
   const [alerts, setAlerts] = useState<Record<string, LiveAlert[]>>({})
   const [incidents, setIncidents] = useState<Record<string, Incident[]>>({})
+  const [requests, setRequests] = useState<Record<string, Requests>>({})
   const [liveRunId, setLiveRunId] = useState<string | null>(null)
   const [lastEnded, setLastEnded] = useState<{ id: string; n: number } | null>(null)
   const [connected, setConnected] = useState(false)
@@ -175,6 +256,7 @@ export function useOpenTrace(backendUrl: string): Hook {
         return rest
       }
       setIncidents(drop)
+      setRequests(drop)
       setAlerts(drop)
       evictLiveMetrics(id)
       clearRunCache(id)
@@ -301,6 +383,10 @@ export function useOpenTrace(backendUrl: string): Hook {
           if (!cur) return prev
           return { ...prev, [run_id]: cur.map((i) => (i.id === patch.id ? { ...i, ...patch } : i)) }
         })
+      } else if (type === 'request_rollup') {
+        // latest per-snapshot endpoint RED for a live monitor run (throttled server-side);
+        // the RequestsTab prefers this over its one-shot fetch so it updates in place
+        setRequests((prev) => ({ ...prev, [run_id]: data as Requests }))
       } else if (type === 'run_analyzing') {
         setRuns((prev) =>
           prev.map((r) => (r.id === run_id ? { ...r, status: 'analyzing' } : r)),
@@ -343,7 +429,7 @@ export function useOpenTrace(backendUrl: string): Hook {
   }, [backendUrl, refresh, upsertRun])
 
   return {
-    projects, runs, alerts, incidents, liveRunId, lastEnded, connected,
+    projects, runs, alerts, incidents, requests, liveRunId, lastEnded, connected,
     connectionError, loaded, refresh, upsertRun, deleteRun, stopMonitor,
     renameRun, createSession, renameSession,
   }

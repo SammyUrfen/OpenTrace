@@ -95,7 +95,13 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   `collectors` dict + optional cgroup cpu-quota / mem-limit.
 - `aggregate.py` — pure aggregations over the event stream: per-syscall stats,
   per-file I/O (fd→path resolution, leak detection), and outbound connections
-  (sockaddr parsing); back `GET /runs/{id}/{syscalls,io,network}`.
+  (sockaddr parsing); back `GET /runs/{id}/{syscalls,io,network}`. Also the
+  request-tracing rollup — `correlate_spans` (nest DB spans under the HTTP span on
+  the same tid+window), `correlate_breakdown` (Phase 2: split each request into on-CPU /
+  run-queue / DB-wait / other-off-CPU from the OFF/RQ intervals), `endpoint_stats`
+  (per-endpoint RED + `db_ms_share` + aggregate breakdown), `request_rollup`,
+  `curate_request_spans` (slow/errored spans → epoch-anchored SQLite rows),
+  `reqtrace_anomalies` (slow/errored endpoint findings).
 - `program_output.py` — reconstructs stdout/stderr from `strace -e write=1,2`
   hex dumps (keeps tty fidelity); backs `GET /runs/{id}/logs`.
 - `llm.py` — OpenAI-compatible streaming client (httpx) + `/config/llm` router;
@@ -127,6 +133,25 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   (`node_cdp.py`, SIGUSR1→CDP, no install) for **Node/Deno/Bun** — for real app
   symbols; else perf. `_finalize`/`_capture_profile` fold by format (`_fold_profile`
   → `fold_collapsed`/`fold_speedscope`/`fold_cpuprofile`/`fold_phpspy`/perf).
+- **Request tracing** (attach, `collector_config.requests`) — a DEDICATED bpftrace
+  program (`ebpf.py` `build_request_bt`). Phase 2 additions (all fail-open, same program):
+  `_BT_OFFCPU` (per-request on/off-CPU/run-queue decomposition from `sched_switch`/`_wakeup`
+  scoped to `@active` request threads + a per-tid off-CPU stack map `@ostk` for the drill),
+  `_BT_TLS`/`_BT_TLS_EX` (HTTPS plaintext via `SSL_read`/`SSL_write`[`_ex`], `libssl_path`),
+  `_BT_MYSQL`/`_BT_SQLITE` (`db_libs(pid)` → `mysql_real_query` / `sqlite3_step`);
+  `parse_bpftrace_offcpu` + `extract_offcpu_stacks` → per-tid off-CPU flame
+  (`GET /runs/{id}/offcpu-flamegraph?tid=`), curated spans in SQLite
+  (`GET /runs/{id}/request-spans`, epoch via the §2.6 anchor). Base (`_BT_HTTP`
+  syscall-tracepoint HTTP boundary +
+  `_BT_SQL` libpq `PQsendQuery→PQgetResult` uprobes, `/pid==PID/`, never `-p`) driven by
+  `orchestrator._capture_requests` (gated independently of the eBPF suite by `_start_ebpf`);
+  parsed → correlated (`aggregate`) → `requests.ndjson.zst` (full stream) + `requests.json`
+  (rollup) + a throttled `request_rollup` SSE. Fail-open + capability-gated on
+  `bpftrace_available()`+privilege (`GET /runs/attach/request-capabilities`), NOT the BTF/bcc
+  eBPF gate. Frontend: `RequestsTab` (RED table + full on/off/DB/run-queue breakdown; an
+  Endpoints/Requests view toggle), `RequestWaterfall` (per-request timeline + nested DB spans
+  → expand for the breakdown, SQL, and the span→off-CPU `FlamegraphTab` `tid` drill),
+  `AttachModal` toggle. See `docs/Request_Tracing_Roadmap.md` (§10 spikes, §11–§12 status).
 - `tests/` — pytest: parser, rules, CRUD/storage, syscall aggregation, a live
   end-to-end pipeline, and real-workload scenario tests (leak/fd-leak/exit-code).
 

@@ -452,6 +452,7 @@ function App() {
           backendUrl={BACKEND_URL}
           onOpenSettings={openAiSettings}
           incidents={ot.incidents[focusedRun.id] ?? EMPTY_INCIDENTS}
+          requestsLive={ot.requests[focusedRun.id] ?? null}
           onStopMonitor={stopFocusedMonitor}
           topSlot={
             namePrompt && nameBarRunId === focusedRun.id ? (

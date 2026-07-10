@@ -40,6 +40,13 @@ async function attachPid(ctx, pid, opts = {}) {
     ctx.assert(await box.isEnabled().catch(() => false), 'eBPF checkbox stayed disabled (capabilities?)')
     await box.check()
   }
+  if (opts.requests) {
+    const box = ctx.page.locator('.attach__monitor input[type=checkbox]').nth(2)
+    // disabled until GET /runs/attach/request-capabilities resolves
+    for (let i = 0; i < 15; i++) { if (await box.isEnabled().catch(() => false)) break; await ctx.sleep(300) }
+    ctx.assert(await box.isEnabled().catch(() => false), 'Request-tracing checkbox stayed disabled (capabilities?)')
+    await box.check()
+  }
   const row = ctx.page.locator('.attach__row', { hasText: `pid ${pid}` }).first()
   await row.waitFor({ state: 'visible', timeout: 8000 })
   await row.click()

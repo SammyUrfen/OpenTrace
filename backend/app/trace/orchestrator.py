@@ -231,7 +231,7 @@ def _descendant_pids(root: int, *, include_root: bool = True) -> list[int]:
 
 def start_attach_run(
     pid: int, window_s: int = 20, session_id: str | None = None, monitor: bool = False,
-    ebpf: bool = False,
+    ebpf: bool = False, requests: bool = False,
 ) -> runs.Run:
     """Attach to an already-running process and profile it.
 
@@ -285,7 +285,7 @@ def start_attach_run(
         session_id=session_id,
         collector_config={
             "psutil": True, "perf": True, "attach": True, "monitor": monitor,
-            "ebpf": ebpf, "runtime": info["runtime"], "profiler": profiler,
+            "ebpf": ebpf, "requests": requests, "runtime": info["runtime"], "profiler": profiler,
             "profile_format": prof_fmt, "profile_file": prof_file,
             "container": info.get("container"),
             "cgroup_cpu_quota_cores": climits["cpu_quota_cores"],
@@ -548,14 +548,22 @@ def _ensure_flamegraph_reason(run_dir: Path, reason: str | None) -> None:
             log.debug("could not write flamegraph reason", exc_info=True)
 
 
-def _start_ebpf(run: runs.Run, pid: int, window_s: int, stop: threading.Event) -> threading.Thread | None:
-    """Spawn the eBPF off-CPU + latency capture concurrently with the on-CPU
-    profiler (both cover the same window). None unless the run opted into eBPF."""
-    if not (run.collector_config or {}).get("ebpf"):
-        return None
-    t = threading.Thread(target=_capture_ebpf, args=(run, pid, window_s, stop), daemon=True)
-    t.start()
-    return t
+def _start_ebpf(run: runs.Run, pid: int, window_s: int, stop: threading.Event) -> list[threading.Thread]:
+    """Spawn the concurrent bpftrace/bcc captures for the window: the eBPF suite
+    (off-CPU + latency, gated on the `ebpf` flag) and/or request tracing (HTTP boundary
+    + libpq DB spans, gated on the `requests` flag). Each is its OWN dedicated program on
+    its OWN flag, so a requests-only run produces NO off-CPU/latency artifacts and an
+    ebpf-only run produces no request artifacts (§3.6). Returns the spawned threads (the
+    caller joins them before finalize); an empty list when the run opted into neither."""
+    cfg = run.collector_config or {}
+    threads: list[threading.Thread] = []
+    if cfg.get("ebpf"):
+        threads.append(threading.Thread(target=_capture_ebpf, args=(run, pid, window_s, stop), daemon=True))
+    if cfg.get("requests"):
+        threads.append(threading.Thread(target=_capture_requests, args=(run, pid, window_s, stop), daemon=True))
+    for t in threads:
+        t.start()
+    return threads
 
 
 def _capture_ebpf(run: runs.Run, pid: int, window_s: int, stop: threading.Event) -> None:
@@ -685,6 +693,117 @@ def _capture_ebpf(run: runs.Run, pid: int, window_s: int, stop: threading.Event)
                 _make_incident(ctx, a.rule_id, a.severity, a.title, ts)
 
 
+def _capture_requests(run: runs.Run, pid: int, window_s: int, stop: threading.Event) -> None:
+    """Attach the DEDICATED request-tracing bpftrace (plaintext-HTTP/1.x boundary +
+    libpq DB spans) for the window; parse → correlate (tid + time-window) → write
+    requests.ndjson.zst (full stream) + requests.json (rollup, atomic) + a request_rollup
+    SSE; and for a MONITOR run emit slow/errored-endpoint incidents (collapse per
+    endpoint) so the feed matches the Overview. Fail-open at every step: no bpftrace /
+    privilege / libpq / HTTP traffic completes with a friendly `reason`, never raises.
+    Gated on the `requests` flag and independent of the eBPF suite (§3.6)."""
+    from .. import ebpf as ebpf_mod, aggregate
+    run_dir = Path(run.run_dir)
+    n = str(max(2, int(window_s)))
+    tmo = window_s + 30
+
+    def _persist(rollup: dict, spans: list, off_intervals: list | None = None) -> None:
+        if runs.get(run.id) is None:  # deleted mid-capture — don't recreate its dir
+            return
+        try:
+            # Full stream: http/db spans (Span.to_ndjson) + off-CPU/runq intervals (dicts).
+            def _rows():
+                for s in spans:
+                    yield s.to_ndjson()
+                for iv in (off_intervals or []):
+                    yield {"event_type": "offcpu", **iv}
+            storage.write_ndjson_zst(run_dir / "requests.ndjson.zst", _rows())
+            storage.write_json(run_dir / "requests.json", rollup)
+            storage.record_artifact(run.id, "requests", run_dir / "requests.json")
+            broker.publish(run.id, "request_rollup", rollup)
+        except Exception:  # noqa: BLE001
+            log.debug("persist requests failed for %s", run.id, exc_info=True)
+
+    try:
+        caps = ebpf_mod.request_capabilities()
+        if not caps["available"]:
+            _persist(aggregate.request_rollup([], [], window_s=window_s,
+                                              available=False, reason=caps["reason"]), [])
+            return
+
+        # Resolve the target's mapped client libs: Postgres (libpq), MySQL/SQLite (db_libs),
+        # and TLS (libssl → plaintext recovery for an HTTPS server). Each is fail-open None.
+        pq_lib = ebpf_mod.libpq_path(pid)      # None → no dynamically-linked Postgres
+        db_libs = ebpf_mod.db_libs(pid)        # [(engine, path)] for MySQL/SQLite
+        ssl_lib = ebpf_mod.libssl_path(pid)    # None → plaintext only
+        script = ebpf_mod.build_request_bt(pid, n, pq_lib=pq_lib, db_libs=db_libs,
+                                           ssl_lib=ssl_lib, off_cpu=True)
+        # CLOCK_MONOTONIC→epoch anchor (§2.6), captured back-to-back at child launch so the
+        # curated SQLite spans (monotonic start_ns) can be stored as epoch timestamp_ms.
+        mono0 = time.clock_gettime(time.CLOCK_MONOTONIC)
+        wall0 = time.time()
+        _ok, out, _reason = ebpf_mod.run_bpftrace(script, timeout=tmo, stop=stop)
+        if runs.get(run.id) is None:
+            return
+
+        http_spans = ebpf_mod.parse_bpftrace_http(out)
+        db_spans = ebpf_mod.parse_bpftrace_sql(out)
+        off_intervals = ebpf_mod.parse_bpftrace_offcpu(out)
+        has_db = bool(pq_lib or db_libs)
+        reason = None if has_db else (
+            "DB spans unavailable — the target maps no dynamically-linked libpq / "
+            "libmysqlclient / libsqlite3 (a statically-bundled psycopg2-binary, or an "
+            "asyncpg/pure-wire driver). Endpoint timings are still shown.")
+        if not http_spans:
+            # bpftrace ran but saw no request boundaries: an idle server, an HTTP/2
+            # endpoint, or a non-HTTP process — a valid empty result, not a failure.
+            # (TLS is now recovered via libssl, so it's no longer a blind spot.)
+            reason = reason or (
+                "No HTTP/1.x requests were observed on the target during the window "
+                "(idle server, HTTP/2 endpoint, or a non-HTTP process).")
+
+        rollup = aggregate.request_rollup(http_spans, db_spans, window_s=window_s,
+                                          engine="bpftrace", reason=reason, available=True,
+                                          off_intervals=off_intervals)
+        _persist(rollup, sorted(http_spans + db_spans, key=lambda s: s.start_ns), off_intervals)
+
+        # Curated slow/errored spans → SQLite (queryable via GET /runs/{id}/request-spans),
+        # epoch-timestamped for time-correlation. Fail-open — never strands the run.
+        if http_spans and runs.get(run.id) is not None:
+            try:
+                curated = aggregate.curate_request_spans(
+                    http_spans, db_spans, rollup["endpoints"], mono0=mono0, wall0=wall0)
+                storage.insert_request_spans(run.id, curated)
+            except Exception:  # noqa: BLE001
+                log.debug("curate request spans failed for %s", run.id, exc_info=True)
+
+        # Per-tid off-CPU flamegraphs (the span→off-CPU-flamegraph drill). One flame per
+        # request-serving tid, folded from the @ostk kernel-stack dump. Served tid-filtered
+        # by GET /runs/{id}/offcpu-flamegraph?tid=. Fail-open.
+        try:
+            stacks = ebpf_mod.extract_offcpu_stacks(out)
+            if stacks and runs.get(run.id) is not None:
+                flames = {tid: perf_mod.fold_collapsed(txt, count_is_usec=True)
+                          for tid, txt in stacks.items()}
+                storage.write_json(run_dir / "request-offcpu.json", flames)
+                storage.record_artifact(run.id, "request-offcpu", run_dir / "request-offcpu.json")
+        except Exception:  # noqa: BLE001
+            log.debug("request off-cpu flamegraph failed for %s", run.id, exc_info=True)
+
+        # Monitor: slow/errored endpoints → live incidents (collapse per endpoint), so the
+        # Incidents feed matches the Overview. The incident ts MUST be epoch ms — use the
+        # latest sample's timestamp, never a span's monotonic nsecs (§2.6 / §3.10).
+        anoms = aggregate.reqtrace_anomalies(rollup)
+        if anoms:
+            with _lock:
+                ctx = _active.get(run.id)
+            if ctx is not None and ctx.monitor:
+                ts = ctx.samples[-1].timestamp_ms if ctx.samples else time.time() * 1000
+                for a in anoms:
+                    _make_incident(ctx, a.rule_id, a.severity, a.title, ts)
+    except Exception:  # noqa: BLE001 — fail-open: a request-capture crash never strands the run
+        log.debug("request capture failed for %s", run.id, exc_info=True)
+
+
 def _run_attach_profile(run_id: str, pid: int, window_s: int) -> None:
     """Single-shot attach: one profiling window, then finalize (sole finalizer)."""
     run = runs.get(run_id)
@@ -694,10 +813,10 @@ def _run_attach_profile(run_id: str, pid: int, window_s: int) -> None:
         with _lock:
             ctx = _active.get(run_id)
         stop = ctx.stop_event if ctx else threading.Event()
-        ebpf_t = _start_ebpf(run, pid, window_s, stop)
+        ebpf_ts = _start_ebpf(run, pid, window_s, stop)
         ok, reason = _capture_profile(run, pid, window_s, stop)
-        if ebpf_t is not None:
-            ebpf_t.join(timeout=window_s + 40)
+        for t in ebpf_ts:
+            t.join(timeout=window_s + 40)
         final = end_run(run_id, exit_code=0 if ok else None, exit_signal=None, ended_at=None)
         if final is not None:  # None: run deleted mid-window — don't recreate its dir
             _ensure_flamegraph_reason(Path(run.run_dir), reason)
@@ -721,10 +840,10 @@ def _run_attach_monitor(run_id: str, pid: int, window_s: int) -> None:
         stop = ctx.stop_event
         reason = None
         while not stop.is_set() and psutil.pid_exists(pid):
-            ebpf_t = _start_ebpf(run, pid, window_s, stop)  # concurrent off-CPU + latency
+            ebpf_ts = _start_ebpf(run, pid, window_s, stop)  # concurrent off-CPU/latency + requests
             ok, reason = _capture_profile(run, pid, window_s, stop)
-            if ebpf_t is not None:
-                ebpf_t.join(timeout=window_s + 40)
+            for t in ebpf_ts:
+                t.join(timeout=window_s + 40)
             if stop.is_set():
                 break  # Stop/abort mid-window: no snapshot refresh, no late incidents
             if ok and runs.get(run_id) is not None:  # deleted run: don't recreate its dir
@@ -1241,6 +1360,18 @@ def _finalize(
                 anomalies.extend(ebpf_mod.latency_anomalies(json.loads(lat_path.read_text())))
             except Exception:  # noqa: BLE001
                 log.debug("latency anomalies failed for %s", run.id, exc_info=True)
+
+    # Request-tracing findings (slow / errored endpoints). MONITOR runs already emit these
+    # as live incidents (picked up by _incidents_to_anomalies above), so adding them here
+    # too would duplicate them and desync Overview from the feed — single-shot only (§3.10).
+    if collectors.get("requests", False) and not monitor:
+        req_path = run_dir / "requests.json"
+        if req_path.exists():
+            from .. import aggregate
+            try:
+                anomalies.extend(aggregate.reqtrace_anomalies(json.loads(req_path.read_text())))
+            except Exception:  # noqa: BLE001
+                log.debug("reqtrace anomalies failed for %s", run.id, exc_info=True)
 
     # Persist a curated subset of events (+ anomaly evidence), then link ids.
     curated = _curate_events(events, anomalies)

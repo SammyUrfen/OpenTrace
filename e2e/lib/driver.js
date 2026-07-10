@@ -22,7 +22,8 @@
  * await ctx.sleep(ms)
  * ctx.api.get(path) / ctx.api.post(path, body) / ctx.api.del(path)  -> json
  * await ctx.spawnTarget(kind?) spawn a throwaway process to attach to -> pid
- *                              kinds: 'cpu'|'idle'|'fdleak'|'memgrow' (auto-killed)
+ *                              kinds: 'cpu'|'idle'|'fdleak'|'memgrow'|'http' (auto-killed)
+ *                              ('http' binds httpTargetPort(pid); drive it with fetch)
  * ctx.backendUrl               the isolated backend base url
  */
 const { spawn } = require('child_process')
@@ -37,7 +38,25 @@ const TARGETS = {
   idle: _HOLD + 'import time\nwhile True: time.sleep(1)',
   fdleak: _HOLD + 'import socket,time\nh=[]\nwhile True:\n h.append(socket.socket()); time.sleep(0.02)',
   memgrow: _HOLD + 'import time\nb=[]\nwhile True:\n b.append(bytearray(4*1024*1024)); time.sleep(0.05)',
+  // plaintext HTTP/1.x server for request-tracing scenarios; binds a port derived
+  // from its own pid (so the scenario can drive traffic without a handshake). Thread-
+  // per-request (tid join) with a /slow route (off-CPU sleep → the off-CPU breakdown +
+  // per-tid drill have real content) and a /err route (5xx → errored_endpoint).
+  http: _HOLD + [
+    'import http.server,os,time',
+    'P=20000+os.getpid()%20000',
+    'class H(http.server.BaseHTTPRequestHandler):',
+    ' protocol_version="HTTP/1.1"',
+    ' def log_message(self,*a):pass',
+    ' def do_GET(self):',
+    '  if self.path.startswith("/slow"): time.sleep(0.2)',
+    '  b=b"ok"; self.send_response(500 if self.path.startswith("/err") else 200)',
+    '  self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)',
+    'http.server.ThreadingHTTPServer(("127.0.0.1",P),H).serve_forever()',
+  ].join('\n'),
 }
+// The port an `http` target binds, given its pid (mirror of the target's own formula).
+function httpTargetPort(pid) { return 20000 + (pid % 20000) }
 
 function makeCtx(appHandle, scenarioId) {
   const { page, backendUrl } = appHandle
@@ -110,4 +129,4 @@ function makeCtx(appHandle, scenarioId) {
   return ctx
 }
 
-module.exports = { makeCtx }
+module.exports = { makeCtx, httpTargetPort }

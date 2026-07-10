@@ -20,6 +20,8 @@ interface Flamegraph {
   hotspots: PerfHotspot[]
   reason?: string
   unit?: string
+  tid?: number
+  tid_unavailable?: boolean
 }
 
 interface Props {
@@ -27,6 +29,12 @@ interface Props {
   runId: string
   /** run captured an eBPF off-CPU profile → offer the On-CPU / Off-CPU toggle */
   offCpu?: boolean
+  /**
+   * Drill: pin to ONE request thread's off-CPU flame (the span→flamegraph drill).
+   * Forces off-CPU mode, hides the On/Off toggle + the hotspot table, and fetches
+   * `offcpu-flamegraph?tid=`. Falls back to the whole-process off-CPU flame with a note.
+   */
+  tid?: number
 }
 
 const ROW_H = 20
@@ -73,19 +81,22 @@ function frameColor(name: string, depth: number): string {
   return `hsl(${hue} 68% ${light}%)`
 }
 
-export function FlamegraphTab({ backendUrl, runId, offCpu }: Props) {
-  const [mode, setMode] = useState<'on' | 'off'>('on')
-  const resource = mode === 'off' ? 'offcpu-flamegraph' : 'flamegraph'
+export function FlamegraphTab({ backendUrl, runId, offCpu, tid }: Props) {
+  const drill = tid != null
+  const [mode, setMode] = useState<'on' | 'off'>(drill ? 'off' : 'on')
+  const resource = drill
+    ? `offcpu-flamegraph?tid=${tid}`
+    : mode === 'off' ? 'offcpu-flamegraph' : 'flamegraph'
   const { data, loading } = useRunObject<Flamegraph>(backendUrl, runId, resource)
   const [focus, setFocus] = useState<FlameNode | null>(null)
 
-  const isOff = mode === 'off'
+  const isOff = drill || mode === 'off'
   // Format from the LOADED data's unit, not the toggle — while a switch is in
   // flight `data` is still the previous resource, so keying off `isOff` would
   // briefly render on-CPU counts through fmtDuration (and mislabel cells).
   const dataIsOff = data?.unit === 'usec'
   const cellUnit = dataIsOff ? 'µs' : 'samples'  // browser tooltip — not CSS-uppercased
-  const toggle = offCpu ? (
+  const toggle = offCpu && !drill ? (
     <div className="flame-toggle" role="tablist">
       <button type="button" role="tab" aria-selected={!isOff}
         className={`flame-toggle__btn${!isOff ? ' flame-toggle__btn--on' : ''}`}
@@ -112,6 +123,16 @@ export function FlamegraphTab({ backendUrl, runId, offCpu }: Props) {
     )
   }
 
+  if (drill && (!data?.supported || !root)) {
+    return (
+      <div className="overview" data-testid="flamegraph-tab">
+        <div className="overview__muted">
+          No off-CPU stacks were captured for thread {tid} — it spent the request on-CPU, or
+          blocked too briefly to sample.
+        </div>
+      </div>
+    )
+  }
   if (!data?.supported || !root) {
     // The launch advice ("enable a collector and re-run") is wrong for an attach
     // run — there's no command to re-run, you re-attach. Detect attach from the
@@ -149,11 +170,17 @@ export function FlamegraphTab({ backendUrl, runId, offCpu }: Props) {
   return (
     <div className="overview" data-testid="flamegraph-tab">
       <h3 className="overview__h">
-        {dataIsOff
+        {drill
+          ? data.tid_unavailable
+            ? `Off-CPU flamegraph — ${fmtDuration(data.samples)} blocked (whole process)`
+            : `Off-CPU flamegraph — thread ${tid}, ${fmtDuration(data.samples)} blocked`
+          : dataIsOff
           ? `Off-CPU flamegraph — ${fmtDuration(data.samples)} blocked`
           : `CPU flamegraph — ${data.samples.toLocaleString()} samples`}
         <span className="overview__muted" style={{ marginLeft: 10, fontWeight: 400 }}>
-          {isOff ? 'time spent blocked, not on CPU' : 'click a frame to zoom'}
+          {drill && data.tid_unavailable
+            ? 'per-thread capture unavailable — showing the whole-process off-CPU flame'
+            : isOff ? 'time spent blocked, not on CPU' : 'click a frame to zoom'}
         </span>
         {toggle}
         {focus && (
@@ -186,7 +213,7 @@ export function FlamegraphTab({ backendUrl, runId, offCpu }: Props) {
         })}
       </div>
 
-      <h3 className="overview__h">Function hotspots — {hotspots.length} symbols</h3>
+      {drill ? null : <><h3 className="overview__h">Function hotspots — {hotspots.length} symbols</h3>
       {hotspots.length === 0 ? (
         <div className="overview__muted">No resolved symbols.</div>
       ) : (
@@ -212,7 +239,7 @@ export function FlamegraphTab({ backendUrl, runId, offCpu }: Props) {
             ))}
           </tbody>
         </table>
-      )}
+      )}</>}
     </div>
   )
 }

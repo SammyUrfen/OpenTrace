@@ -268,6 +268,7 @@ class AttachRequest(BaseModel):
     session_id: str | None = None
     monitor: bool = False
     ebpf: bool = False
+    requests: bool = False
 
 
 @router.post("/start", response_model=RunStartResponse)
@@ -327,7 +328,7 @@ def http_attach(data: AttachRequest) -> Run:
     try:
         return orchestrator.start_attach_run(
             pid, window_s=data.window_s, session_id=data.session_id,
-            monitor=data.monitor, ebpf=data.ebpf,
+            monitor=data.monitor, ebpf=data.ebpf, requests=data.requests,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -340,6 +341,17 @@ def http_ebpf_capabilities(refresh: bool = False) -> dict:
     from . import ebpf
 
     return ebpf.capabilities(refresh=refresh)
+
+
+@router.get("/attach/request-capabilities")
+def http_request_capabilities(refresh: bool = False) -> dict:
+    """Whether request tracing (HTTP endpoint RED + libpq DB spans) can run here — the
+    picker gate. Gates on bpftrace + privilege ONLY, NOT the eBPF-suite (BTF+bcc) gate:
+    syscall tracepoints + libpq uprobes need neither, so gating on `ebpf-capabilities`
+    would fail closed on boxes where request tracing still works."""
+    from . import ebpf
+
+    return ebpf.request_capabilities(refresh=refresh)
 
 
 class ResolveRequest(BaseModel):
@@ -625,12 +637,30 @@ def http_flamegraph(rid: str) -> dict:
 
 
 @router.get("/{rid}/offcpu-flamegraph")
-def http_offcpu_flamegraph(rid: str) -> dict:
-    """eBPF off-CPU flame tree (where the process was BLOCKED, µs) — Phase D."""
+def http_offcpu_flamegraph(rid: str, tid: int | None = None) -> dict:
+    """eBPF off-CPU flame tree (where the process was BLOCKED, µs) — Phase D. With `tid`
+    (the span→flamegraph drill), returns that request-thread's off-CPU flame from the
+    request program's per-tid capture, falling back to the whole-process aggregate.
+
+    NOTE: `request-offcpu.json` holds only the LATEST capture window keyed by worker tid (a
+    monitor run overwrites it each snapshot). So drill only from the LIVE rollup spans
+    (`GET /requests` → the waterfall), whose window matches this file — NOT from a historical
+    curated span (`GET /request-spans`), where a reused tid could resolve to a later request."""
     run = _require(rid)
+    if tid is not None:
+        pt = Path(run.run_dir) / "request-offcpu.json"
+        if pt.exists():
+            flames = json.loads(pt.read_text())
+            fg = flames.get(str(tid))
+            if fg:
+                return {**fg, "tid": tid}
+        # fall through to the aggregate flame (roadmap §6.2 fail-open) with a note
     p = Path(run.run_dir) / "offcpu-flamegraph.json"
     if p.exists():
-        return json.loads(p.read_text())
+        doc = json.loads(p.read_text())
+        if tid is not None:
+            doc = {**doc, "tid": tid, "tid_unavailable": True}
+        return doc
     return {"supported": False, "samples": 0, "tree": None, "hotspots": [], "unit": "usec",
             "reason": "off-CPU profiling not enabled for this run (attach with eBPF)."}
 
@@ -655,6 +685,30 @@ def http_gc_timeline(rid: str) -> dict:
         return json.loads(p.read_text())
     return {"available": False, "events": [],
             "reason": "GC timeline not captured (attach with eBPF on a USDT-enabled python)."}
+
+
+@router.get("/{rid}/requests")
+def http_requests(rid: str) -> dict:
+    """Per-endpoint RED table + endpoint→query attribution (attach request tracing).
+    A `available:false` stub when the run didn't opt in, so the Requests tab shows a
+    friendly empty state (mirrors /latency)."""
+    run = _require(rid)
+    p = Path(run.run_dir) / "requests.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"available": False, "reason": "request tracing not enabled for this run.",
+            "window_s": None, "engine": "bpftrace", "endpoints": [], "spans": [],
+            "request_count": 0, "db_span_count": 0, "has_breakdown": False}
+
+
+@router.get("/{rid}/request-spans")
+def http_request_spans(rid: str, limit: int = 500, since_ms: float | None = None,
+                       until_ms: float | None = None) -> list[dict]:
+    """Curated slow/errored request spans persisted to SQLite (epoch-timestamped), newest
+    first. Powers the per-request waterfall's full history + incident-evidence time queries;
+    an empty list when the run captured none (mirrors the other stub readers)."""
+    _require(rid)
+    return storage.read_request_spans(rid, limit=limit, since_ms=since_ms, until_ms=until_ms)
 
 
 @router.get("/{rid}/ai-summary")

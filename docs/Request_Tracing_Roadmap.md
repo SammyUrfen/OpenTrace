@@ -407,3 +407,177 @@ Extend the `Incident` type with `requests: [{req_id, method, route, dur_ms, top_
 
 **UI prior art**
 - https://github.com/jaegertracing/jaeger-ui · https://docs.datadoghq.com/tracing/services/service_page/ · https://docs.datadoghq.com/profiler/connect_traces_and_profiles/ · https://docs.datadoghq.com/tracing/guide/slowest_request_daily/ · https://docs.sentry.io/product/sentry-basics/concepts/tracing/event-detail/ · https://docs.px.dev/tutorials/pixie-101/service-performance/ · https://coroot.com/blog/instrumenting-the-node-js-event-loop-with-ebpf/
+
+---
+
+## 10. Spike results — MVP boundary RESOLVED (2026-07-09)
+
+All three Phase-1 pre-work spikes (§7 pre-work; §8 OQ#1–3) were executed on the target
+box. **Environment:** kernel **7.0.14-201.fc44**, **bpftrace v0.24.2**, 20 cores, BTF
+present, `unprivileged_bpf_disabled=2` (**sudo mandatory** — no unprivileged BPF at all).
+Passwordless sudo is scoped to **exact tool paths** (`/usr/bin/bpftrace` + the bcc tools),
+with `env_reset` and a fixed `env_keep` that does **not** include `BPFTRACE_*`. System
+`/lib64/libpq.so.5` present; `postgres`/`psql` installed (used as the libpq target).
+Harness scripts live in the session scratchpad (`oq1_firing.sh`, `oq1b_pflag.sh`,
+`oq2_libpq.sh`, `oq2b_async.sh`, `scbench.c`).
+
+### OQ#3 — syscall tracepoint fields (RESOLVED)
+`bpftrace -lv` **requires root even to list** → must go through `sudo -n`. Confirmed field
+names on kernel 7.0.14:
+
+| tracepoint | buffer ptr | length | exit |
+|---|---|---|---|
+| `sys_enter_read` | `buf` (`char*`) | `count` (`size_t`) | `sys_exit_read` → `ret` (`long`) |
+| `sys_enter_write` | `buf` (`const char*`) | `count` | also exposes `__data_loc char[] __buf_val` (kernel-captured write bytes, truncated) |
+| `sys_enter_recvfrom` | `ubuf` (`void*`) | `size` | `sys_exit_recvfrom` → `ret` |
+| `sys_enter_sendto` | `buff` (`void*`) | `len` | — |
+| `sys_enter_accept4` | — | — | `sys_exit_accept4` → `ret` = new connfd (server-fd seed) |
+| `sys_enter_connect` | `uservaddr` | `addrlen` | outbound-fd seed |
+| `sys_enter_close` | `fd` | — | fd teardown |
+
+**String cap (supersedes §2.5 + the §3.4 `env`-dict harness change):** `BPFTRACE_MAX_STRLEN`
+**default is 1024 bytes** (not ~64) — a request line / SQL prefix fits with **no override**.
+The env-var name is `BPFTRACE_MAX_STRLEN` (not the old `BPFTRACE_STRLEN`). **The env-var path
+is unusable under this sudo model**: `env_reset` strips a pre-set `BPFTRACE_MAX_STRLEN`, and
+`sudo -n env BPFTRACE_MAX_STRLEN=… bpftrace` is **DENIED** ("sudo: a password is required" —
+sudoers whitelists only `/usr/bin/bpftrace`, not `/usr/bin/env`). Both env-free alternatives
+work and were verified: **inline `str(ptr, N)`** and the in-script **`config = { max_strlen = N }`**
+block. → **Do NOT thread an `env` dict through `run_bpftrace`; use inline `str(ptr,N)`/`config`.**
+
+### OQ#2 — libpq uprobe primitives (RESOLVED — DB spans ARE in the MVP, with an async correction)
+Verified against a throwaway PG18 cluster driven by `psql`:
+- ✅ **absolute-path uprobe** (`uprobe:/usr/lib64/libpq.so.private18-5.18:PQexec`), ✅ **multi-symbol
+  comma-attach**, ✅ **`str(arg1)`** (full 95-char marker returned uncut), ✅ **`/pid==PID/`**
+  scoping, ✅ **entry→uretprobe span**. Every primitive the plan gated behind OQ#2 works.
+- **`libpq_path(pid)` MUST resolve from `/proc/<pid>/maps`** (confirms §3.4). Fedora's `psql`
+  maps **`libpq.so.private18-5.18`**, *not* `libpq.so.5` — a filename assumption would miss it.
+  A psycopg2 app built on system libpq would map `/lib64/libpq.so.5`; both are dynamic with
+  `PQexec`/`PQexecParams`/`PQsendQuery`/`PQgetResult` exported as real `FUNC`s.
+- ⚠️ **ASYNC CORRECTION (changes §3.3).** The default Postgres client (`psql`, and — pending
+  per-driver confirmation — psycopg2) uses the **async** libpq API: `PQsendQuery`, *not* the
+  synchronous `PQexec`. An entry→uretprobe span on `PQsendQuery` measured **`dur_ms=0`** — it
+  only enqueues; the real wait is inside `PQgetResult`. The **correct async DB-span** is
+  `PQsendQuery` entry → the `PQgetResult` uretprobe whose **`retval==0` (NULL)** terminates the
+  result loop: measured **`dur_ms=201`** for a `pg_sleep(0.2)` (`getresult_calls=2`). So `_BT_SQL`
+  must support the async pattern (stash on `PQsendQuery`, close on terminal `PQgetResult`), not
+  only sync `PQexec`/`PQexecParams`. The single-slot `@st[tid]`/`@q[tid]` stash is still safe for
+  a synchronous-blocking client (one in-flight query per connection/thread); true pipelining is
+  still out of scope. **Residual:** confirm psycopg2/psycopg3/libpqxx's actual symbol during impl
+  (psycopg2 not installed here; async proven via psql).
+
+### OQ#1 — system-wide tracepoint firing cost (RESOLVED — dedicated program, no `-p`)
+Tight C microbench (`N` read+write of 1 byte = `2N` syscalls), timed via `CLOCK_MONOTONIC`
+around the loop only, coordinated with `bpftrace -c`:
+
+| condition | ns/syscall | Δ vs baseline |
+|---|---|---|
+| baseline (no probe) | 157.6 | — |
+| **bystander** (probes attached, `/pid==1/` rejects — the innocent-bystander tax) | 294.8 | **+137 ns** |
+| **matched** (target's own syscalls, full stash + `str()` runs) | 599.0 | **+441 ns** |
+
+- **Ambient box rate ≈ 4,300 read/write/send/recv syscalls/sec** (idle-ish) → bystander tax
+  here ≈ **0.06% of one core**. Projections: ~1.4% of one core at 100k syscalls/s, ~14% at 1M/s.
+  The tax is bounded to the attach window and only while system-wide read/write tracepoints
+  are attached.
+- **`bpftrace -p` is the FILTER model, not a per-task perf attach.** With a dedicated read/write
+  program attached via `-p <unrelated idle pid>`, a *bystander* bench still slowed **+135.7 ns/syscall**
+  (≈ the `/pid==1/` tax). So `-p` gives **zero** bystander relief and only adds the harmful
+  all-probe global filter — **fully vindicating the no-`-p` rule.** The ~137 ns firing cost is
+  **intrinsic** while the tracepoints are attached; it is identical for a dedicated vs folded
+  program (same tracepoints).
+- **Decision:** ship request tracing as its own **DEDICATED single bpftrace program** with the
+  in-script **`/pid==PID/`** filter (never `-p`). Firing cost is neutral to the fold question, so
+  dedicated wins on the independent grounds of §3.6 requests-only scoping and not enlarging the
+  combined program's single CO-RE compile / probe-drop risk. The "fold blast-radius" test is
+  moot (dedicated sidesteps it). **Minimize the tracepoint set**: `read`/`write`(+`exit_read`)
+  cover read/write-based servers; add `recvfrom`/`sendto` only for socket-syscall servers
+  (CPython `socket.recv` → `recvfrom`), accepting the extra firing cost per added tracepoint.
+
+### Net MVP boundary (post-spike)
+- **HTTP endpoint RED + `slow_endpoint`**: unchanged, HIGH confidence, in.
+- **DB (libpq) spans: IN the MVP** — the OQ#2 primitives all work — **with the async
+  `PQsendQuery`→`PQgetResult(NULL)` span** as the primary path (sync `PQexec`/`PQexecParams`
+  entry→exit also supported for synchronous clients/libpqxx).
+- **Dedicated bpftrace program**, `/pid==PID/`, no `-p`, inline `str`/`config` for any string
+  sizing (no `env` dict), `libpq_path` from `/proc/maps`.
+- **Still deferred to Phase 2:** off-CPU decomposition (OQ#7), TLS/`libssl`, MySQL/SQLite,
+  curated SQLite write + reader, waterfall + drill.
+
+---
+
+## 11. Implementation status — Phase 1 MVP SHIPPED (2026-07-10)
+
+The Phase-1 MVP is **fully implemented and verified end-to-end** against a real
+Flask(threaded)+psycopg2→system-libpq app: attach with `requests=true` produces a
+per-endpoint RED table + a `slow_endpoint` finding, with DB time attributed per request
+(`GET /slow` → p95 608ms, `db_ms_share` 0.99, *"99% of that time is DB queries"*).
+
+- **Backend** (`ebpf.py` `_BT_HTTP`/`_BT_SQL`/`build_request_bt`/`libpq_path`/parsers/
+  `request_capabilities`; `aggregate.py` `correlate_spans`/`endpoint_stats`/`request_rollup`/
+  `reqtrace_anomalies`; `orchestrator.py` `_capture_requests` + per-flag gating + finalize
+  pass; `runs.py` flag + `GET /runs/{id}/requests` + `GET /runs/attach/request-capabilities`;
+  `events.py` `Span`). **DB spans DID land in the MVP** (OQ#2 passed) via the async
+  `PQsendQuery→PQgetResult(NULL)` path (§10). Adversarially reviewed — 3 fixes: unterminated-
+  SQL-literal PII scrub, single-owner correlation + db-share clamp, route slash canonicalization.
+- **Frontend** (`RequestsTab.tsx` RED table + DB-vs-app breakdown; `RunView` gate;
+  `useOpenTrace` `request_rollup` SSE; `AttachModal` "Request tracing" checkbox + capability
+  probe).
+- **Verification:** backend 206 · frontend 64 · e2e 174/174 (new `21-requests.js`) · tsc/lint/
+  build green.
+- **Deviations from this doc, all deliberate:** the §3.4 `env`-dict string-cap harness change
+  was NOT done (env-var unusable under NOPASSWD sudo — §10 OQ#3); the §2.6 monotonic→epoch
+  anchor is NOT needed in the MVP (no span reaches an absolute sink — incident `ts` uses the
+  latest sample's epoch); spans are dicts/`Span` with no SQLite write (§3.5, as planned).
+
+---
+
+## 12. Implementation status — Phase 2 SHIPPED (2026-07-10)
+
+**All of Phase 2 (§7) is implemented and live-validated** against the multi-signal target
+(`scratchpad/target_app.py`: libpq via ctypes, in-process SQLite, a TLS variant, and
+sleep/CPU routes). Everything is fail-open and gated on the same `requests` flag.
+
+- **Off-CPU decomposition of `db_ms` (OQ#7).** The request program now carries a per-request
+  off-CPU / run-queue tracker (`_BT_OFFCPU`): `sched_switch`/`sched_wakeup` scoped to threads
+  ACTIVELY serving a request (`@active[tid]`, set at REQ / cleared at RSP — so the system-wide
+  sched tracepoints do almost no work outside a request window, no `-p`). It emits per-interval
+  `OFF`/`RQ` lines (+ a coarse blocking-syscall reason: net/lock/sleep/disk via `@insc[tid]`).
+  `aggregate.correlate_breakdown` splits each request's wall time into **on-CPU / run-queue /
+  DB-wait (off-CPU ∩ a DB span) / other-off-CPU** — the four buckets sum to the duration.
+  Validated: `/db` → 97% DB-wait, `/sqlite` → 99% on-CPU (in-process DB is an *overlay* on
+  on-CPU, never a bucket), `/sleep` → 99% off-CPU(sleep), `/cpu` → 99% on-CPU.
+- **TLS (`libssl`).** `_BT_TLS`/`_BT_TLS_EX` probe `SSL_read`/`SSL_write` (+ the OpenSSL-3
+  `_ex` variants CPython uses — count in the `*readbytes` out-param), keyed by tid, emitting
+  the same REQ/RSP lines → the whole pipeline (routes, DB spans, breakdown) works over HTTPS.
+  `build_request_bt` emits only the variants the target's libssl exports; `libssl_path` resolves it.
+- **MySQL / SQLite drivers.** `_BT_MYSQL` (`mysql_real_query`, unit-tested — no server here) and
+  `_BT_SQLITE` (`sqlite3_prepare_v2/v3`→text, `sqlite3_step` >1ms spans, with a **reentrancy
+  depth-guard** for SQLite's nested internal schema prepares + a finalize/END `clear` that also
+  prevents raw-SQL map-dump PII). `db_libs(pid)` resolves both; both reuse the SQL parser.
+- **Per-request waterfall + span→off-CPU-flamegraph drill.** `@ostk[tid, kstack]` aggregates
+  each thread's off-CPU stacks (block-time `kstack`, scheduler epilogue stripped, decimal
+  offsets handled); `extract_offcpu_stacks` → `perf.fold_collapsed` per tid → `request-offcpu.json`;
+  `GET /runs/{id}/offcpu-flamegraph?tid=` serves the per-thread flame (fail-open to the aggregate).
+  `RequestWaterfall.tsx` renders sampled requests as duration tracks with nested DB spans;
+  expanding one shows the breakdown bar + SQL + the tid-filtered off-CPU `FlamegraphTab` drill.
+- **Curated SQLite write + reader (§3.5/§4.4, with its reader this time).** `curate_request_spans`
+  keeps slow (≥ endpoint p95) / errored spans (cap 200), converting each span's CLOCK_MONOTONIC
+  `start_ns` → **epoch ms via the §2.6 `(mono0, wall0)` child-launch anchor** (now genuinely
+  needed and captured); `storage.insert_request_spans` writes `event_type='request'` rows and
+  `read_request_spans` / `GET /runs/{id}/request-spans` reads them back (time-queryable). Kept
+  isolated: `read_events` excludes `event_type='request'` so the syscall aggregations + raw
+  Events tab are untouched.
+- **Adversarially reviewed (12-agent workflow) — 5 fixes:** (1) HIGH `@active[tid]`/`@insc[tid]`
+  leaked when a request closed without a probed response write (writev/sendfile or an aborted
+  connection) → sched probes kept working + idle epoll_wait polluted the drill flame; fixed by
+  clearing them on SERVER-fd close (gated on `@srv` so an intermediate DB-socket close mid-request
+  can't truncate live tracking). (2) MED the waterfall keyed rows by array index → a monitor
+  re-sort rebound an open row (+ its drill) to another request; fixed with a stable span-identity
+  key. (3) LOW `@sqq`/`@mqq` (raw SQL) weren't in the `END` clear → an in-flight query at window
+  close auto-dumped unredacted SQL; added. (4) LOW documented that `request-offcpu.json` is
+  latest-window-only (drill from the live rollup, not a historical curated span). (5) LOW the drill
+  header claimed "thread N blocked" even on the whole-process fallback; fixed.
+- **Verification:** backend 218 · frontend 68 · e2e 7/7 requests (`requests-waterfall-breakdown-drill`)
+  · tsc clean · lint 24 (baseline) · build green. Live-validated on kernel 7.0.14 / bpftrace 0.24.2.
+- **Not live-validated (no server on this box):** MySQL uprobes — symbol-correct + unit-tested,
+  fail-open. Everything else was exercised against real Postgres / SQLite / a TLS server.

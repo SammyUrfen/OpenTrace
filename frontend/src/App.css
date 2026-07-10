@@ -951,6 +951,73 @@
 .sort-caret {
   color: var(--accent);
 }
+
+/* Requests tab — endpoint RED table + DB-vs-app breakdown */
+.endpoint-row { cursor: pointer; }
+.endpoint-method { color: var(--accent); font-weight: 600; font-size: 11px; }
+.endpoint-dbbar {
+  position: relative; display: inline-block; width: 76px; height: 14px;
+  background: var(--bg); border-radius: 3px; overflow: hidden; vertical-align: middle;
+}
+.endpoint-dbbar__fill {
+  position: absolute; left: 0; top: 0; height: 100%;
+  background: var(--accent); opacity: 0.5; min-width: 1px;
+}
+.endpoint-dbbar__txt {
+  position: absolute; right: 5px; top: 0; line-height: 14px;
+  font-size: 10.5px; color: var(--text);
+}
+.endpoint-breakdown-row td { background: var(--hover); white-space: normal; }
+.endpoint-breakdown-row td [data-testid='endpoint-breakdown'] { padding: 4px 2px; }
+
+/* Requests tab — Phase 2: Endpoints/Requests view toggle */
+.req-view-toggle { display: inline-flex; gap: 2px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.req-view-toggle__btn {
+  padding: 4px 14px; font-size: 12px; background: transparent; color: var(--text-dim);
+  border: none; cursor: pointer;
+}
+.req-view-toggle__btn--on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+/* on-CPU / run-queue / DB-wait / off-CPU decomposition bar (per request + per endpoint) */
+.req-breakdown { margin: 6px 0 2px; }
+.req-breakdown__bar {
+  display: flex; height: 12px; width: 100%; border-radius: 3px; overflow: hidden;
+  background: var(--bg); border: 1px solid var(--border);
+}
+.req-seg { height: 100%; min-width: 1px; }
+.req-seg--cpu { background: #6bbf59; }
+.req-seg--runq { background: #d98a3b; }
+.req-seg--db { background: #4a90d9; }
+.req-seg--off { background: #9b7fc4; }
+.req-breakdown__legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; }
+.req-chip { font-size: 11px; color: var(--text-dim); display: inline-flex; align-items: center; gap: 5px; }
+.req-chip b { color: var(--text); font-weight: 600; }
+.req-dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+
+/* per-request waterfall */
+.waterfall { display: flex; flex-direction: column; }
+.waterfall__row {
+  display: grid; grid-template-columns: minmax(160px, 260px) 1fr 72px; gap: 10px;
+  align-items: center; padding: 5px 4px; cursor: pointer; border-bottom: 1px solid var(--border);
+}
+.waterfall__row:hover { background: var(--hover); }
+.waterfall__label { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.waterfall__status { margin-left: 6px; font-size: 10.5px; color: var(--text-dim); }
+.waterfall__status.errs { color: #d9722b; font-weight: 600; }
+.waterfall__track {
+  position: relative; height: 14px; background: var(--bg);
+  border-radius: 3px; overflow: hidden; border: 1px solid var(--border);
+}
+.waterfall__http { position: absolute; inset: 0; background: var(--accent-soft); }
+.span-bar { position: absolute; top: 0; height: 100%; min-width: 1px; border-radius: 2px; }
+.span-bar[data-span-kind='db'] { background: #4a90d9; opacity: 0.85; }
+.waterfall__dur { font-size: 11.5px; text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.waterfall__detail { padding: 8px 4px 14px; background: var(--hover); border-bottom: 1px solid var(--border); }
+.waterfall__sql { margin: 8px 0; display: flex; flex-direction: column; gap: 3px; }
+.waterfall__sqlrow { display: flex; justify-content: space-between; gap: 12px; font-size: 11.5px; }
+.waterfall__sqlrow code { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.waterfall__sqlrow span { color: var(--text-dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.waterfall__flame { margin-top: 6px; }
 .io-leak {
   color: #fca5a5;
   font-weight: 600;

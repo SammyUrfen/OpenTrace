@@ -53,6 +53,24 @@ function fetchEbpfCaps(backendUrl: string, force = false): Promise<EbpfCaps | nu
   return ebpfCapsCache.get(backendUrl)!
 }
 
+// Request-tracing capability (bpftrace + privilege — a DIFFERENT, weaker gate than
+// eBPF's BTF+bcc). Cached per backend like the eBPF probe, for the same reason.
+const requestCapsCache = new Map<string, Promise<EbpfCaps | null>>()
+
+function fetchRequestCaps(backendUrl: string, force = false): Promise<EbpfCaps | null> {
+  if (force || !requestCapsCache.has(backendUrl)) {
+    const probe = fetch(`${backendUrl}/runs/attach/request-capabilities${force ? '?refresh=true' : ''}`)
+      .then((r) => (r.ok ? (r.json() as Promise<EbpfCaps>) : null))
+      .catch(() => null)
+      .then((caps) => {
+        if (caps === null) requestCapsCache.delete(backendUrl)
+        return caps
+      })
+    requestCapsCache.set(backendUrl, probe)
+  }
+  return requestCapsCache.get(backendUrl)!
+}
+
 /**
  * "Attach to a running process" picker (profiling Phase A). Lists attachable
  * PIDs from `GET /runs/attach/targets`, then `POST /runs/attach` samples the
@@ -66,6 +84,8 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
   const [monitor, setMonitor] = useState(false)
   const [ebpf, setEbpf] = useState(false)
   const [ebpfCaps, setEbpfCaps] = useState<EbpfCaps | null>(null)
+  const [requests, setRequests] = useState(false)
+  const [reqCaps, setReqCaps] = useState<EbpfCaps | null>(null)
   // in-flight attach key: `pid-<n>` for a listed row or manual PID, `port-<n>`
   // for a manual port. A single string lets rows and the manual affordance share
   // one busy gate (only one attach can be in flight).
@@ -89,11 +109,14 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
   const rescan = () => {
     load()
     setEbpfCaps(null)
+    setReqCaps(null)
     void fetchEbpfCaps(backendUrl, true).then(setEbpfCaps)
+    void fetchRequestCaps(backendUrl, true).then(setReqCaps)
   }
   useEffect(load, [backendUrl])
   useEffect(() => {
     void fetchEbpfCaps(backendUrl).then(setEbpfCaps)
+    void fetchRequestCaps(backendUrl).then(setReqCaps)
   }, [backendUrl])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -127,7 +150,9 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           window_s: windowS, monitor,
-          ebpf: ebpf && !!ebpfCaps?.available, session_id: sessionId ?? null,
+          ebpf: ebpf && !!ebpfCaps?.available,
+          requests: requests && !!reqCaps?.available,
+          session_id: sessionId ?? null,
           ...body,
         }),
       })
@@ -202,6 +227,25 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
               {ebpfCaps?.available
                 ? 'Adds an off-CPU flamegraph (where it BLOCKS — I/O, locks, DB waits) and scheduler + block-I/O latency histograms. This is what on-CPU sampling cannot see.'
                 : (ebpfCaps?.reason ?? 'Checking eBPF capabilities…')}
+            </span>
+          </span>
+        </label>
+
+        <label className={`attach__monitor${reqCaps && !reqCaps.available ? ' attach__monitor--off' : ''}`}>
+          <input
+            type="checkbox" checked={requests && !!reqCaps?.available}
+            disabled={!reqCaps?.available}
+            onChange={(e) => setRequests(e.target.checked)}
+          />
+          <span>
+            <span className="attach__monitor-label">
+              Request tracing (HTTP endpoints + DB)
+              {reqCaps && !reqCaps.available && <span className="attach__ebpf-tag"> unavailable</span>}
+            </span>
+            <span className="attach__monitor-sub">
+              {reqCaps?.available
+                ? 'Adds a per-endpoint latency table (RED) for a plaintext HTTP/1.x server, and — with a dynamically-linked libpq — attributes each request’s time to its Postgres queries.'
+                : (reqCaps?.reason ?? 'Checking request-tracing capabilities…')}
             </span>
           </span>
         </label>

@@ -5,7 +5,7 @@ set -u
 cd "$(dirname "$0")"
 WAVE="${1:-4}"
 FILES=(00-core 10-sessions 11-attach 12-monitor 13-ebpf 14-run-tabs 15-analytics \
-       16-settings 17-palette-menu 18-diff 19-edge-cases 20-terminal)
+       16-settings 17-palette-menu 18-diff 19-edge-cases 20-terminal 21-requests)
 mkdir -p out
 i=0
 for f in "${FILES[@]}"; do

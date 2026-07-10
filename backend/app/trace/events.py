@@ -14,6 +14,7 @@ SYSCALL = "syscall"
 SIGNAL = "signal"
 EXIT = "exit"
 LIBCALL = "libcall"  # a library-function call from ltrace (e.g. malloc/free)
+REQUEST = "request"  # an HTTP request / DB query span (attach request-tracing)
 
 
 @dataclass(slots=True)
@@ -75,6 +76,44 @@ class MetricSample:
             self.open_fds, self.threads, self.syscall_rate,
             self.io_read_bps, self.io_write_bps,
         )
+
+
+@dataclass(slots=True)
+class Span:
+    """One request-tracing span — an HTTP request (`kind='http'`) or a DB query
+    (`kind='db'`) — captured by the attach-mode bpftrace request program.
+
+    Timestamps are CLOCK_MONOTONIC nanoseconds (bpftrace `nsecs`), the SAME clock
+    as offcputime/runqueue, so a future off-CPU join needs no conversion. They are
+    **not** Unix epoch: durations here are self-consistent within the run, but any
+    absolute-time sink (an incident `ts`, a timeline overlay) must convert via a
+    (mono0, wall0) anchor captured at child launch (roadmap §2.6). The MVP has no
+    such sink — endpoint durations are relative — so spans stay monotonic.
+
+    `tid` is the worker thread and the correlation join key: a `db` span nests
+    under the `http` span with the same tid whose [start_ns, start_ns+dur_ns]
+    window contains it (thread-per-request). `db_ms` on an http span is the sum of
+    its nested db-span durations, filled by the correlator.
+    """
+
+    kind: str  # 'http' | 'db'
+    tid: int
+    pid: int
+    start_ns: int  # CLOCK_MONOTONIC (bpftrace nsecs)
+    dur_ns: int
+    name: str = ""  # 'GET /users/{id}' | 'SELECT …' (normalized rollup key)
+    method: str | None = None
+    route: str | None = None
+    status: int | None = None
+    db_ms: float = 0.0  # http spans only: Σ nested db-span ms (correlator-filled)
+    attrs: dict = field(default_factory=dict)
+
+    @property
+    def dur_ms(self) -> float:
+        return self.dur_ns / 1e6
+
+    def to_ndjson(self) -> dict:
+        return asdict(self)
 
 
 @dataclass(slots=True)
