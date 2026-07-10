@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useRunResource } from '../state/useRunResource'
 import { formatBytes } from '../state/format'
+import { apiFetch } from '../state/api'
 
 interface FileRow {
   name: string
@@ -31,7 +32,7 @@ export function FilesTab({ backendUrl, runId }: Props) {
     setDoc(null)
     if (!f.text) return
     setLoading(true)
-    fetch(`${backendUrl}/runs/${runId}/file?name=${encodeURIComponent(f.name)}`)
+    apiFetch(`${backendUrl}/runs/${runId}/file?name=${encodeURIComponent(f.name)}`)
       .then((r) => r.json())
       .then((d: FileContent) => setDoc(d))
       .catch(() => setDoc(null))

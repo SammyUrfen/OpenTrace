@@ -7,6 +7,20 @@ import {
   statusClass,
   statusLabel,
 } from '../state/format'
+import { ConfirmModal } from './ConfirmModal'
+
+const COLLAPSE_KEY = 'opentrace.sidebar.collapsedSessions'
+function loadCollapsed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(COLLAPSE_KEY)
+    return new Set(raw ? (JSON.parse(raw) as string[]) : [])
+  } catch {
+    return new Set()
+  }
+}
+function saveCollapsed(s: Set<string>) {
+  try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...s])) } catch { /* best-effort */ }
+}
 
 interface Props {
   projects: Project[]
@@ -34,11 +48,13 @@ function RunRow({
   active,
   onSelect,
   onContextMenu,
+  onDeleteKey,
 }: {
   run: Run
   active: boolean
   onSelect?: (r: Run) => void
   onContextMenu?: (e: React.MouseEvent, r: Run) => void
+  onDeleteKey?: (r: Run) => void
 }) {
   return (
     <button
@@ -46,6 +62,15 @@ function RunRow({
       className={`run-row ${active ? 'run-row--active' : ''}`}
       onClick={() => onSelect?.(run)}
       onContextMenu={(e) => onContextMenu?.(e, run)}
+      onKeyDown={(e) => {
+        // Delete/Backspace on a focused run row deletes it (same confirm flow as
+        // the context menu). Scoped to this button's own focus — never a global
+        // listener — so it can't ever eat a Backspace typed into the terminal.
+        if (e.key === 'Delete' || e.key === 'Backspace') {
+          e.preventDefault()
+          onDeleteKey?.(run)
+        }
+      }}
       title={run.label ? `${run.label} — ${run.command}` : run.command}
     >
       <span
@@ -84,6 +109,8 @@ export function RunSidebar({
   onRenameSession,
 }: Props) {
   const [menu, setMenu] = useState<MenuState | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<Run | null>(null)
+  const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsed)
   const runsByProject = new Map<string, Run[]>()
   for (const r of runs) {
     const list = runsByProject.get(r.session_id) ?? []
@@ -109,13 +136,16 @@ export function RunSidebar({
   }, [menu])
   const doDelete = (run: Run) => {
     closeMenu()
-    if (
-      window.confirm(
-        `Delete run "${run.label ?? run.display_name}"? This permanently removes its data and cannot be undone.`,
-      )
-    ) {
-      onDeleteRun?.(run)
-    }
+    setConfirmDelete(run)
+  }
+  const toggleCollapsed = (id: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      saveCollapsed(next)
+      return next
+    })
   }
 
   return (
@@ -139,37 +169,62 @@ export function RunSidebar({
         {projects.map((p) => {
           const projectRuns = runsByProject.get(p.id) ?? []
           const isActive = p.id === activeSessionId
+          const isCollapsed = collapsed.has(p.id)
           return (
             <div key={p.id} className="project-group">
-              <button
-                type="button"
-                className={`project-group__header ${isActive ? 'project-group__header--active' : ''}`}
-                onClick={() => onSelectSession?.(p)}
-                onDoubleClick={() => onRenameSession?.(p)}
-                title={isActive ? 'Active — new runs go here (double-click to rename)' : 'Switch (double-click to rename)'}
-              >
-                <span className="project-group__name">
-                  {isActive && <span className="project-group__active-dot" />}
-                  {p.display_name}
-                </span>
-                <span className="project-group__count">{projectRuns.length}</span>
-              </button>
-              {projectRuns.length === 0 && (
+              <div className={`project-group__header ${isActive ? 'project-group__header--active' : ''}`}>
+                <button
+                  type="button"
+                  className={`project-group__toggle ${isCollapsed ? 'project-group__toggle--collapsed' : ''}`}
+                  onClick={() => toggleCollapsed(p.id)}
+                  aria-label={isCollapsed ? 'expand session' : 'collapse session'}
+                  aria-expanded={!isCollapsed}
+                  title={isCollapsed ? 'Expand' : 'Collapse'}
+                >
+                  ▾
+                </button>
+                <button
+                  type="button"
+                  className="project-group__select"
+                  onClick={() => onSelectSession?.(p)}
+                  onDoubleClick={() => onRenameSession?.(p)}
+                  title={isActive ? 'Active — new runs go here (double-click to rename)' : 'Switch (double-click to rename)'}
+                >
+                  <span className="project-group__name">
+                    {isActive && <span className="project-group__active-dot" />}
+                    {p.display_name}
+                  </span>
+                  <span className="project-group__count">{projectRuns.length}</span>
+                </button>
+              </div>
+              {!isCollapsed && projectRuns.length === 0 && (
                 <div className="project-group__empty">no runs yet</div>
               )}
-              {projectRuns.map((r) => (
+              {!isCollapsed && projectRuns.map((r) => (
                 <RunRow
                   key={r.id}
                   run={r}
                   active={r.id === activeRunId}
                   onSelect={onSelectRun}
                   onContextMenu={openMenu}
+                  onDeleteKey={doDelete}
                 />
               ))}
             </div>
           )
         })}
       </div>
+
+      {confirmDelete && (
+        <ConfirmModal
+          title="Delete run"
+          body={`Delete run "${confirmDelete.label ?? confirmDelete.display_name}"? This permanently removes its data and cannot be undone.`}
+          confirmLabel="Delete"
+          danger
+          onClose={() => setConfirmDelete(null)}
+          onConfirm={() => { onDeleteRun?.(confirmDelete); setConfirmDelete(null) }}
+        />
+      )}
 
       {menu && (
         <>

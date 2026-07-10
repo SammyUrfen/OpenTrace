@@ -1,5 +1,6 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu } = require('electron')
 const { spawn } = require('child_process')
+const crypto = require('crypto')
 const path = require('path')
 const http = require('http')
 const net = require('net')
@@ -28,6 +29,11 @@ const FRONTEND_DIST = path.resolve(__dirname, '..', 'frontend', 'dist', 'index.h
 // later directory changes inside the app don't affect the terminal's start dir.
 const LAUNCH_CWD = process.env.OPENTRACE_LAUNCH_CWD || process.cwd()
 
+// Random per-launch bearer token, generated only when we spawn our OWN backend
+// child (below) — never for an external/reused one, which was never given it
+// and would just 401 every request. Empty means the backend requires no auth,
+// same as a manual `uvicorn` run or an isolated test backend.
+let API_TOKEN = ''
 let backendProcess = null
 let backendSpawned = false // we own a child (vs external / reused backend)
 let backendGaveUp = false // restart budget exhausted — backend is permanently down
@@ -124,7 +130,7 @@ function startBackend() {
   backendProcess = spawn(
     python,
     ['-m', 'uvicorn', 'app.main:app', '--port', String(BACKEND_PORT)],
-    { cwd: backendDir, env: process.env }
+    { cwd: backendDir, env: API_TOKEN ? { ...process.env, OPENTRACE_API_TOKEN: API_TOKEN } : process.env }
   )
 
   backendProcess.stdout.on('data', (d) => process.stdout.write(`[backend] ${d}`))
@@ -241,7 +247,10 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      additionalArguments: [`--opentrace-backend-url=${BACKEND_URL}`],
+      additionalArguments: [
+        `--opentrace-backend-url=${BACKEND_URL}`,
+        `--opentrace-api-token=${API_TOKEN}`,
+      ],
     },
   })
 
@@ -362,6 +371,7 @@ function registerIpc() {
       cols: opts.cols,
       rows: opts.rows,
       backendUrl: BACKEND_URL,
+      apiToken: API_TOKEN,
       // Mirror terminal scrollback under userData (respects OPENTRACE_USERDATA,
       // so e2e's throwaway profiles stay isolated) to restore it after a restart.
       scrollbackPath: path.join(app.getPath('userData'), 'terminal-scrollback.log'),
@@ -390,7 +400,10 @@ app.whenReady().then(async () => {
   registerIpc()
   if (!EXTERNAL_BACKEND) {
     const shouldSpawn = await resolveBackendPort()
-    if (shouldSpawn) startBackend()
+    if (shouldSpawn) {
+      API_TOKEN = crypto.randomBytes(32).toString('hex')
+      startBackend()
+    }
   }
   try {
     await waitForBackend()

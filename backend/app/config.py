@@ -45,6 +45,9 @@ class TracingConfig(BaseModel):
     # defaults in `rules.engine.RuleThresholds` — retune the anomaly engine
     # without a code change. Empty = use every rule's built-in default.
     rule_thresholds: dict[str, float] = Field(default_factory=dict)
+    # Built-in rule ids (function name == rule_id, see rules.engine.RULE_META)
+    # the user turned off from Settings → Rules. Empty = every rule runs.
+    disabled_rules: list[str] = Field(default_factory=list)
 
 
 class Config(BaseModel):

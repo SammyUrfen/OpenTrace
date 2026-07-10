@@ -1,4 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
+import { apiFetch } from '../state/api'
 
 export const GOOGLE_BASE = 'https://generativelanguage.googleapis.com/v1beta/openai'
 
@@ -34,7 +35,7 @@ export const LlmConfigForm = forwardRef<LlmConfigHandle, Props>(function LlmConf
   onLoadedRef.current = onLoaded
 
   useEffect(() => {
-    fetch(`${backendUrl}/config/llm`).then((r) => r.json()).then((d) => {
+    apiFetch(`${backendUrl}/config/llm`).then((r) => r.json()).then((d) => {
       setBaseUrl(d.base_url ?? '')
       setModel(d.model ?? '')
       setHasKey(!!d.has_key)
@@ -46,7 +47,7 @@ export const LlmConfigForm = forwardRef<LlmConfigHandle, Props>(function LlmConf
     const body: Record<string, string> = { base_url: baseUrl, model }
     if (apiKey.trim()) body.api_key = apiKey.trim()
     try {
-      await fetch(`${backendUrl}/config/llm`, {
+      await apiFetch(`${backendUrl}/config/llm`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
@@ -57,7 +58,7 @@ export const LlmConfigForm = forwardRef<LlmConfigHandle, Props>(function LlmConf
     setTest('Testing…')
     await save()
     try {
-      const d = await fetch(`${backendUrl}/config/llm/test`, { method: 'POST' }).then((r) => r.json())
+      const d = await apiFetch(`${backendUrl}/config/llm/test`, { method: 'POST' }).then((r) => r.json())
       setTest(d.ok
         ? `✓ Connected — ${d.models_count} models${d.model_available ? '' : ' (configured model NOT found)'}`
         : `✗ ${d.error}`)

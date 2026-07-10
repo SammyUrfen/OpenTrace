@@ -74,6 +74,14 @@ async function runContextMenu(ctx, pid) {
   await row.click({ button: 'right' })
 }
 
+// Confirm the styled delete dialog that follows clicking the sidebar's "Delete" item
+// (window.confirm is gone — it's a real modal now, same as every other dialog).
+async function confirmDeleteRun(ctx) {
+  await ctx.waitFor('.modal--small .ai-btn--danger', 4000)
+  await ctx.click('.modal--small .ai-btn--danger')
+  await ctx.gone('.modal--small', 4000).catch(() => {})
+}
+
 // Trigger an in-app MenuBar item (for actions with no palette entry / renderer shortcut).
 async function menu(ctx, topRe, itemRe) {
   await ctx.page.locator('.menubar__top', { hasText: topRe }).first().click()
@@ -84,4 +92,4 @@ async function menu(ctx, topRe, itemRe) {
 const runCount = async (ctx) => (await ctx.api.get('/runs?limit=500')).length
 
 module.exports = { cmd, newSession, attachPid, openSettings, toggleTheme, toggleTracing,
-                   runContextMenu, openRunByPid, menu, runCount }
+                   runContextMenu, confirmDeleteRun, openRunByPid, menu, runCount }

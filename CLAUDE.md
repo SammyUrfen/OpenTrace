@@ -6,12 +6,21 @@ OpenTrace is a **local-first Linux observability desktop app** (Electron shell +
 
 ## Authoritative docs — read these first
 
+Contributor/internal references:
 - **`docs/structure.md`** — the tree→responsibility map (backend modules, electron shell + shell hooks, frontend state/components, and the end-to-end runtime flow). Start here to find where something lives.
+- **`docs/ARCHITECTURE.md`** — the conceptual how-it-works narrative (three-process model, data spine, collector/fold model, rule engine, request tracing, fail-open + local-only security). Complements `structure.md`.
 - **`docs/OpenTrace_Roadmap.md`** — product spec + phase status (Phases A–E of the profiling roadmap: attach-to-PID, universal samplers, Node/.NET/PHP, eBPF off-CPU/latency, containers/USDT).
-- **`docs/testing.md`** — copy-pasteable manual test workflows for every feature (each with an inline workload + expected result).
 - **`docs/Profiling_Roadmap.md`** — per-runtime profiler research (exact tools/flags/formats).
+- **`docs/Request_Tracing_Roadmap.md`** — request-tracing (endpoint→query attribution) design + phase status.
+- **`docs/testing.md`** — copy-pasteable manual test workflows for every feature (each with an inline workload + expected result).
 
-Keep `docs/structure.md` and the roadmap updated when you change architecture — they are treated as living docs.
+User-facing guides (grounded in the code; keep in sync when behavior changes):
+- **`README.md`** — the front door (what it is, feature tour, quick start).
+- **`docs/SETUP.md`** — full install & run guide (prerequisites, env vars, optional tools, verification).
+- **`docs/USAGE.md`** — task-oriented "how to use every feature" walkthrough.
+- **`docs/TROUBLESHOOTING.md`** — requirements + failure matrix (what can break, why, and the fix), with the real fail-open reason strings.
+
+Keep `docs/structure.md`, `docs/ARCHITECTURE.md`, and the roadmap updated when you change architecture — they are treated as living docs.
 
 ## Commands
 

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { apiFetch } from './api'
 
 export interface Collectors {
   strace: boolean
@@ -18,7 +19,7 @@ export function useCollectors(backendUrl: string) {
 
   useEffect(() => {
     let cancelled = false
-    fetch(`${backendUrl}/config/tracing`)
+    apiFetch(`${backendUrl}/config/tracing`)
       .then((r) => r.json())
       .then((d: TracingConfig) => {
         if (!cancelled) setTracing(d)
@@ -42,7 +43,7 @@ export function useCollectors(backendUrl: string) {
         if (on && key === 'ltrace') collectors.strace = false
         if (on && key === 'strace') collectors.ltrace = false
         const next: TracingConfig = { ...prev, collectors }
-        fetch(`${backendUrl}/config/tracing`, {
+        apiFetch(`${backendUrl}/config/tracing`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(next),

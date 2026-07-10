@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.datastructures import Headers
+from starlette.datastructures import Headers, QueryParams
 from starlette.responses import PlainTextResponse
 
-from . import config, db, llm, paths, runs, sessions, terminals
+from . import config, db, llm, paths, rules_api, runs, sessions, terminals
 from .streaming import sse_response
 from .trace import metrics as metrics_mod
 from .trace import orchestrator
@@ -84,10 +86,52 @@ app.add_middleware(
 # Added after CORS so it runs first (outermost) and rejects before preflight.
 app.add_middleware(LocalOnlyMiddleware)
 
+# Per-launch bearer token: Electron generates one and passes it to the backend
+# child it spawns (OPENTRACE_API_TOKEN) plus the renderer/otrace hook. A manual
+# `uvicorn` run, the test suite, and isolated dev/e2e backends never set this
+# env var, so the check is a no-op there — preserving the documented
+# unauthenticated local workflow (see CLAUDE.md testing conventions).
+API_TOKEN = os.environ.get("OPENTRACE_API_TOKEN", "").strip()
+
+
+class ApiTokenMiddleware:
+    """Reject requests that don't carry API_TOKEN, once one is configured.
+    EventSource (SSE) can't set custom headers, so a `?token=` query param is
+    accepted as well as `Authorization: Bearer`. CORS preflight (OPTIONS) never
+    carries the header by browser design — it must pass through untouched so
+    CORSMiddleware (which runs after this one) can answer it."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if not API_TOKEN or scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if scope.get("method") == "OPTIONS" or scope.get("path") == "/health":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        auth = headers.get("authorization", "")
+        token = auth[7:] if auth.lower().startswith("bearer ") else ""
+        if not token:
+            token = QueryParams(scope.get("query_string", b"")).get("token", "")
+        if not secrets.compare_digest(token, API_TOKEN):
+            resp = PlainTextResponse("unauthorized", status_code=401)
+            await resp(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+# Added after LocalOnly so it runs first (outermost) of all — the earliest
+# possible rejection for a request carrying no/wrong token.
+app.add_middleware(ApiTokenMiddleware)
+
 app.include_router(sessions.router)
 app.include_router(terminals.router)
 app.include_router(runs.router)
 app.include_router(llm.router)
+app.include_router(rules_api.router)
 
 
 @app.get("/health")

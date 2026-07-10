@@ -7,6 +7,14 @@ function readBackendUrl() {
   return arg ? arg.slice(prefix.length) : 'http://localhost:8000'
 }
 
+// Extract --opentrace-api-token=... (empty when main.js reused/pointed at an
+// external backend rather than spawning + tokening its own).
+function readApiToken() {
+  const prefix = '--opentrace-api-token='
+  const arg = process.argv.find((a) => a.startsWith(prefix))
+  return arg ? arg.slice(prefix.length) : ''
+}
+
 // Subscribe to an ipcRenderer channel and return an unsubscribe function.
 function subscribe(channel, cb) {
   const listener = (_event, payload) => cb(payload)
@@ -16,6 +24,7 @@ function subscribe(channel, cb) {
 
 contextBridge.exposeInMainWorld('opentrace', {
   backendUrl: readBackendUrl(),
+  apiToken: readApiToken(),
   terminal: {
     start: (opts) => ipcRenderer.invoke('pty:start', opts || {}),
     write: (data) => ipcRenderer.send('pty:write', data),

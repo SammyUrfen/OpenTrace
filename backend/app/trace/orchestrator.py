@@ -42,7 +42,7 @@ import psutil
 from .. import db, runs, storage
 from .. import perf as perf_mod
 from .. import profile as profile_mod
-from ..rules import RuleContext, run_rules
+from ..rules import CustomRuleDef, RuleContext, run_custom_rules, run_rules
 from ..rules.engine import RuleThresholds
 from ..streaming import broker
 from ..util import new_id, now_ms
@@ -101,6 +101,25 @@ def _rule_thresholds() -> RuleThresholds:
         return RuleThresholds.from_overrides(config.load().tracing.rule_thresholds)
     except Exception:  # noqa: BLE001
         return RuleThresholds()
+
+
+def _disabled_rules() -> frozenset[str]:
+    """Built-in rule ids turned off from Settings -> Rules. Fail-open to the
+    empty set (every rule runs) — a bad/absent config must never break analysis."""
+    try:
+        from .. import config
+        return frozenset(config.load().tracing.disabled_rules)
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def _custom_rule_defs() -> list[CustomRuleDef]:
+    """User-authored rules (Settings -> Rules). Fail-open to none — a corrupt
+    row or a DB hiccup must never break analysis."""
+    try:
+        return storage.list_custom_rules()
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _sweep_stale() -> None:
@@ -1009,12 +1028,17 @@ def _eval_sliding_rules(ctx: _RunContext) -> None:
         cgroup_cpu_quota_cores=cc.get("cgroup_cpu_quota_cores"),
         cgroup_mem_limit_bytes=cc.get("cgroup_mem_limit_bytes"),
         thresholds=_rule_thresholds(),
+        disabled_rules=_disabled_rules(),
     )
     try:
         found = run_rules(rctx)
     except Exception:  # noqa: BLE001
         log.debug("sliding rules failed for %s", ctx.run.id, exc_info=True)
         return
+    try:
+        found = found + run_custom_rules(rctx, _custom_rule_defs())
+    except Exception:  # noqa: BLE001
+        log.debug("custom sliding rules failed for %s", ctx.run.id, exc_info=True)
     for a in found:
         # cooldown-deduped inside _make_incident (re-fires after a quiet gap)
         _make_incident(ctx, a.rule_id, a.severity, a.title, window[-1].timestamp_ms)
@@ -1311,8 +1335,13 @@ def _finalize(
             cgroup_cpu_quota_cores=collectors.get("cgroup_cpu_quota_cores"),
             cgroup_mem_limit_bytes=collectors.get("cgroup_mem_limit_bytes"),
             thresholds=_rule_thresholds(),
+            disabled_rules=_disabled_rules(),
         )
         anomalies = run_rules(rctx)
+        try:
+            anomalies += run_custom_rules(rctx, _custom_rule_defs())
+        except Exception:  # noqa: BLE001 — a bad custom rule must never break finalize
+            log.warning("custom rule evaluation failed for %s", run.id, exc_info=True)
 
     # Fail-open note when the in-memory cap truncated the analysis window.
     if stream_totals["events"] > len(events):

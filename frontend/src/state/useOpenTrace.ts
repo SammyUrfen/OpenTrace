@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { evictLiveMetrics, recordLiveSample } from './liveMetrics'
 import { clearRunCache, registerRunStatuses } from './runCache'
+import { apiFetch, sseUrl } from './api'
 
 /** Mirrors `app.sessions.Session` (a project/workspace). */
 export interface Project {
@@ -208,8 +209,8 @@ export function useOpenTrace(backendUrl: string): Hook {
   const refresh = useCallback(async () => {
     try {
       const [p, r] = await Promise.all([
-        fetch(`${backendUrl}/sessions`).then((x) => x.json()),
-        fetch(`${backendUrl}/runs?limit=200`).then((x) => x.json()),
+        apiFetch(`${backendUrl}/sessions`).then((x) => x.json()),
+        apiFetch(`${backendUrl}/runs?limit=200`).then((x) => x.json()),
       ])
       setProjects(p)
       setRuns(r)
@@ -245,7 +246,7 @@ export function useOpenTrace(backendUrl: string): Hook {
   const deleteRun = useCallback(
     async (id: string) => {
       try {
-        await fetch(`${backendUrl}/runs/${id}`, { method: 'DELETE' })
+        await apiFetch(`${backendUrl}/runs/${id}`, { method: 'DELETE' })
       } catch {
         /* ignore; we still drop it locally */
       }
@@ -267,7 +268,7 @@ export function useOpenTrace(backendUrl: string): Hook {
   const stopMonitor = useCallback(
     async (id: string): Promise<void> => {
       try {
-        await fetch(`${backendUrl}/runs/${id}/stop`, { method: 'POST' })
+        await apiFetch(`${backendUrl}/runs/${id}/stop`, { method: 'POST' })
       } catch {
         /* ignore; the run finalizes on target exit regardless */
       }
@@ -284,7 +285,7 @@ export function useOpenTrace(backendUrl: string): Hook {
       // Optimistic: reflect immediately, reconcile on response.
       setRuns((prev) => prev.map((r) => (r.id === id ? { ...r, label } : r)))
       try {
-        const r = await fetch(`${backendUrl}/runs/${id}`, {
+        const r = await apiFetch(`${backendUrl}/runs/${id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ label }),
@@ -303,7 +304,7 @@ export function useOpenTrace(backendUrl: string): Hook {
   const createSession = useCallback(
     async (displayName: string): Promise<Project | null> => {
       try {
-        const r = await fetch(`${backendUrl}/sessions`, {
+        const r = await apiFetch(`${backendUrl}/sessions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ display_name: displayName }),
@@ -322,7 +323,7 @@ export function useOpenTrace(backendUrl: string): Hook {
   const renameSession = useCallback(
     async (id: string, displayName: string): Promise<void> => {
       try {
-        const r = await fetch(`${backendUrl}/sessions/${id}`, {
+        const r = await apiFetch(`${backendUrl}/sessions/${id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ display_name: displayName }),
@@ -346,7 +347,7 @@ export function useOpenTrace(backendUrl: string): Hook {
 
   useEffect(() => {
     void refresh()
-    const es = new EventSource(`${backendUrl}/stream`)
+    const es = new EventSource(sseUrl(`${backendUrl}/stream`))
     // Re-sync on every (re)connect: lifecycle events emitted while the stream
     // was down are gone for good (the broker has no replay), so refetch.
     es.onopen = () => { setConnected(true); setConnectionError(false); void refresh() }
@@ -416,7 +417,7 @@ export function useOpenTrace(backendUrl: string): Hook {
 
     async function refreshProjects() {
       try {
-        const p = await fetch(`${backendUrl}/sessions`).then((x) => x.json())
+        const p = await apiFetch(`${backendUrl}/sessions`).then((x) => x.json())
         setProjects(p)
       } catch {
         /* ignore */

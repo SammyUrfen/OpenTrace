@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useSyncExternalStore } from 'react'
+import { apiFetch, sseUrl } from './api'
 
 export type AiStatus =
   | 'idle'
@@ -71,7 +72,7 @@ function loadCached(backendUrl: string, runId: string) {
   const e = getEntry(keyFor(backendUrl, runId))
   if (e.loaded || isActive(e) || (e.status === 'done' && e.text)) return
   e.loaded = true
-  fetch(`${backendUrl}/runs/${runId}/ai-summary`)
+  apiFetch(`${backendUrl}/runs/${runId}/ai-summary`)
     .then((r) => r.json())
     .then((d: { text: string | null; configured: boolean }) => {
       if (isActive(e)) return // a stream started while we were fetching — leave it
@@ -98,7 +99,7 @@ function startGenerate(backendUrl: string, runId: string, force: boolean) {
   commit(e)
 
   const es = new EventSource(
-    `${backendUrl}/runs/${runId}/ai-summary/stream?force=${force ? 'true' : 'false'}`,
+    sseUrl(`${backendUrl}/runs/${runId}/ai-summary/stream?force=${force ? 'true' : 'false'}`),
   )
   e.es = es
   const detach = () => {

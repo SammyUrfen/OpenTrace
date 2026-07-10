@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { apiFetch } from '../state/api'
 
 interface Target {
   pid: number
@@ -41,7 +42,7 @@ const ebpfCapsCache = new Map<string, Promise<EbpfCaps | null>>()
 function fetchEbpfCaps(backendUrl: string, force = false): Promise<EbpfCaps | null> {
   if (force || !ebpfCapsCache.has(backendUrl)) {
     // force also bypasses the backend's TTL cache, not just this client one
-    const probe = fetch(`${backendUrl}/runs/attach/ebpf-capabilities${force ? '?refresh=true' : ''}`)
+    const probe = apiFetch(`${backendUrl}/runs/attach/ebpf-capabilities${force ? '?refresh=true' : ''}`)
       .then((r) => (r.ok ? (r.json() as Promise<EbpfCaps>) : null))
       .catch(() => null)
       .then((caps) => {
@@ -59,7 +60,7 @@ const requestCapsCache = new Map<string, Promise<EbpfCaps | null>>()
 
 function fetchRequestCaps(backendUrl: string, force = false): Promise<EbpfCaps | null> {
   if (force || !requestCapsCache.has(backendUrl)) {
-    const probe = fetch(`${backendUrl}/runs/attach/request-capabilities${force ? '?refresh=true' : ''}`)
+    const probe = apiFetch(`${backendUrl}/runs/attach/request-capabilities${force ? '?refresh=true' : ''}`)
       .then((r) => (r.ok ? (r.json() as Promise<EbpfCaps>) : null))
       .catch(() => null)
       .then((caps) => {
@@ -95,7 +96,7 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
   const load = () => {
     setTargets(null)
     setError(null)
-    fetch(`${backendUrl}/runs/attach/targets`)
+    apiFetch(`${backendUrl}/runs/attach/targets`)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         return r.json()
@@ -145,7 +146,7 @@ export function AttachModal({ backendUrl, sessionId, onClose, onAttached }: Prop
     setBusy(key)
     setError(null)
     try {
-      const r = await fetch(`${backendUrl}/runs/attach`, {
+      const r = await apiFetch(`${backendUrl}/runs/attach`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

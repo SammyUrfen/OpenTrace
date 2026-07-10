@@ -100,7 +100,8 @@ files are auto-discovered by the runner. A failure = a throw **or** an uncaught 
 
 Findings this suite already surfaced (behaviours worth a look, not necessarily bugs):
 the attach modal only lists the top-60 processes by RSS (a low-RSS target is
-unfindable); deleting a run uses a native `window.confirm`; the xterm swallows `Ctrl+K`
+unfindable); deleting a run opens a styled confirm modal (`H.confirmDeleteRun`), not a
+native `window.confirm`; the xterm swallows `Ctrl+K`
 so the palette won't open while the terminal is focused; a raw API run-delete doesn't
 refresh the sidebar (only the UI delete path does); the Live-Monitor hint text
 ("toggle OpenTrace on to trace") makes body-text assertions on tracing state unreliable

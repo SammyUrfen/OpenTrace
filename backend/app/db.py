@@ -148,6 +148,23 @@ MIGRATIONS: list[tuple[int, str]] = [
     # v2: the run_views feature (per-run persisted UI state) was removed
     # before any client ever used it; clean the orphan table from older DBs.
     (2, "DROP TABLE IF EXISTS run_views;"),
+    # v3: user-authored anomaly rules (Settings -> Rules "custom expressions").
+    # Global (no run_id — a ruleset the user builds once, applied to every run),
+    # so it's a top-level table like sessions/runs, not a per-run child table.
+    (3, """
+        CREATE TABLE IF NOT EXISTS custom_rules (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            signal TEXT NOT NULL,
+            expression TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'medium',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            min_count INTEGER NOT NULL DEFAULT 5,
+            duration_ms INTEGER NOT NULL DEFAULT 5000,
+            created_at INTEGER NOT NULL
+        );
+    """),
 ]
 
 CURRENT_VERSION = 1 + len(MIGRATIONS)
@@ -156,7 +173,7 @@ CURRENT_VERSION = 1 + len(MIGRATIONS)
 # Used only to tear down a pre-release legacy database (see `_drop_legacy`).
 _OWNED_TABLES = [
     "artifacts", "anomalies", "metrics", "events", "run_views",
-    "runs", "terminals", "sessions",
+    "runs", "terminals", "sessions", "custom_rules",
 ]
 
 

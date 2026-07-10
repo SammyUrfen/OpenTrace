@@ -38,6 +38,7 @@ module.exports = [
       const before = await H.runCount(ctx)
       await H.runContextMenu(ctx, pid)
       await ctx.page.locator('.ctx-item--danger', { hasText: /Delete/i }).first().click()
+      await H.confirmDeleteRun(ctx)
       for (let i = 0; i < 15 && (await H.runCount(ctx)) >= before; i++) await ctx.sleep(300)
       ctx.assert((await H.runCount(ctx)) < before, 'running run was not deleted')
       ctx.assert(!(await ctx.exists(`.run-row:has-text("pid ${pid}")`)), 'row for deleted pid still present')
@@ -53,6 +54,7 @@ module.exports = [
       await ctx.waitFor('.main-tabs', 6000)
       await H.runContextMenu(ctx, pid)
       await ctx.page.locator('.ctx-item--danger', { hasText: /Delete/i }).first().click()
+      await H.confirmDeleteRun(ctx)
       await ctx.sleep(1500)
       const tab = ctx.page.locator('.main-tab', { hasText: `pid ${pid}` })
       ctx.assert((await tab.count()) === 0, 'tab for the deleted run stayed open')
@@ -101,6 +103,7 @@ module.exports = [
       for (let guard = 0; guard < 40 && (await ctx.count('.run-row')) > 0; guard++) {
         await ctx.page.locator('.run-row').first().click({ button: 'right' })
         await ctx.page.locator('.ctx-item--danger', { hasText: /Delete/i }).first().click()
+        await H.confirmDeleteRun(ctx)
         await ctx.sleep(300)
       }
       ctx.assert((await H.runCount(ctx)) === 0, 'runs remained after deleting all')

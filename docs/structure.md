@@ -1,7 +1,11 @@
 # OpenTrace — Repository Structure and Responsibilities
 
-Developer-facing map of the tree to its responsibilities, current as of the
-Phase-1 data pipeline. For the product spec see `OpenTrace_Roadmap.md`.
+Developer-facing map of the tree to its responsibilities. This is the
+file-by-file reference; for the conceptual "how it all fits together" narrative
+see [`ARCHITECTURE.md`](ARCHITECTURE.md), and for the product spec see
+[`OpenTrace_Roadmap.md`](OpenTrace_Roadmap.md). User-facing guides live in
+[`../README.md`](../README.md), [`SETUP.md`](SETUP.md), [`USAGE.md`](USAGE.md),
+and [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ## Data model (the spine)
 
@@ -36,7 +40,12 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
 - `main.py` — app, lifespan (init DB, reconcile orphaned runs), routers, SSE endpoints.
   A local-only guard replaces wildcard CORS: real web `Origin`s and non-localhost
   `Host` headers get 403 (drive-by/DNS-rebinding defense); Electron's `file://`
-  (null origin), the Vite dev server, and plain curl all pass.
+  (null origin), the Vite dev server, and plain curl all pass. `ApiTokenMiddleware`
+  additionally requires a per-launch bearer token (`OPENTRACE_API_TOKEN`, generated
+  by `electron/main.js` only for a backend it spawns itself) on every request but
+  `/health` and CORS preflight — `?token=` is also accepted (EventSource can't set
+  headers). A no-op when the env var is unset, so a manual `uvicorn` run / the test
+  suite / an isolated dev backend stay unauthenticated exactly as documented above.
 - `db.py` — SQLite connect (WAL + FK), base schema, migrations, legacy-DB rebuild.
 - `paths.py` — every filesystem path + `slugify` / `command_basename` / `run_folder_name`.
 - `config.py`, `secrets.py`, `util.py` — config, file-based secret store, id/time helpers.
@@ -92,7 +101,26 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   clears once its metric stays quiet, so a genuine re-occurrence re-fires). Monitor
   runs also get a **long-horizon slow-leak** check (full DB history vs a start
   baseline) that the 90s sliding window can't see. `RuleContext` carries the
-  `collectors` dict + optional cgroup cpu-quota / mem-limit.
+  `collectors` dict + optional cgroup cpu-quota / mem-limit, plus `disabled_rules`
+  (built-in rule ids turned off from Settings → Rules, `config.tracing.disabled_rules`).
+  `RULE_META` (bottom of the module) is *derived*, not hand-written: each entry's
+  `label`/`description` come from the rule function's name/docstring and its
+  `thresholds` list from regex-scanning the function source for `ctx.thresholds.*`
+  reads — so it can't drift from the code it describes. `rule_id` is always the
+  function's own name by convention.
+- `rules/safe_eval.py` + `rules/custom.py` — user-authored ("Settings → Rules")
+  rules: a boolean/arithmetic expression over a fixed field set, AST-whitelisted
+  before compiling (no `Call`/`Attribute`/`Subscript`/comprehensions/lambdas — closes
+  the usual eval-sandbox escapes, which all need `Call` or `Attribute`) and evaluated
+  with `__builtins__` stripped. Two modes mirror the built-ins: `events` (expression
+  tested per-event, fires at `min_count` matches) and `metrics` (tested per-sample,
+  fires once true for a contiguous `duration_ms` span). Stored in the `custom_rules`
+  SQLite table (global, not per-run); `run_custom_rules` runs alongside `run_rules` at
+  both `_finalize` and the monitor sliding-window pass, fail-open throughout (a bad
+  expression is caught by `/rules/custom/validate` at save time, never at run time).
+- `rules_api.py` — `GET /rules` (built-ins + custom, effective thresholds/enabled
+  state), `PUT /rules/builtin/{id}` (toggle / tune), `POST|PUT|DELETE /rules/custom`
+  (+ `/validate` for live expression checking), all under `/rules`.
 - `aggregate.py` — pure aggregations over the event stream: per-syscall stats,
   per-file I/O (fd→path resolution, leak detection), and outbound connections
   (sockaddr parsing); back `GET /runs/{id}/{syscalls,io,network}`. Also the
@@ -166,11 +194,16 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   the renderer informed). `OPENTRACE_BACKEND_URL` points it at an already-running
   backend (skips probing/spawning, for dev/testing); `OPENTRACE_WIN=WxH` sizes
   the window. Reload/DevTools menu roles are dev-only (`OPENTRACE_DEV`/`DEBUG`)
-  so Ctrl+R reaches the shell instead of killing the live pty.
-- `preload.js` — `contextBridge` exposing `backendUrl`, `terminal`, `tracing`.
-- `pty.js` — node-pty session. Exports `OPENTRACE_API` / `OPENTRACE_OTRACE` /
-  `OPENTRACE_ENABLE_STRACE` into the shell, sources the right hook, and toggles
-  tracing by updating the env var the hook reads each command. Keeps a capped
+  so Ctrl+R reaches the shell instead of killing the live pty. When it spawns its
+  OWN backend (not a reused/external one), it also generates a random per-launch
+  `API_TOKEN`, passes it via `OPENTRACE_API_TOKEN` env to the child and
+  `--opentrace-api-token=` to the renderer (`preload.js`) and the pty (below) —
+  never for a reused `:8000` or `OPENTRACE_BACKEND_URL` backend, which was never
+  given one either.
+- `preload.js` — `contextBridge` exposing `backendUrl`, `apiToken`, `terminal`, `tracing`.
+- `pty.js` — node-pty session. Exports `OPENTRACE_API` / `OPENTRACE_API_TOKEN` /
+  `OPENTRACE_OTRACE` / `OPENTRACE_ENABLE_STRACE` into the shell, sources the right
+  hook, and toggles tracing by updating the env var the hook reads each command. Keeps a capped
   (256KB) rolling copy of terminal output that it **replays through the `pty:data`
   channel** into a freshly-mounted xterm (renderer reload / panel remount) and
   **mirrors to `<userData>/terminal-scrollback.log`**, so scrollback survives a
@@ -178,7 +211,9 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   exited shell reuses the same xterm and deliberately skips the replay.
 - `shell-hooks/`
   - `otrace` — the launcher. `otrace -- <cmd>` does the `/runs/start` handshake
-    (fail-open), then builds the trace command from the run's collectors: an
+    (fail-open, `Authorization: Bearer $OPENTRACE_API_TOKEN` on every call — a
+    no-op header when the var is empty), then builds the trace command from the
+    run's collectors: an
     inner `ltrace -S` **or** `strace` wrapper (ptrace-exclusive), optionally
     wrapped by an outer `perf record -g` (probed first to stay fail-open). It
     reports the pid, waits, posts `/runs/end`, and `exit`s with the real status.
@@ -195,6 +230,10 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
 
 ## frontend/ (React 19 + Vite + TS)
 
+- `state/api.ts` — `apiFetch`/`authHeaders`/`sseUrl`: attach the per-launch bearer
+  token (`window.opentrace.apiToken`, empty for a dev/test run against an external
+  backend) to every backend call. Every `fetch`/`EventSource` call site in the
+  renderer goes through this — no raw `fetch()` against the backend elsewhere.
 - `state/useOpenTrace.ts` — single hook: fetches projects + runs over REST and
   keeps them live via the `/stream` SSE channel (run lifecycle events). An SSE
   reconnect triggers a full sessions+runs resync, so missed lifecycle events
@@ -233,9 +272,18 @@ lifecycle, slow calls, anomaly evidence) so the DB stays small.
   - chrome: `MenuBar` (in-app File/View/Run/Help — the native Electron menu bar
     doesn't render on KDE/Wayland; dropdown is portalled to <body>),
     `RunSidebar` (create/switch sessions + run context menu: Open /
-    Rename… / Compare with… / Delete; a run shows `label ?? command`),
+    Rename… / Compare with… / Delete; a run shows `label ?? command`; each
+    session group is collapsible — chevron toggle, state persisted to
+    localStorage — and Delete/Backspace on a focused run row opens the same
+    confirm flow as the context menu), `ConfirmModal` (generic styled
+    confirm dialog — replaces `window.confirm`, which Electron renders
+    unstyled and which blocks the whole process),
     `LiveMonitor` (collector toggles),
-    `SettingsPage` (full sectioned page: General/Collectors/AI/Tools/Guide/About),
+    `SettingsPage` (full sectioned page: General/Collectors/AI/Rules/Tools/Guide/About),
+    `RulesSettings` (Settings ▸ Rules: enable/disable + tune thresholds on the
+    ~23 built-in rules; author fully custom rules as a safe boolean expression
+    over event/metric fields, validated live against `/rules/custom/validate`
+    with debounced feedback before it can be saved),
     `CommandPalette` (⌘K), `SessionModal` (generic create/rename dialog for
     sessions and runs), `RunNameBar` (non-blocking "name this run" prompt shown
     on a freshly-finished run; opt-out in Settings ▸ General), `FirstRunWizard`

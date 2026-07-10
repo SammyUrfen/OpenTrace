@@ -15,7 +15,7 @@
   local self="${${(%):-%x}:A}"
   : ${OPENTRACE_OTRACE:="${self:h}/otrace"}
   : ${OPENTRACE_API:="http://localhost:8000"}
-  export OPENTRACE_OTRACE OPENTRACE_API
+  export OPENTRACE_OTRACE OPENTRACE_API OPENTRACE_API_TOKEN
 }
 
 # One-time terminal registration so runs attach to a session + terminal.
@@ -26,7 +26,7 @@ if [[ -z "${OPENTRACE_TERMINAL:-}" && -n "${OPENTRACE_API:-}" ]] && \
   [[ -n "${OPENTRACE_SESSION:-}" ]] && \
     __ot_payload="{\"shell\":\"${SHELL:-/usr/bin/zsh}\",\"cwd\":\"$PWD\",\"session_id\":\"$OPENTRACE_SESSION\"}"
   __ot_resp="$(curl -sf --max-time 2 -X POST "$OPENTRACE_API/terminals/attach" \
-      -H 'content-type: application/json' -d "$__ot_payload" 2>/dev/null)"
+      -H 'content-type: application/json' -H "Authorization: Bearer ${OPENTRACE_API_TOKEN:-}" -d "$__ot_payload" 2>/dev/null)"
   if [[ -n "$__ot_resp" ]]; then
     export OPENTRACE_SESSION="$(print -r -- "$__ot_resp" | grep -o '"session_id":"[^"]*"' | cut -d'"' -f4)"
     export OPENTRACE_TERMINAL="$(print -r -- "$__ot_resp" | grep -o '"terminal_id":"[^"]*"' | cut -d'"' -f4)"

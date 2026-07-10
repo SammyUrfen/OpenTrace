@@ -6,6 +6,7 @@
  * cached ONLY for terminal-status runs; a live run keeps the fetch-on-mount
  * behavior, which is its only data-refresh path for these views.
  */
+import { apiFetch } from './api'
 
 // Payloads can be MBs (full metrics arrays), so keep the cache bounded (LRU).
 const MAX_ENTRIES = 40
@@ -31,7 +32,7 @@ export function isRunImmutable(runId: string): boolean {
 
 /** Fetch JSON, throwing on HTTP errors so failures are never cached. */
 export async function fetchJsonStrict<T>(url: string): Promise<T> {
-  const r = await fetch(url)
+  const r = await apiFetch(url)
   if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`)
   return (await r.json()) as T
 }

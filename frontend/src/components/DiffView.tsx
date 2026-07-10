@@ -5,6 +5,7 @@ import { useDiff, type RunBundle } from '../state/useDiff'
 import { commandBasename } from '../state/text'
 import { Markdown } from './Markdown'
 import { MemoryDiff, CpuDiff, SyscallDiff, AnomalyDiff } from './DiffPanels'
+import { sseUrl } from '../state/api'
 
 type AiStatus = 'idle' | 'thinking' | 'streaming' | 'done' | 'error'
 
@@ -28,7 +29,7 @@ function AiDiffSummary({ backendUrl, aId, bId }: { backendUrl: string; aId: stri
     setText('')
     setError(null)
     setStatus('thinking')
-    const es = new EventSource(`${backendUrl}/diff/${aId}/${bId}/ai-summary/stream`)
+    const es = new EventSource(sseUrl(`${backendUrl}/diff/${aId}/${bId}/ai-summary/stream`))
     esRef.current = es
     es.onmessage = (e) => {
       let m: { type: string; text?: string; message?: string }

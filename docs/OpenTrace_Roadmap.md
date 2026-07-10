@@ -704,8 +704,10 @@ API key stored in OS keyring (libsecret / Secret Service API). Never in config f
 ### Phase 2 — Setup UX + Sidebar (Weeks 4–5)
 - [x] First-run wizard (LLM config + collector defaults)
 - [ ] API key in libsecret *(file-based secret store exists; keyring swap deferred)*
-- [x] Right sidebar: sessions (projects) → runs with severity dots; **create + switch sessions**
-- [x] Right-click context menu (Open / Delete a run; middle-click closes a tab)
+- [x] Right sidebar: sessions (projects) → runs with severity dots; **create + switch sessions**;
+      each session is collapsible (chevron, persisted)
+- [x] Right-click context menu (Open / Delete a run; middle-click closes a tab); Delete/Backspace
+      on a focused run row opens the same styled confirm dialog (no `window.confirm`)
 - [x] Main tab bar + secondary tab bar (real: open runs as tabs, per-run views)
 - [x] Overview tab: execution snapshot + top anomaly cards
 - [x] Live Monitor: real-time sparklines (SSE) + **collector toggles** (strace/psutil
@@ -717,9 +719,13 @@ API key stored in OS keyring (libsecret / Secret Service API). Never in config f
 ### Phase 3 — Analytics Views (Weeks 6–9)
 - [x] Secondary tabs with real data — all 9 built: **Overview, Timeline, Memory, CPU,
       I/O, Network, Processes, Syscalls, Logs** (custom SVG timeline + process table)
-- [x] Detection rule engine — **18 rules** covering most of §5 (file I/O, memory,
+- [x] Detection rule engine — **23 built-in rules** covering most of §5 (file I/O, memory,
       CPU/spin/infinite-loop, network errors/reuse, mutex contention, I/O retry,
       read/write storms, subprocess spawning). ltrace/perf-derived rules → Phase 6.
+- [x] *(bonus)* Settings ▸ Rules: enable/disable + retune any built-in rule's thresholds,
+      and author fully custom rules as a sandboxed boolean expression over event/metric
+      fields (no function calls/attribute access reachable — AST-whitelisted, not `eval`),
+      with live server-side validation before a rule can be saved.
 - [x] Severity highlighting (dots, colored anomaly cards, threshold lines, red errors,
       ⊘ fd-leak markers, anomaly-window shading in Timeline + Logs)
 - [x] Real-time anomaly alerts in Live Monitor (live FD>200 / memory-spike /

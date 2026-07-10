@@ -153,4 +153,39 @@ describe('RunSidebar run naming (label ?? command)', () => {
     expect(screen.getByText('nightly-bench')).toBeTruthy() // labeled → label
     expect(screen.queryByText('python b.py')).toBeNull()   // command hidden behind label
   })
+
+  it('collapsing a session hides its runs; expanding shows them again', () => {
+    const runs = [mkRun({ id: 'r1', command: 'python a.py' })]
+    render(<RunSidebar projects={[project]} runs={runs} connected />)
+    expect(screen.getByText('python a.py')).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('collapse session'))
+    expect(screen.queryByText('python a.py')).toBeNull()
+    fireEvent.click(screen.getByLabelText('expand session'))
+    expect(screen.getByText('python a.py')).toBeTruthy()
+  })
+
+  it('deleting a run shows a styled confirm modal (not window.confirm), and only deletes on confirm', () => {
+    const onDeleteRun = vi.fn()
+    const runs = [mkRun({ id: 'r1', command: 'python a.py' })]
+    render(<RunSidebar projects={[project]} runs={runs} connected onDeleteRun={onDeleteRun} />)
+    const row = screen.getByText('python a.py').closest('button')!
+    fireEvent.contextMenu(row)
+    fireEvent.click(screen.getByText('Delete'))
+    expect(screen.getByText('Delete run')).toBeTruthy() // the styled modal, not a native dialog
+    expect(onDeleteRun).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+    expect(onDeleteRun).toHaveBeenCalledWith(runs[0])
+  })
+
+  it('pressing Delete on a focused run row opens the same confirm flow', () => {
+    const onDeleteRun = vi.fn()
+    const runs = [mkRun({ id: 'r1', command: 'python a.py' })]
+    render(<RunSidebar projects={[project]} runs={runs} connected onDeleteRun={onDeleteRun} />)
+    const row = screen.getByText('python a.py').closest('button')!
+    fireEvent.keyDown(row, { key: 'Delete' })
+    expect(screen.getByText('Delete run')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByText('Delete run')).toBeNull()
+    expect(onDeleteRun).not.toHaveBeenCalled()
+  })
 })

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { Incident } from '../state/useOpenTrace'
 import { formatTime, severityColor } from '../state/format'
+import { apiFetch } from '../state/api'
 
 function ago(ms: number): string {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
@@ -34,7 +35,7 @@ export function IncidentFeed({ backendUrl, runId, live }: Props) {
 
   useEffect(() => {
     let cancelled = false
-    fetch(`${backendUrl}/runs/${runId}/incidents`)
+    apiFetch(`${backendUrl}/runs/${runId}/incidents`)
       .then((r) => (r.ok ? r.json() : []))
       .then((d) => { if (!cancelled) setStored(Array.isArray(d) ? d : []) })
       .catch(() => {})

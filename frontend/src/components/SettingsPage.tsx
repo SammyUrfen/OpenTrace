@@ -2,10 +2,12 @@ import { useEffect, useRef, useState } from 'react'
 import type { Collectors } from '../state/useCollectors'
 import { COLLECTOR_ROWS } from './collectorRows'
 import { LlmConfigForm, type LlmConfigHandle } from './LlmConfigForm'
+import { RulesSettings } from './RulesSettings'
 import { ToolChecklist, type ToolInfo } from './ToolChecklist'
 import { UsageGuide } from './UsageGuide'
+import { apiFetch } from '../state/api'
 
-export type SettingsSection = 'general' | 'collectors' | 'ai' | 'tools' | 'guide' | 'about'
+export type SettingsSection = 'general' | 'collectors' | 'ai' | 'rules' | 'tools' | 'guide' | 'about'
 
 interface Props {
   backendUrl: string
@@ -23,6 +25,7 @@ const NAV: { key: SettingsSection; label: string }[] = [
   { key: 'general', label: 'General' },
   { key: 'collectors', label: 'Collectors' },
   { key: 'ai', label: 'AI / LLM' },
+  { key: 'rules', label: 'Rules' },
   { key: 'tools', label: 'Tracing tools' },
   { key: 'guide', label: 'Guide' },
   { key: 'about', label: 'About' },
@@ -75,6 +78,7 @@ export function SettingsPage({
             <CollectorsPane collectors={collectors} onToggle={onToggleCollector} />
           )}
           {section === 'ai' && <AiPane backendUrl={backendUrl} />}
+          {section === 'rules' && <RulesSettings backendUrl={backendUrl} />}
           {section === 'tools' && <ToolsPane backendUrl={backendUrl} />}
           {section === 'guide' && (
             <section className="settings__pane"><h3 className="settings__h">How to use OpenTrace</h3><UsageGuide /></section>
@@ -92,7 +96,7 @@ function GeneralPane({ backendUrl, themeResolved, onToggleTheme, namePrompt, onT
 }) {
   const [info, setInfo] = useState<Record<string, unknown> | null>(null)
   useEffect(() => {
-    fetch(`${backendUrl}/info`).then((r) => r.json()).then(setInfo).catch(() => {})
+    apiFetch(`${backendUrl}/info`).then((r) => r.json()).then(setInfo).catch(() => {})
   }, [backendUrl])
   return (
     <section className="settings__pane">
@@ -169,7 +173,7 @@ function AiPane({ backendUrl }: { backendUrl: string }) {
     setContinuous(next)
     // send ONLY the flag — resending empty base_url/model (before the mount GET
     // resolves, or when unset) would null out the saved LLM config.
-    void fetch(`${backendUrl}/config/llm`, {
+    void apiFetch(`${backendUrl}/config/llm`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ continuous_summaries: next }),
     })
@@ -202,7 +206,7 @@ function ToolsPane({ backendUrl }: { backendUrl: string }) {
   const [data, setData] = useState<{ tools: ToolInfo[]; perf_event_paranoid: number | null } | null>(null)
   // refresh=true bypasses the backend's TTL cache (recheck after installing a tool)
   const load = (refresh = false) =>
-    fetch(`${backendUrl}/info/tools${refresh ? '?refresh=true' : ''}`).then((r) => r.json()).then(setData).catch(() => {})
+    apiFetch(`${backendUrl}/info/tools${refresh ? '?refresh=true' : ''}`).then((r) => r.json()).then(setData).catch(() => {})
   useEffect(() => { void load() }, [backendUrl])
 
   return (
@@ -228,7 +232,7 @@ function ToolsPane({ backendUrl }: { backendUrl: string }) {
 function AboutPane({ backendUrl }: { backendUrl: string }) {
   const [info, setInfo] = useState<Record<string, unknown> | null>(null)
   useEffect(() => {
-    fetch(`${backendUrl}/info`).then((r) => r.json()).then(setInfo).catch(() => {})
+    apiFetch(`${backendUrl}/info`).then((r) => r.json()).then(setInfo).catch(() => {})
   }, [backendUrl])
   return (
     <section className="settings__pane">

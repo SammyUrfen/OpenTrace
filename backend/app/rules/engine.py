@@ -23,6 +23,7 @@ Public surface:
 """
 from __future__ import annotations
 
+import inspect
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -126,6 +127,9 @@ class RuleContext:
     cgroup_cpu_quota_cores: float | None = None
     cgroup_mem_limit_bytes: int | None = None
     thresholds: RuleThresholds = field(default_factory=RuleThresholds)
+    # Built-in rule ids (== function name, see RULE_META) turned off from
+    # Settings -> Rules. Empty = every rule that matches its signal runs.
+    disabled_rules: frozenset[str] = field(default_factory=frozenset)
 
 
 # --- rule registration / signal gating --------------------------------------
@@ -1031,6 +1035,8 @@ def spin_loop(ctx: RuleContext) -> Anomaly | None:
 def run_rules(ctx: RuleContext) -> list[Anomaly]:
     found: list[Anomaly] = []
     for rule in RULES:
+        if rule.__name__ in ctx.disabled_rules:
+            continue
         needs = getattr(rule, "_needs", None)
         if needs == "events" and not ctx.events:
             continue
@@ -1044,3 +1050,43 @@ def run_rules(ctx: RuleContext) -> list[Anomaly]:
             found.append(result)
     found.sort(key=lambda a: a.severity_score, reverse=True)
     return found
+
+
+# --- rule metadata for the Settings "Rules" UI -------------------------------
+#
+# Derived from the rule functions themselves (name, docstring, and which
+# `ctx.thresholds.*` fields they actually read) rather than a hand-maintained
+# parallel table, so it can never drift out of sync with the code above.
+# `rule_id` is always `fn.__name__` — every rule above returns
+# `Anomaly(rule_id="<its own function name>", ...)` by convention.
+
+_THRESHOLD_REF = re.compile(r"ctx\.thresholds\.(\w+)")
+
+
+def _thresholds_used(fn: Callable) -> list[str]:
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):
+        return []
+    seen: list[str] = []
+    for name in _THRESHOLD_REF.findall(src):
+        if name not in seen and hasattr(RuleThresholds, name):
+            seen.append(name)
+    return seen
+
+
+def _short_description(fn: Callable) -> str:
+    doc = (fn.__doc__ or "").strip()
+    return doc.splitlines()[0].strip() if doc else ""
+
+
+RULE_META: list[dict] = [
+    {
+        "id": fn.__name__,
+        "signal": getattr(fn, "_needs", "events"),
+        "label": fn.__name__.replace("_", " ").capitalize(),
+        "description": _short_description(fn),
+        "thresholds": _thresholds_used(fn),
+    }
+    for fn in RULES
+]

@@ -4,6 +4,7 @@ import { COLLECTOR_ROWS } from './collectorRows'
 import { LlmConfigForm, type LlmConfigHandle } from './LlmConfigForm'
 import { ToolChecklist, type ToolInfo } from './ToolChecklist'
 import { UsageGuide } from './UsageGuide'
+import { apiFetch } from '../state/api'
 
 interface Props {
   backendUrl: string
@@ -24,7 +25,7 @@ export function FirstRunWizard({ backendUrl, onDone }: Props) {
 
   // refresh=true bypasses the backend's TTL cache (recheck after installing a tool)
   const loadTools = (refresh = false) =>
-    fetch(`${backendUrl}/info/tools${refresh ? '?refresh=true' : ''}`).then((r) => r.json()).then((d) => setTools(d.tools)).catch(() => {})
+    apiFetch(`${backendUrl}/info/tools${refresh ? '?refresh=true' : ''}`).then((r) => r.json()).then((d) => setTools(d.tools)).catch(() => {})
   useEffect(() => { void loadTools() }, [backendUrl])
 
   // The LLM form unmounts when leaving step 2, so persist it on any navigation

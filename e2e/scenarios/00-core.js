@@ -133,6 +133,7 @@ module.exports = [
       const n = await H.runCount(ctx)
       await H.runContextMenu(ctx)
       await ctx.page.locator('.ctx-item--danger', { hasText: /Delete/i }).first().click()
+      await H.confirmDeleteRun(ctx)
       for (let i = 0; i < 15 && (await H.runCount(ctx)) >= n; i++) await ctx.sleep(300)
       ctx.assert((await H.runCount(ctx)) < n, 'run was not deleted')
     },
@@ -149,6 +150,7 @@ module.exports = [
       const n = await H.runCount(ctx)
       await H.runContextMenu(ctx, pid)
       await ctx.page.locator('.ctx-item--danger', { hasText: /Delete/i }).first().click()
+      await H.confirmDeleteRun(ctx)
       for (let i = 0; i < 15 && (await H.runCount(ctx)) >= n; i++) await ctx.sleep(300)
       ctx.assert((await H.runCount(ctx)) < n, 'open run was not deleted')
       // the runner auto-fails this scenario if any console/page error fired

@@ -17,6 +17,7 @@
 set -u
 
 API="${OPENTRACE_API:-http://localhost:8000}"
+AUTH_HDR="Authorization: Bearer ${OPENTRACE_API_TOKEN:-}"
 
 # Drop the leading `--` the hook passes.
 [ "${1:-}" = "--" ] && shift
@@ -52,7 +53,7 @@ payload="{\"command\":\"$cmd_j\",\"cwd\":\"$cwd_j\""
 payload="$payload}"
 
 resp="$(curl -sf --max-time 2 -X POST "$API/runs/start" \
-    -H 'content-type: application/json' -d "$payload" 2>/dev/null)"
+    -H 'content-type: application/json' -H "$AUTH_HDR" -d "$payload" 2>/dev/null)"
 [ -z "$resp" ] && exec "$@"          # backend down -> fail open
 
 run_id="$(printf '%s' "$resp" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)"
@@ -93,7 +94,7 @@ child=$!
 
 [ -n "$run_dir" ] && printf '%s\n' "$child" > "$run_dir/strace.pid" 2>/dev/null
 curl -sf --max-time 1 -X POST "$API/runs/$run_id/pid" \
-    -H 'content-type: application/json' -d "{\"pid\":$child}" >/dev/null 2>&1 &
+    -H 'content-type: application/json' -H "$AUTH_HDR" -d "{\"pid\":$child}" >/dev/null 2>&1 &
 
 # Catch INT/TERM ourselves so we survive to finalize; the tty already delivered
 # the signal to the workload's process group, so it dies on its own.
@@ -116,6 +117,6 @@ end_payload="{\"exit_code\":$rc,\"exit_signal\":$sig_field"
 [ -n "$ended" ] && end_payload="$end_payload,\"ended_at\":$ended"
 end_payload="$end_payload}"
 curl -sf --max-time 3 -X POST "$API/runs/$run_id/end" \
-    -H 'content-type: application/json' -d "$end_payload" >/dev/null 2>&1
+    -H 'content-type: application/json' -H "$AUTH_HDR" -d "$end_payload" >/dev/null 2>&1
 
 exit $rc

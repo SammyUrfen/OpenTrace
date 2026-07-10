@@ -135,7 +135,7 @@ function reattach(webContents, cols, rows) {
  * previous WebContents is gone (true window recreation). Returns a small info
  * object the caller can hand to a session record.
  */
-function start({ webContents, cwd, cols = 80, rows = 24, backendUrl, scrollbackPath }) {
+function start({ webContents, cwd, cols = 80, rows = 24, backendUrl, apiToken, scrollbackPath }) {
   if (scrollbackPath && !scrollbackFile) scrollbackFile = scrollbackPath
   // A blank xterm that needs the full history replayed into it: a rebuilt window
   // (below) or a cold start that loads the disk mirror. A restart after the shell
@@ -178,6 +178,7 @@ function start({ webContents, cwd, cols = 80, rows = 24, backendUrl, scrollbackP
     ...process.env,
     PATH: `${HOOKS_DIR}${path.delimiter}${process.env.PATH || ''}`,
     OPENTRACE_API: backendUrl || process.env.OPENTRACE_API || DEFAULT_BACKEND_URL,
+    OPENTRACE_API_TOKEN: apiToken || process.env.OPENTRACE_API_TOKEN || '',
     OPENTRACE_OTRACE: OTRACE_PATH,
     OPENTRACE_RT: rtFile,
     OPENTRACE_ENABLE_STRACE: tracingEnabled ? '1' : '0',

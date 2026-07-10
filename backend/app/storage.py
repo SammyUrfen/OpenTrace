@@ -31,6 +31,7 @@ from typing import Iterable, Iterator
 import zstandard as zstd
 
 from . import db
+from .rules.custom import CustomRuleDef
 from .trace.events import Anomaly, MetricSample, TraceEvent
 from .util import new_id, now_ms
 
@@ -469,3 +470,82 @@ def update_incident(run_dir: str | Path, incident_id: str, **fields) -> None:
         if not changed:
             return
         _rewrite_incidents_unlocked(run_dir, incidents)
+
+
+# --- SQLite: custom rules (user-authored, Settings -> Rules) ----------------
+
+def _row_to_custom_rule(r: sqlite3.Row) -> CustomRuleDef:
+    return CustomRuleDef(
+        id=r["id"], name=r["name"], description=r["description"],
+        signal=r["signal"], expression=r["expression"], severity=r["severity"],
+        enabled=bool(r["enabled"]), min_count=r["min_count"],
+        duration_ms=r["duration_ms"], created_at=r["created_at"],
+    )
+
+
+def list_custom_rules() -> list[CustomRuleDef]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM custom_rules ORDER BY created_at ASC"
+        ).fetchall()
+    return [_row_to_custom_rule(r) for r in rows]
+
+
+def get_custom_rule(rule_id: str) -> CustomRuleDef | None:
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM custom_rules WHERE id = ?", (rule_id,)
+        ).fetchone()
+    return _row_to_custom_rule(row) if row else None
+
+
+def create_custom_rule(
+    *, name: str, description: str, signal: str, expression: str,
+    severity: str = "medium", enabled: bool = True,
+    min_count: int = 5, duration_ms: int = 5000,
+) -> CustomRuleDef:
+    rule = CustomRuleDef(
+        id=new_id(), name=name, description=description, signal=signal,
+        expression=expression, severity=severity, enabled=enabled,
+        min_count=min_count, duration_ms=duration_ms, created_at=now_ms(),
+    )
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO custom_rules
+                (id, name, description, signal, expression, severity, enabled,
+                 min_count, duration_ms, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (rule.id, rule.name, rule.description, rule.signal, rule.expression,
+             rule.severity, int(rule.enabled), rule.min_count, rule.duration_ms,
+             rule.created_at),
+        )
+    return rule
+
+
+def update_custom_rule(rule_id: str, **fields) -> CustomRuleDef | None:
+    """Patch a subset of columns (name/description/signal/expression/severity/
+    enabled/min_count/duration_ms). Returns the updated row, or None if it
+    doesn't exist."""
+    cols = {
+        "name", "description", "signal", "expression", "severity",
+        "enabled", "min_count", "duration_ms",
+    }
+    sets = {k: v for k, v in fields.items() if k in cols and v is not None}
+    if not sets:
+        return get_custom_rule(rule_id)
+    if "enabled" in sets:
+        sets["enabled"] = int(sets["enabled"])
+    with db.connect() as conn:
+        conn.execute(
+            f"UPDATE custom_rules SET {', '.join(f'{k} = ?' for k in sets)} WHERE id = ?",
+            (*sets.values(), rule_id),
+        )
+    return get_custom_rule(rule_id)
+
+
+def delete_custom_rule(rule_id: str) -> bool:
+    with db.connect() as conn:
+        cur = conn.execute("DELETE FROM custom_rules WHERE id = ?", (rule_id,))
+    return cur.rowcount > 0

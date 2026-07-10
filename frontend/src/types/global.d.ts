@@ -2,6 +2,9 @@ declare global {
   interface Window {
     opentrace?: {
       backendUrl: string
+      /** Per-launch bearer token for the local API (empty when Electron didn't
+       *  spawn the backend itself, e.g. dev/test against an external instance). */
+      apiToken?: string
       terminal?: {
         start: (opts?: { cols?: number; rows?: number }) => Promise<{
           shell: string
